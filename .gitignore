@@ -1,3 +1,10 @@
+# Custom
+logs/
+runs/
+uv.lock
+data/
+videos/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
