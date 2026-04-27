@@ -1,0 +1,26 @@
+env:
+  id: Ant-v5
+  num_envs: 16
+
+trainer:
+  timesteps: 1000000
+  headless: true
+
+ppo:
+  rollouts: 512
+  learning_epochs: 10
+  mini_batches: 32
+  discount_factor: 0.99
+  gae_lambda: 0.95
+  learning_rate: 1.0e-4
+  grad_norm_clip: 0.5
+  ratio_clip: 0.2
+  value_clip: 0.2
+  entropy_loss_scale: 0.001
+  value_loss_scale: 1.0
+  kl_threshold: 0.0
+  time_limit_bootstrap: true
+
+experiment:
+  directory: runs
+  name: ant_transformer_ppo
