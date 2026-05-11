@@ -19,10 +19,10 @@ class LegTransformer(nn.Module):
     def __init__(
         self,
         mode: Literal["policy", "value"],
-        d_model: int = 64,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        ffn: int = 256,
+        d_model: int = 128,
+        n_heads: int = 8,
+        n_layers: int = 3,
+        ffn: int = 512,
     ):
         super().__init__()
         assert mode in ("policy", "value")
@@ -46,7 +46,7 @@ class LegTransformer(nn.Module):
             dropout=0.0, activation="gelu",
             batch_first=True, norm_first=True,
         )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers)
+        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers, enable_nested_tensor=False)
 
         if mode == "policy":
             self.joint_head = nn.Linear(d_model, 1)
@@ -67,20 +67,28 @@ class LegTransformer(nn.Module):
                 nn.init.zeros_(p)
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        tok = tokenize(obs)
-        t = self.embed_torso(tok["torso"])   # [B, 1, d]
-        h = self.embed_joint(tok["hip"])     # [B, 4, d]
-        a = self.embed_joint(tok["ankle"])   # [B, 4, d]
-        x = torch.cat([t, h, a], dim=1)      # [B, 9, d]
+        tok, active_mask = tokenize(obs)      # active_mask: [B, 8] natural order
+        t = self.embed_torso(tok["torso"])    # [B, 1, d]
+        h = self.embed_joint(tok["hip"])      # [B, 4, d]
+        a = self.embed_joint(tok["ankle"])    # [B, 4, d]
+        x = torch.cat([t, h, a], dim=1)       # [B, 9, d]
 
         x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids)
-        x = self.encoder(x)                  # [B, 9, d]
+
+        # mask inactive joint tokens from attention (torso always active)
+        pad_mask = torch.cat(
+            [torch.zeros(obs.shape[0], 1, dtype=torch.bool, device=obs.device),
+             ~(active_mask > 0.5)],
+            dim=1,
+        )  # [B, 9] True = ignore
+        x = self.encoder(x, src_key_padding_mask=pad_mask)  # [B, 9, d]
 
         if self.mode == "policy":
-            joints = x[:, 1:, :]                                # [B, 8, d]
-            a_nat = torch.tanh(self.joint_head(joints).squeeze(-1))  # [B, 8] in [h1..h4, a1..a4], bounded to (-1, 1)
-            return a_nat.index_select(-1, self.act_perm)        # [B, 8] actuator order
-        return self.value_head(x[:, 0, :])                      # [B, 1]
+            joints = x[:, 1:, :]                                        # [B, 8, d]
+            a_nat = torch.tanh(self.joint_head(joints).squeeze(-1))     # [B, 8] natural order
+            a_nat = a_nat * active_mask                                  # zero inactive
+            return a_nat.index_select(-1, self.act_perm)                # [B, 8] actuator order
+        return self.value_head(x[:, 0, :])                              # [B, 1]
 
 
 if __name__ == "__main__":
