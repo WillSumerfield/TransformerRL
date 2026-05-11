@@ -10,7 +10,6 @@ import gymnasium as gym
 import mujoco
 import torch
 import yaml
-
 from skrl.agents.torch.ppo import PPO, PPO_CFG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
@@ -37,7 +36,7 @@ def route_mujoco_warnings(logs_dir: Path, seed: int) -> Path:
 
 def build(cfg: dict, device: torch.device, seed: int):
     ec = cfg["env"]
-    venvs = gym.make_vec(ec["id"], num_envs=ec["num_envs"], vectorization_mode="sync")
+    venvs = gym.make_vec(ec["id"], num_envs=ec["num_envs"], vectorization_mode="async")
     venvs.reset(seed=seed)
     env = wrap_env(venvs)
 
@@ -54,8 +53,6 @@ def build(cfg: dict, device: torch.device, seed: int):
         setattr(pc, k, v)
     pc.observation_preprocessor = RunningStandardScaler
     pc.observation_preprocessor_kwargs = {"size": env.observation_space, "device": device}
-    pc.value_preprocessor = RunningStandardScaler
-    pc.value_preprocessor_kwargs = {"size": 1, "device": device}
     pc.experiment.directory = cfg["experiment"]["directory"]
     pc.experiment.experiment_name = f"{cfg['experiment']['name']}_seed{seed}"
 

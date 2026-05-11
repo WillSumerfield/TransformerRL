@@ -5,8 +5,10 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import gymnasium as gym
+from utils import find_latest_run
 import numpy as np
 import torch
 import yaml
@@ -86,7 +88,7 @@ if __name__ == "__main__":
     p.add_argument("--env", type=str, default="Ant-v5", dest="env_id")
     p.add_argument("--no-render", action="store_false", dest="render")
     p.add_argument("--checkpoint", type=Path,
-                   default=Path("runs/ant_transformer_ppo/checkpoints/best_agent.pt"))
+                   default=find_latest_run("ant_transformer_ppo"))
     p.add_argument("--config", type=Path, default=Path("configs/ppo_ant.yaml"))
     p.add_argument("--cpu", action="store_true")
     p.add_argument("--fps", type=float, default=60.0)
