@@ -371,10 +371,13 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
             return
 
         EPM = self.envs_per_morph
-        # Read current post-step physics state so non-resetting envs aren't clobbered.
-        ArticulationKinematicStateHandler.get_articulation_kinematic_states(
-            [g["kine_handler"] for g in self.groups]
-        )
+        # If any env is still live, read physics state so we can preserve it below.
+        # Skip on a full reset (e.g. initial reset before any step) — no valid state exists yet.
+        has_live_envs = not self._reset_buf.all()
+        if has_live_envs:
+            ArticulationKinematicStateHandler.get_articulation_kinematic_states(
+                [g["kine_handler"] for g in self.groups]
+            )
 
         for gi, g in enumerate(self.groups):
             start, end = gi * EPM, (gi + 1) * EPM
@@ -383,7 +386,6 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
                 continue
 
             kh = g["kine_handler"]
-            m = reset_mask.unsqueeze(-1)  # (EPM, 1)
 
             new_dof_pos = g["dof_pos_init"] + reset_noise_helper(
                 g["dof_pos_init"], self.reset_noise_scale, 0.4, 0.2
@@ -391,10 +393,17 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
             new_dof_vel = reset_noise_helper(
                 g["dof_vel_init"], self.reset_noise_scale, 0.2, 0.1
             )
-            kh.set_dof_pos_buf[:]  = torch.where(m, new_dof_pos,      kh.get_dof_pos_buf)
-            kh.set_dof_vel_buf[:]  = torch.where(m, new_dof_vel,      kh.get_dof_vel_buf)
-            kh.set_link_pose_buf[:] = torch.where(m, g["root_tf_init"], kh.get_link_pose_buf)
-            kh.set_link_vel_buf[:] = torch.where(m, g["root_vl_init"], kh.get_link_vel_buf)
+            if has_live_envs:
+                m = reset_mask.unsqueeze(-1)  # (EPM, 1)
+                kh.set_dof_pos_buf[:]  = torch.where(m, new_dof_pos,       kh.get_dof_pos_buf)
+                kh.set_dof_vel_buf[:]  = torch.where(m, new_dof_vel,       kh.get_dof_vel_buf)
+                kh.set_link_pose_buf[:] = torch.where(m, g["root_tf_init"], kh.get_link_pose_buf)
+                kh.set_link_vel_buf[:] = torch.where(m, g["root_vl_init"],  kh.get_link_vel_buf)
+            else:
+                kh.set_dof_pos_buf[:]  = new_dof_pos
+                kh.set_dof_vel_buf[:]  = new_dof_vel
+                kh.set_link_pose_buf[:] = g["root_tf_init"]
+                kh.set_link_vel_buf[:]  = g["root_vl_init"]
 
             ArticulationKinematicStateHandler.set_articulation_kinematic_states([kh])
 
