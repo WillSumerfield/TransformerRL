@@ -1,90 +1,73 @@
-"""skrl Policy (Gaussian) + Value (Deterministic) wrapping LegTransformer."""
+"""rl_games NetworkBuilders for ant envs."""
 import torch
 import torch.nn as nn
-from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
+from rl_games.algos_torch.network_builder import NetworkBuilder
 
-from .transformer import LegTransformer
-from .obs_tokenize import OBS_DIM
-
-# qpos order [h1,a1,h2,a2,h3,a3,h4,a4] → actuator order [h4,a4,h1,a1,h2,a2,h3,a3]
-_QPOS_TO_ACT = torch.tensor([6, 7, 0, 1, 2, 3, 4, 5], dtype=torch.long)
+from .architectures import LegTransformer, DynamicLegTransformer
+from .tokenize import OBS_DIM_4 as OBS_DIM, MASK_DIM_4 as MASK_DIM, OBS_DIM_8 as DYN_OBS_DIM, MASK_DIM_8 as DYN_MASK_DIM
 
 
-class Policy(GaussianMixin, Model):
-    def __init__(self, observation_space, action_space, device=None,
-                 clip_actions=True, clip_log_std=True,
-                 min_log_std=-5.0, max_log_std=2.0):
-        Model.__init__(self, observation_space=observation_space,
-                       action_space=action_space, device=device)
-        GaussianMixin.__init__(self, clip_actions=clip_actions,
-                               clip_log_std=clip_log_std,
-                               min_log_std=min_log_std, max_log_std=max_log_std,
-                               reduction="none")
-        self.net = LegTransformer("policy")
-        self.log_std_param = nn.Parameter(torch.zeros(self.num_actions))
-        self.register_buffer("_qpos_to_act", _QPOS_TO_ACT)
-        self._active_mask: torch.Tensor | None = None
+class LegTransformerBuilder(NetworkBuilder):
+    """rl_games builder for 4-leg ant (ant / ant_adaptive)."""
 
-    def compute(self, inputs, role=""):
-        mean = self.net(inputs["observations"])
-        log_std = self.log_std_param.expand_as(mean)
-        return mean, {"log_std": log_std}
+    def load(self, params):
+        self.params = params
 
-    def _extract_mask(self, obs: torch.Tensor) -> torch.Tensor:
-        if obs.shape[-1] > OBS_DIM:
-            mask_qpos = (obs[..., OBS_DIM:OBS_DIM + 8] > 0.5).float()
-            return mask_qpos[..., self._qpos_to_act]
-        return torch.ones(obs.shape[0], 8, device=obs.device)
+    class Network(NetworkBuilder.BaseNetwork):
+        def __init__(self, params, **kwargs):
+            nn.Module.__init__(self)
+            kwargs.pop('actions_num', None)
+            kwargs.pop('input_shape', None)
+            kwargs.pop('num_seqs', None)
+            tc = params.get('transformer', {})
+            self.net = LegTransformer(**tc)
+            self.log_std_param = nn.Parameter(torch.zeros(8))
 
-    def act(self, inputs, role=""):
-        actions, outputs = super().act(inputs, role=role)
-        obs = inputs.get("observations")
-        if obs is None:
-            obs = inputs.get("states")
-        mask = self._extract_mask(obs)
-        self._active_mask = mask
-        outputs["log_prob"] = (outputs["log_prob"] * mask).sum(-1, keepdim=True)
-        return actions, outputs
+        def forward(self, obs_dict):
+            obs = obs_dict['obs']
+            mu, value = self.net(obs)
+            if obs.shape[-1] >= OBS_DIM + MASK_DIM:
+                mask_dof = (obs[..., OBS_DIM : OBS_DIM + MASK_DIM] > 0.5).float()
+                log_std = self.log_std_param - 10.0 * (1.0 - mask_dof)
+            else:
+                log_std = self.log_std_param.expand(obs.shape[0], -1)
+            return mu, log_std, value, None
 
-    def get_entropy(self, *, role=""):
-        ent = self._g_distribution.entropy().to(self.device)  # [B, 8]
-        if self._active_mask is not None:
-            ent = ent * self._active_mask
-        return ent
+        def is_rnn(self):
+            return False
+
+    def build(self, name, **kwargs):
+        return LegTransformerBuilder.Network(self.params, **kwargs)
 
 
-class Value(DeterministicMixin, Model):
-    def __init__(self, observation_space, action_space, device=None,
-                 clip_actions=False):
-        Model.__init__(self, observation_space=observation_space,
-                       action_space=action_space, device=device)
-        DeterministicMixin.__init__(self, clip_actions=clip_actions)
-        self.net = LegTransformer("value")
+class DynamicLegTransformerBuilder(NetworkBuilder):
+    """rl_games builder for 8-leg ant (ant_dynamic)."""
 
-    def compute(self, inputs, role=""):
-        return self.net(inputs["observations"]), {}
+    def load(self, params):
+        self.params = params
 
+    class Network(NetworkBuilder.BaseNetwork):
+        def __init__(self, params, **kwargs):
+            nn.Module.__init__(self)
+            kwargs.pop('actions_num', None)
+            kwargs.pop('input_shape', None)
+            kwargs.pop('num_seqs', None)
+            tc = params.get('transformer', {})
+            self.net = DynamicLegTransformer(**tc)
+            self.log_std_param = nn.Parameter(torch.zeros(16))
 
-if __name__ == "__main__":
-    import gymnasium as gym
-    env = gym.make("Ant-v5")
-    o_space, a_space = env.observation_space, env.action_space
+        def forward(self, obs_dict):
+            obs = obs_dict['obs']
+            mu, value = self.net(obs)
+            if obs.shape[-1] >= DYN_OBS_DIM + DYN_MASK_DIM:
+                mask_dof = (obs[..., DYN_OBS_DIM : DYN_OBS_DIM + DYN_MASK_DIM] > 0.5).float()
+                log_std = self.log_std_param - 10.0 * (1.0 - mask_dof)
+            else:
+                log_std = self.log_std_param.expand(obs.shape[0], -1)
+            return mu, log_std, value, None
 
-    pol = Policy(o_space, a_space, device="cpu")
-    val = Value(o_space, a_space, device="cpu")
+        def is_rnn(self):
+            return False
 
-    obs, _ = env.reset(seed=0)
-    states = torch.from_numpy(obs).float().unsqueeze(0)  # [1, 105]
-
-    # sample from policy
-    actions, outputs = pol.act({"observations": states}, role="policy")
-    v, _ = val.act({"observations": states}, role="value")
-    print("sampled action:", actions.shape, "range:", actions.min().item(), actions.max().item())
-    print("log_prob:", outputs["log_prob"].shape, "value:", v.shape, v.item())
-    assert actions.shape == (1, 8) and v.shape == (1, 1)
-    assert actions.min() >= -1.0 - 1e-6 and actions.max() <= 1.0 + 1e-6, "clip_actions failed"
-
-    # one env step end-to-end
-    env.step(actions.detach().numpy()[0])
-    print("end-to-end env step ok")
-    env.close()
+    def build(self, name, **kwargs):
+        return DynamicLegTransformerBuilder.Network(self.params, **kwargs)
