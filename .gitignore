@@ -4,6 +4,8 @@ runs/
 uv.lock
 data/
 videos/
+.claude/
+TurboActivate.dat
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
