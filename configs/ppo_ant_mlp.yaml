@@ -6,7 +6,7 @@ params:
     name: continuous_a2c_logstd
 
   network:
-    name: leg_transformer
+    name: actor_critic
     separate: False
     space:
       continuous:
@@ -18,17 +18,14 @@ params:
           name: const_initializer
           val: 0
         fixed_sigma: True
-    transformer:
-      d_model: 208
-      n_heads: 8
-      n_layers: 1
-      ffn: 832 # dmodel * 4
-      torso_dim: 11
-      hip_dim: 5
-      ankle_dim: 11
+    mlp:
+      units: [512, 256, 128]
+      activation: elu
+      initializer:
+        name: default
 
   config:
-    name: ant_transformer
+    name: ant_mlp
     env_name: ant-env
     multi_gpu: False
     ppo: True
