@@ -1,12 +1,18 @@
 """Shared boilerplate for rl_games-based ant training scripts."""
 from __future__ import annotations
 
+import math
 import os
 import sys
 from datetime import datetime
 from pathlib import Path
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_VIDEOS_DIR = _PROJECT_ROOT / "videos"
+
+# Title/class fragments used to identify the vsim render window.
+# SDL2 sets WM_CLASS to "SDL_app" by default; also try common vsim/vlearn names.
+_VSIM_WINDOW_TITLES = ["vsim", "vlearn", "SDL_app"]
 
 
 def _str_to_bool(s: str) -> bool:
@@ -24,7 +30,143 @@ def _adjust_minibatch(cfg: dict, n_envs: int, h_len: int) -> None:
     cfg["minibatch_size"] = mb
 
 
-def _run_random(env_class, args) -> None:
+def _find_xwindow(display, title_fragments):
+    """Find the vsim render window by title/class fragment, falling back to largest mapped window."""
+    from Xlib import X, error as Xerror
+
+    root = display.screen().root
+    candidates = []
+
+    def collect(win, depth=0):
+        try:
+            attrs = win.get_attributes()
+            if attrs.map_state != X.IsViewable:
+                return
+            name = win.get_wm_name() or ""
+            cls = win.get_wm_class() or ()
+            combined = (name + " " + " ".join(cls)).lower()
+            if any(t.lower() in combined for t in title_fragments):
+                geom = win.get_geometry()
+                candidates.append((geom.width * geom.height, win))
+                return  # don't recurse into matched window
+        except Xerror.BadWindow:
+            return
+        try:
+            for child in win.query_tree().children:
+                collect(child, depth + 1)
+        except Xerror.BadWindow:
+            pass
+
+    collect(root)
+    if candidates:
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        return candidates[0][1]
+
+    # Fallback: largest viewable top-level window that isn't the root
+    largest = None
+    largest_area = 0
+    try:
+        for child in root.query_tree().children:
+            try:
+                attrs = child.get_attributes()
+                if attrs.map_state != X.IsViewable:
+                    continue
+                geom = child.get_geometry()
+                area = geom.width * geom.height
+                if area > largest_area:
+                    largest_area = area
+                    largest = child
+            except Xerror.BadWindow:
+                pass
+    except Xerror.BadWindow:
+        pass
+    return largest
+
+
+class _VideoRecorder:
+    """Captures the vsim X11 window each render_callback and writes to mp4."""
+
+    def __init__(self, path: Path, max_frames: int, stop_env: bool):
+        self.path = path
+        self.max_frames = max_frames
+        self.stop_env = stop_env
+        self._writer = None
+        self._display = None
+        self._window = None
+        self._size = None
+        self._frames = 0
+        self.done = False
+
+    def _init(self):
+        from Xlib import display as xdisplay
+        self._display = xdisplay.Display()
+
+    def _get_window(self):
+        if self._window is not None:
+            return self._window
+        win = _find_xwindow(self._display, _VSIM_WINDOW_TITLES)
+        if win:
+            self._window = win
+        return win
+
+    def _capture(self):
+        import numpy as np
+        from Xlib import X
+        win = self._get_window()
+        if win is None:
+            return None
+        try:
+            geom = win.get_geometry()
+            raw = win.get_image(0, 0, geom.width, geom.height, X.ZPixmap, 0xFFFFFFFF)
+        except Exception:
+            self._window = None  # window may have moved; retry next frame
+            return None
+        img = np.frombuffer(raw.data, dtype=np.uint8).reshape(geom.height, geom.width, 4)
+        # Drop alpha → BGR; copy to a writable C-contiguous array (VideoWriter requires it).
+        # Crop to even dims so the mp4 encoder doesn't choke.
+        h = geom.height - (geom.height & 1)
+        w = geom.width - (geom.width & 1)
+        return np.ascontiguousarray(img[:h, :w, :3])
+
+    def make_callback(self, env):
+        def callback():
+            if self.done:
+                return
+            try:
+                import cv2
+                if self._display is None:
+                    self._init()
+                frame = self._capture()
+                if frame is None:
+                    return
+                if self._writer is None:
+                    h, w = frame.shape[:2]
+                    self._size = (w, h)
+                    fps = round(1.0 / env.dt) if hasattr(env, "dt") else 60
+                    self.path.parent.mkdir(parents=True, exist_ok=True)
+                    self._writer = cv2.VideoWriter(
+                        str(self.path),
+                        cv2.VideoWriter_fourcc(*"mp4v"),
+                        fps,
+                        self._size,
+                    )
+                    print(f"Recording video → {self.path}  ({fps} fps, max {self.max_frames} frames)")
+                if (frame.shape[1], frame.shape[0]) != self._size:
+                    frame = cv2.resize(frame, self._size)
+                self._writer.write(frame)
+                self._frames += 1
+                if self._frames >= self.max_frames:
+                    self._writer.release()
+                    self.done = True
+                    print(f"Video saved: {self.path}")
+                    if self.stop_env:
+                        env.render_finished = True
+            except Exception as e:
+                print(f"[video] capture error: {e}")
+        return callback
+
+
+def _run_random(env_class, args, video_path=None, video_length=1) -> None:
     import torch
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_envs = args.num_envs or 1
@@ -41,7 +183,16 @@ def _run_random(env_class, args) -> None:
     act_high = torch.tensor(env.action_space.high, device=device)
     total = getattr(env, "total_num_envs", num_envs)
     env.reset()
+    recorder = None
+    if video_path is not None:
+        max_ep = getattr(env, "max_episode_length", 1000)
+        # stop_env=False: we own this loop, so break on recorder.done instead of
+        # tripping env.render_finished (which would raise via raise_exception).
+        recorder = _VideoRecorder(video_path, max_frames=video_length * max_ep, stop_env=False)
+        env.render_callback = recorder.make_callback(env)
     while not env.render_finished:
+        if recorder is not None and recorder.done:
+            break
         actions = act_low + torch.rand(total, act_low.shape[0], device=device) * (act_high - act_low)
         env.step(actions)
 
@@ -102,6 +253,8 @@ def run_training(
     parser.add_argument("--max_epochs", type=int)
     parser.add_argument("--horizon_length", type=int)
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--video", action="store_true")
+    parser.add_argument("--video-length", type=int, default=1, dest="video_length")
     if extra_args_fn is not None:
         extra_args_fn(parser)
     args = parser.parse_args()
@@ -109,8 +262,13 @@ def run_training(
     mode = args.mode
     checkpoint = args.checkpoint
 
+    video_path = None
+    if args.video:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        video_path = _VIDEOS_DIR / f"{timestamp}_{mode}.mp4"
+
     if mode == "random":
-        _run_random(env_class, args)
+        _run_random(env_class, args, video_path=video_path, video_length=args.video_length)
         return
 
     # --- Config loading ---
@@ -122,6 +280,7 @@ def run_training(
     if "player" not in config["params"]["config"]:
         config["params"]["config"]["player"] = {}
     config["params"]["config"]["player"]["use_vecenv"] = True
+    config["params"]["config"]["player"]["print_stats"] = False
     cfg = config["params"]["config"]
     exp_name = cfg.get("name", "run").removeprefix("ant_")
     cfg["train_dir"] = f"{train_dir}/{exp_name}"
@@ -165,7 +324,9 @@ def run_training(
             )
 
     # --- Rendering ---
-    if args.headless is None:
+    if args.video:
+        args.headless = "False"
+    elif args.headless is None:
         args.headless = "False" if mode == "play" else "True"
     rendering = not _str_to_bool(args.headless)
 
@@ -176,6 +337,19 @@ def run_training(
         **config.get("env", {}),
     }
 
+    # --- Video recorder setup ---
+    recorder = None
+    if args.video:
+        max_ep = env_kwargs.get("max_episode_length", 1000)
+        horizon = ppo_cfg.get("horizon_length", 16)
+        max_frames = args.video_length * max_ep
+        if mode == "train":
+            # Limit training to exactly N episodes worth of steps
+            cfg["max_epochs"] = math.ceil(max_frames / horizon)
+            recorder = _VideoRecorder(video_path, max_frames=max_frames, stop_env=False)
+        else:  # play
+            recorder = _VideoRecorder(video_path, max_frames=max_frames, stop_env=True)
+
     # --- Env + vecenv registration ---
     def create_envs(n, **kw):
         assert torch.cuda.is_available()
@@ -183,6 +357,8 @@ def run_training(
         envs = env_class(n, device, **env_kwargs)
         if mode == "play":
             envs.inference_mode_post_init_callback()
+        if recorder is not None:
+            envs.render_callback = recorder.make_callback(envs)
         return NewToOldAPICompatilibity(envs)
 
     def make_vecenv(config_name, num_actors, **kw):
@@ -198,11 +374,29 @@ def run_training(
         net_name, net_builder = network
         mb_module.register_network(net_name, net_builder)
 
+    # Mask-passthrough normalizer variant (used by configs via model.name; harmless otherwise).
+    from .models import TransformerMaskedNorm
+    mb_module.register_model('transformer_masked_a2c_logstd', TransformerMaskedNorm)
+
     # --- Run ---
     run_args = {"train": mode == "train", "play": mode == "play"}
     if checkpoint:
         run_args["checkpoint"] = checkpoint
 
+    if mode == "play":
+        if checkpoint:
+            print(f"[play] Loading model from checkpoint: {checkpoint}")
+        else:
+            print("[play] No checkpoint provided; running with randomly initialized model")
+
     runner = Runner()
     runner.load(config)
-    runner.run(run_args)
+    try:
+        runner.run(run_args)
+    except Exception:
+        # vsim's render() raises a bare Exception to signal shutdown. When the
+        # recorder finished on purpose, that's a clean stop; otherwise re-raise.
+        if recorder is not None and recorder.done:
+            print("Recording complete, exiting.")
+        else:
+            raise
