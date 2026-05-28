@@ -6,13 +6,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent.parent / "v
 
 import torch
 
-from .ant_codesign import AntCodesignEnv, _stable_morphologies
+from .ant_codesign import AntCodesignEnv
 
-_MORPHOLOGIES = _stable_morphologies(min_legs=3, max_legs=4)
+_MORPHOLOGIES = [
+    frozenset({1, 3, 6}),    # 3-leg: gaps 90°/135°/135°
+    frozenset({2, 4, 6, 8}), # 4-leg: symmetric 90° spacing
+]
 
 
 class AntAdaptiveEnv(AntCodesignEnv):
-    """AntCodesignEnv with only 3-4 leg stable morphologies (46 total)."""
+    """AntCodesignEnv with one 3-leg and one 4-leg morphology."""
 
     def __init__(self, num_envs: int, device: torch.device, **kwargs):
         super().__init__(num_envs, device, morphologies=_MORPHOLOGIES, **kwargs)
