@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import random
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -10,9 +11,18 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEOS_DIR = _PROJECT_ROOT / "videos"
 
+# Camera position relative to the followed ant (world axes, Y up). The look
+# direction is auto-derived to point back at the ant.
+CAMERA_OFFSET = (2.5, 2.5, 2.5)
+
+# Give the SDL render window a stable, unique WM_CLASS so _find_xwindow can
+# target it. Without this SDL defaults WM_CLASS to the interpreter name
+# ("python3.11"), which matches nothing and makes the recorder grab the wrong
+# window (e.g. the editor). Must be set before vlearn creates the window.
+os.environ.setdefault("SDL_VIDEO_X11_WMCLASS", "vsim_render")
+
 # Title/class fragments used to identify the vsim render window.
-# SDL2 sets WM_CLASS to "SDL_app" by default; also try common vsim/vlearn names.
-_VSIM_WINDOW_TITLES = ["vsim", "vlearn", "SDL_app"]
+_VSIM_WINDOW_TITLES = ["vsim_render", "vsim", "vlearn"]
 
 
 def _str_to_bool(s: str) -> bool:
@@ -62,25 +72,11 @@ def _find_xwindow(display, title_fragments):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    # Fallback: largest viewable top-level window that isn't the root
-    largest = None
-    largest_area = 0
-    try:
-        for child in root.query_tree().children:
-            try:
-                attrs = child.get_attributes()
-                if attrs.map_state != X.IsViewable:
-                    continue
-                geom = child.get_geometry()
-                area = geom.width * geom.height
-                if area > largest_area:
-                    largest_area = area
-                    largest = child
-            except Xerror.BadWindow:
-                pass
-    except Xerror.BadWindow:
-        pass
-    return largest
+    # No match. Deliberately no "largest window" fallback: it grabs whatever
+    # else is on screen (e.g. the editor). A missing match means the window is
+    # on a non-visible workspace (unviewable) or SDL_VIDEO_X11_WMCLASS didn't
+    # apply.
+    return None
 
 
 class _VideoRecorder:
@@ -96,6 +92,12 @@ class _VideoRecorder:
         self._size = None
         self._frames = 0
         self.done = False
+        self._warned = False
+
+    def _warn_once(self, msg):
+        if not self._warned:
+            print(f"[video] {msg}")
+            self._warned = True
 
     def _init(self):
         from Xlib import display as xdisplay
@@ -114,8 +116,20 @@ class _VideoRecorder:
         from Xlib import X
         win = self._get_window()
         if win is None:
+            self._warn_once(
+                "render window not found — is it on a visible workspace? "
+                "(matching WM_CLASS 'vsim_render')"
+            )
             return None
         try:
+            # Unviewable windows (on a non-visible workspace) yield black frames;
+            # skip them so the video only contains real, rendered frames.
+            if win.get_attributes().map_state != X.IsViewable:
+                self._warn_once(
+                    "render window is hidden (non-visible workspace) — frames "
+                    "skipped; keep it on a visible workspace to record."
+                )
+                return None
             geom = win.get_geometry()
             raw = win.get_image(0, 0, geom.width, geom.height, X.ZPixmap, 0xFFFFFFFF)
         except Exception:
@@ -166,6 +180,69 @@ class _VideoRecorder:
         return callback
 
 
+class FollowCamera:
+    """Drives the viewer camera to follow one ant, switching each episode.
+
+    Picks a new environment-set in a no-repeat random order (reshuffles once all
+    sets are exhausted), then a random ant within it. Switches when the followed
+    ant's episode ends (its progress counter resets).
+    """
+
+    def __init__(self, env, offset_xyz=CAMERA_OFFSET):
+        import vlearn as v
+        self._v = v
+        self.env = env
+        self.offset = v.Vec3(*offset_xyz)
+        n = (offset_xyz[0] ** 2 + offset_xyz[1] ** 2 + offset_xyz[2] ** 2) ** 0.5
+        self.look = v.Vec3(-offset_xyz[0] / n, -offset_xyz[1] / n, -offset_xyz[2] / n)
+        self.sets = env.follow_sets()
+        self._order = []
+        self._last_set = None
+        self._cur_idx = None
+        self._last_progress = -1
+        self._pick_new()
+
+    def _next_set(self) -> int:
+        if not self._order:
+            self._order = list(range(len(self.sets)))
+            random.shuffle(self._order)
+            if len(self._order) > 1 and self._order[0] == self._last_set:
+                self._order.append(self._order.pop(0))
+        return self._order.pop(0)
+
+    def _pick_new(self) -> None:
+        si = self._next_set()
+        self._last_set = si
+        self._cur_idx = random.choice(self.sets[si])
+        self._last_progress = -1
+
+    def update(self) -> None:
+        prog = int(self.env.progress_buf[self._cur_idx].item())
+        if 0 <= self._last_progress and prog < self._last_progress:
+            self._pick_new()
+            prog = int(self.env.progress_buf[self._cur_idx].item())
+        self._last_progress = prog
+        eye = self.env.follow_world_pos(self._cur_idx) + self.offset
+        self.env.gym_render.reset_camera(eye, self.look)
+
+
+def _attach_render_callback(env, recorder=None) -> None:
+    """Compose follow-camera (if env supports it and is rendering) + video capture."""
+    hooks = []
+    if getattr(env, "rendering", False) and hasattr(env, "follow_sets"):
+        hooks.append(FollowCamera(env).update)
+    if recorder is not None:
+        hooks.append(recorder.make_callback(env))
+    if not hooks:
+        return
+
+    def composite():
+        for h in hooks:
+            h()
+
+    env.render_callback = composite
+
+
 def _run_random(env_class, args, video_path=None, video_length=1) -> None:
     import torch
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -189,7 +266,7 @@ def _run_random(env_class, args, video_path=None, video_length=1) -> None:
         # stop_env=False: we own this loop, so break on recorder.done instead of
         # tripping env.render_finished (which would raise via raise_exception).
         recorder = _VideoRecorder(video_path, max_frames=video_length * max_ep, stop_env=False)
-        env.render_callback = recorder.make_callback(env)
+    _attach_render_callback(env, recorder)
     while not env.render_finished:
         if recorder is not None and recorder.done:
             break
@@ -357,8 +434,7 @@ def run_training(
         envs = env_class(n, device, **env_kwargs)
         if mode == "play":
             envs.inference_mode_post_init_callback()
-        if recorder is not None:
-            envs.render_callback = recorder.make_callback(envs)
+        _attach_render_callback(envs, recorder)
         return NewToOldAPICompatilibity(envs)
 
     def make_vecenv(config_name, num_actors, **kw):

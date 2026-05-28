@@ -26,6 +26,9 @@ _OBS_BASE    = 107  # 1+4+3+3+16+16+16+8*6
 _MASK_DIM    = 16
 _OBS_TOTAL   = _OBS_BASE + _MASK_DIM  # 123
 
+# Empty grid cells of padding between adjacent morphology sets (in units of `spacing`).
+_SET_GAP_CELLS = 4
+
 
 def _stable_morphologies(
     min_legs: int = 3,
@@ -53,6 +56,26 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
     def unwrapped(self):
         return self
 
+    # ---- Follow-camera interface ----------------------------------------------
+
+    def follow_sets(self) -> list[list[int]]:
+        EPM = self.envs_per_morph
+        return [list(range(gi * EPM, (gi + 1) * EPM)) for gi in range(len(self.groups))]
+
+    def follow_world_pos(self, idx: int) -> v.Vec3:
+        EPM = self.envs_per_morph
+        gi, i = idx // EPM, idx % EPM
+        g = self.groups[gi]
+        if "env_transforms" not in g:
+            env_set = list(g["env_group"].get_environment_sets())[0]
+            g["env_transforms"] = [
+                env_set.get_environment(env_set.get_environment_handle(j)).get_transform()
+                for j in range(EPM)
+            ]
+        p = g["kine_handler"].get_link_pose_buf[i, 4:7]
+        local = v.Vec3(float(p[0]), float(p[1]), float(p[2]))
+        return g["env_transforms"][i].transform(local)
+
     def __init__(
         self,
         num_envs: int,
@@ -67,7 +90,7 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
         gravity: v.Vec3 = v.Vec3(0, -9.81, 0),
         timestep: float = 0.01667,
         frame_skip: int = 1,
-        spacing: float = 2.0,
+        spacing: float = 3.0,
         max_contact_pairs_per_env: int = 64,
         with_window: bool = True,
         seed: int = None,
@@ -142,8 +165,8 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
         epm          = self.envs_per_morph
         cols         = max(1, ceil(epm ** 0.5))
         rows_per_grp = max(1, ceil(epm / cols))
-        stride_x     = (cols + 2) * self.spacing
-        stride_z     = (rows_per_grp + 2) * self.spacing
+        stride_x     = (cols + _SET_GAP_CELLS) * self.spacing
+        stride_z     = (rows_per_grp + _SET_GAP_CELLS) * self.spacing
         n_grp_cols   = max(1, ceil(len(self._morphologies) ** 0.5))
 
         for gi, morph in enumerate(self._morphologies):
