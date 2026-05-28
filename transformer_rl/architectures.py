@@ -65,6 +65,7 @@ class LegTransformer(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
+        B = obs.shape[0]
 
         t = self.embed_torso(torso).unsqueeze(1)
         h = self.embed_hip(hip_tok)
@@ -73,12 +74,20 @@ class LegTransformer(nn.Module):
 
         x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids)
 
+        # (B, 1+2*n_legs, 1): torso always active, then hip masks, then ankle masks
+        token_mask = torch.cat(
+            [torch.ones(B, 1, dtype=x.dtype, device=x.device), active_mask],
+            dim=1,
+        ).unsqueeze(-1)
+        x = x * token_mask  # zero inactive token embeddings (kills them as queries)
+
         pad_mask = torch.cat(
-            [torch.zeros(obs.shape[0], 1, dtype=torch.bool, device=obs.device),
-             ~(active_mask > 0.5)],
+            [torch.zeros(B, 1, dtype=torch.bool, device=x.device),
+             ~active_mask.bool()],
             dim=1,
         )
         x = self.encoder(x, src_key_padding_mask=pad_mask)
+        x = x * token_mask  # zero inactive outputs (cuts gradient through transformer)
 
         joints = x[:, 1:, :]
         a_nat  = torch.tanh(self.joint_head(joints).squeeze(-1))

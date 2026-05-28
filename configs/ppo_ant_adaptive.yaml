@@ -3,7 +3,7 @@ params:
     name: a2c_continuous
 
   model:
-    name: continuous_a2c_logstd
+    name: transformer_masked_a2c_logstd
 
   network:
     name: dynamic_leg_transformer

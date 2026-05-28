@@ -24,7 +24,6 @@ _LEG_ENC_8 = torch.tensor(
 
 def _tokenize(obs, n_legs, obs_dim, mask_dim, leg_enc):
     B = obs.shape[0]
-    enc = leg_enc.to(obs.device).unsqueeze(0).expand(B, -1, -1)  # (B, n_legs, 2)
 
     n_dof     = 2 * n_legs
     torso     = obs[:, 0:11]
@@ -35,6 +34,10 @@ def _tokenize(obs, n_legs, obs_dim, mask_dim, leg_enc):
     raw_mask  = (obs[:, obs_dim : obs_dim + mask_dim]
                  if obs.shape[1] >= obs_dim + mask_dim
                  else torch.ones(B, mask_dim, device=obs.device))
+
+    leg_active = (raw_mask[:, 0::2] > 0).float()  # (B, n_legs) from hip slots
+    enc = leg_enc.to(obs.device).unsqueeze(0).expand(B, -1, -1)  # (B, n_legs, 2)
+    enc = enc * leg_active.unsqueeze(-1)  # zero sin/cos for inactive legs
 
     hip_tokens = torch.stack([
         torch.cat([dof_pos[:, 2*i:2*i+1], dof_vel[:, 2*i:2*i+1],
@@ -48,7 +51,7 @@ def _tokenize(obs, n_legs, obs_dim, mask_dim, leg_enc):
         for i in range(n_legs)
     ], dim=1)  # (B, n_legs, 11)
 
-    active_mask = torch.cat([raw_mask[:, 0::2], raw_mask[:, 1::2]], dim=-1)  # (B, mask_dim)
+    active_mask = (torch.cat([raw_mask[:, 0::2], raw_mask[:, 1::2]], dim=-1) > 0).float()  # (B, mask_dim)
     return torso, hip_tokens, ankle_tokens, active_mask
 
 
