@@ -11,10 +11,6 @@ study:
   summaries_subdir: summaries
 
 params:
-  - path: params.network.transformer.n_heads
-    type: categorical
-    choices: [4, 8]
-
   - path: params.config.horizon_length
     type: categorical
     choices: [8, 16, 32]
@@ -36,4 +32,4 @@ params:
 
 derived_params:
   - path: params.config.minibatch_size
-    expr: "8192 * horizon_length // 4"
+    expr: "4096 * horizon_length // 4"
