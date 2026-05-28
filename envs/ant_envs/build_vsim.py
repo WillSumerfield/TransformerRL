@@ -208,12 +208,14 @@ def build_ant_vsim(active_legs: frozenset) -> str:
     for n in active:
         parts.append(_leg_link(n, _LEG_DATA[n - 1]))
 
-    # Hip joints
-    for n in active:
+    # Hip joints — declared in REVERSE active order so vsim's reverse-DFS
+    # traversal yields DOFs in ascending active order (matches scatter logic
+    # in AntCodesignEnv.compute_observations).
+    for n in reversed(active):
         parts.append(_hip_joint(n, _LEG_DATA[n - 1]))
 
     # Ankle joints
-    for n in active:
+    for n in reversed(active):
         parts.append(_ankle_joint(n, _LEG_DATA[n - 1]))
 
     # Motors
