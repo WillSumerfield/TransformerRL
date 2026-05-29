@@ -138,6 +138,22 @@ class _State:
     def n_done(self) -> int:
         return sum(1 for t in self.trials if t.status in ("done", "failed"))
 
+    def seed(self, study) -> None:
+        """Pre-populate from an existing study so the TUI shows prior trials on resume."""
+        TS = optuna.trial.TrialState
+        for t in sorted(study.trials, key=lambda x: x.number):
+            if t.state in (TS.RUNNING, TS.WAITING):
+                continue  # interrupted/stale; not a finished result
+            tr = _Trial(t.number, dict(t.params))
+            if t.state == TS.COMPLETE and t.value is not None and t.value > _NEGINF:
+                tr.score, tr.status = t.value, "done"
+            else:
+                tr.score, tr.status = _NEGINF, "failed"
+            if t.datetime_complete and t.datetime_start:
+                tr.elapsed = (t.datetime_complete - t.datetime_start).total_seconds()
+                self._done_times.append(tr.elapsed)
+            self.trials.append(tr)
+
 
 # ── TUI ───────────────────────────────────────────────────────────────
 
@@ -515,6 +531,9 @@ def main():
         _show_results(study, tune_cfg, base_cfg, output_dir)
         return
 
+    state.seed(study)  # show prior trials in the TUI on resume
+    n_remaining = max(0, sc["n_trials"] - len(study.trials))
+
     if len(study.trials) == 0:
         defaults = {}
         for p in tune_cfg["params"]:
@@ -570,7 +589,7 @@ def main():
             return score
 
         try:
-            study.optimize(objective, n_trials=sc["n_trials"])
+            study.optimize(objective, n_trials=n_remaining)
         except KeyboardInterrupt:
             pass
         finally:
