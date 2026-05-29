@@ -1,4 +1,4 @@
-"""CodesignEnvironmentGpu: EnvironmentGpu extended to support multiple EnvironmentGroups."""
+"""MultiGroupEnvironmentGpu: EnvironmentGpu extended to support multiple EnvironmentGroups."""
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "vlearn-main" / "train"))
@@ -15,7 +15,7 @@ from vlearn.spaces import Box
 import vlearn as v
 
 
-class CodesignEnvironmentGpu(ABC):
+class MultiGroupEnvironmentGpu(ABC):
 
     def __init__(
         self,

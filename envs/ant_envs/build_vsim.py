@@ -5,7 +5,7 @@ from pathlib import Path
 _EFFORT = "3.40282347e+38"
 _DENSITY = "5.0"
 
-# Per-leg geometry data extracted from ant_dynamic.vsim
+# Per-leg geometry data extracted from ant_8leg.vsim
 # Index 0 = leg 1, index 7 = leg 8
 _LEG_DATA = [
     {   # Leg 1 (0 deg)
@@ -210,7 +210,7 @@ def build_ant_vsim(active_legs: frozenset) -> str:
 
     # Hip joints — declared in REVERSE active order so vsim's reverse-DFS
     # traversal yields DOFs in ascending active order (matches scatter logic
-    # in AntCodesignEnv.compute_observations).
+    # in AntMultiMorphEnv.compute_observations).
     for n in reversed(active):
         parts.append(_hip_joint(n, _LEG_DATA[n - 1]))
 

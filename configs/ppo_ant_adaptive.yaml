@@ -6,7 +6,7 @@ params:
     name: transformer_masked_a2c_logstd
 
   network:
-    name: dynamic_leg_transformer
+    name: multimorph_leg_transformer
     separate: False
     space:
       continuous:

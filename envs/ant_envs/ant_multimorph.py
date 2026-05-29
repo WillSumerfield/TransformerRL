@@ -1,4 +1,4 @@
-"""AntCodesignEnv: simultaneous morphology + controller training via one group per morphology."""
+"""AntMultiMorphEnv: train one controller across many morphologies, one group per morphology."""
 import sys
 from math import ceil
 from pathlib import Path
@@ -16,7 +16,7 @@ from envs.ant_environment_common import (
 )
 from envs.common import create_plane, reset_noise_helper
 
-from ..codesign_environment import CodesignEnvironmentGpu
+from ..multigroup_environment import MultiGroupEnvironmentGpu
 from .build_vsim import build_ant_vsim, write_vsim_tempfile
 
 
@@ -49,7 +49,7 @@ def _stable_morphologies(
     return result
 
 
-class AntCodesignEnv(CodesignEnvironmentGpu):
+class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
     """One EnvironmentGroup per stable morphology. Obs is 123D; actions are always 16D."""
 
     @property
@@ -203,9 +203,9 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
                 dtype=torch.long, device=self.device,
             )  # (n_active_legs * 6,)
 
-            # Limb mask: 1 for active DOFs, 0 otherwise
-            limb_mask = torch.zeros(_N_DOFS_FULL, dtype=torch.float32, device=self.device)
-            limb_mask[dof_indices] = 1.0
+            # DOF mask: 1 for active DOFs, 0 otherwise
+            dof_mask = torch.zeros(_N_DOFS_FULL, dtype=torch.float32, device=self.device)
+            dof_mask[dof_indices] = 1.0
 
             self.groups.append({
                 "morph":           morph,
@@ -218,7 +218,7 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
                 "env_def_handle":  env_def_handle,
                 "dof_indices":     dof_indices,
                 "sensor_indices":  sensor_indices,
-                "limb_mask":       limb_mask,
+                "dof_mask":       dof_mask,
             })
 
     # ---- Buffer allocation ----------------------------------------------------
@@ -293,8 +293,8 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
             g["force_buffers"] = force_buffers
             g["n_sensors"]     = n_sensors
 
-            # Pre-set constant limb_mask in obs_buf (slot 107:123, never overwritten in loop)
-            self._obs_buf[start:end, _OBS_BASE:_OBS_TOTAL] = g["limb_mask"].unsqueeze(0)
+            # Pre-set constant dof_mask in obs_buf (slot 107:123, never overwritten in loop)
+            self._obs_buf[start:end, _OBS_BASE:_OBS_TOTAL] = g["dof_mask"].unsqueeze(0)
 
         # Batch all motor / sensor commands across all groups into single GPU arrays
         self.all_motor_cmd_array  = self.gym.create_gpu_array(all_motor_cmds)
@@ -310,7 +310,7 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
             # Save root pose before physics (from last get_articulation_kinematic_states)
             self.old_root_pos_buf[start:end] = g["kine_handler"].get_link_pose_buf
             # Mask inactive joints in action; write active DOFs to motor buffer
-            self._act_buf[start:end] = actions[start:end] * g["limb_mask"]
+            self._act_buf[start:end] = actions[start:end] * g["dof_mask"]
             g["motor_buf"][:] = self._act_buf[start:end, g["dof_indices"]]
         self.gym.set_motor_forces(self.all_motor_cmd_array)
 
@@ -366,7 +366,7 @@ class AntCodesignEnv(CodesignEnvironmentGpu):
                 raw = torch.cat(g["force_buffers"], dim=-1)  # (EPM, n_sensors*6)
                 obs[:, 59 + g["sensor_indices"]] = raw
 
-            # [107:123] = limb_mask — set once at allocate time, preserved here
+            # [107:123] = dof_mask — set once at allocate time, preserved here
 
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         EPM = self.envs_per_morph

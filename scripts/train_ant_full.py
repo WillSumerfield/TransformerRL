@@ -1,4 +1,4 @@
-"""PPO training on AntCodesignEnv: one EnvironmentGroup per stable morphology."""
+"""PPO training on AntMultiMorphEnv: one EnvironmentGroup per stable morphology."""
 import os; os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 import sys
 from pathlib import Path
@@ -7,8 +7,8 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from envs.ant_envs.ant_codesign import AntCodesignEnv, _stable_morphologies
-from transformer_rl import DynamicLegTransformerBuilder
+from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _stable_morphologies
+from transformer_rl import MultiMorphLegTransformerBuilder
 
 
 def post_config(args, config):
@@ -19,10 +19,10 @@ def post_config(args, config):
 
 
 run_training(
-    default_config="ppo_ant_dynamic_p1.yaml",
-    train_dir="runs/ant_dynamic_p1",
-    env_class=AntCodesignEnv,
-    env_name="ant-codesign-env",
-    network=("dynamic_leg_transformer", DynamicLegTransformerBuilder),
+    default_config="ppo_ant_full.yaml",
+    train_dir="runs/ant_full",
+    env_class=AntMultiMorphEnv,
+    env_name="ant-multimorph-env",
+    network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
     post_config_fn=post_config,
 )

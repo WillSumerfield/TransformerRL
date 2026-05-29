@@ -4,7 +4,7 @@ import torch.nn as nn
 from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch.models import ModelA2CContinuousLogStd
 
-from .architectures import LegTransformer, DynamicLegTransformer
+from .architectures import LegTransformer, MultiMorphLegTransformer
 from .tokenize import OBS_DIM_4 as OBS_DIM, MASK_DIM_4 as MASK_DIM, OBS_DIM_8 as DYN_OBS_DIM, MASK_DIM_8 as DYN_MASK_DIM
 
 
@@ -46,8 +46,8 @@ class LegTransformerBuilder(NetworkBuilder):
         return LegTransformerBuilder.Network(self.params, **kwargs)
 
 
-class DynamicLegTransformerBuilder(NetworkBuilder):
-    """rl_games builder for 8-leg ant (ant_dynamic)."""
+class MultiMorphLegTransformerBuilder(NetworkBuilder):
+    """rl_games builder for the 8-leg multi-morphology ant."""
 
     def load(self, params):
         self.params = params
@@ -59,7 +59,7 @@ class DynamicLegTransformerBuilder(NetworkBuilder):
             kwargs.pop('input_shape', None)
             kwargs.pop('num_seqs', None)
             tc = params.get('transformer', {})
-            self.net = DynamicLegTransformer(**tc)
+            self.net = MultiMorphLegTransformer(**tc)
             self.log_std_param = nn.Parameter(torch.zeros(16))
 
         def forward(self, obs_dict):
@@ -81,11 +81,11 @@ class DynamicLegTransformerBuilder(NetworkBuilder):
             return False
 
     def build(self, name, **kwargs):
-        return DynamicLegTransformerBuilder.Network(self.params, **kwargs)
+        return MultiMorphLegTransformerBuilder.Network(self.params, **kwargs)
 
 
 class TransformerMaskedNorm(ModelA2CContinuousLogStd):
-    """continuous_a2c_logstd whose input normalizer leaves the limb-mask dims raw.
+    """continuous_a2c_logstd whose input normalizer leaves the DOF mask dims raw.
 
     Standard RunningMeanStd collapses the constant mask to ~0 once running_mean
     rounds to 1.0 in fp32 (a hard cliff that flips every leg to "inactive"). We keep

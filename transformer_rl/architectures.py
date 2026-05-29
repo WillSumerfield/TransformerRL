@@ -98,6 +98,6 @@ class LegTransformer(nn.Module):
         return mu, value
 
 
-def DynamicLegTransformer(n_layers: int = 3, **kwargs) -> LegTransformer:
+def MultiMorphLegTransformer(n_layers: int = 3, **kwargs) -> LegTransformer:
     kwargs.setdefault('n_legs', 8)
     return LegTransformer(n_layers=n_layers, **kwargs)

@@ -1,4 +1,4 @@
-"""PPO training on AntAdaptiveEnv: codesign env with 3-4 leg morphologies."""
+"""PPO training on AntAdaptiveEnv: multi-morphology env with 3-4 leg morphologies."""
 import os; os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
 import sys
 from pathlib import Path
@@ -8,7 +8,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
 from envs.ant_envs.ant_adaptive import AntAdaptiveEnv, _MORPHOLOGIES
-from transformer_rl import DynamicLegTransformerBuilder
+from transformer_rl import MultiMorphLegTransformerBuilder
 
 
 def post_config(args, config):
@@ -23,6 +23,6 @@ run_training(
     train_dir="runs/ant_adaptive",
     env_class=AntAdaptiveEnv,
     env_name="ant-adaptive-env",
-    network=("dynamic_leg_transformer", DynamicLegTransformerBuilder),
+    network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
     post_config_fn=post_config,
 )

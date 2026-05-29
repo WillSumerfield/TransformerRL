@@ -12,7 +12,7 @@ params:
     name: transformer_masked_a2c_logstd
 
   network:
-    name: dynamic_leg_transformer
+    name: multimorph_leg_transformer
     separate: False
     space:
       continuous:
@@ -34,8 +34,8 @@ params:
       ankle_dim: 11
 
   config:
-    name: ant_dynamic_transformer_p1
-    env_name: ant-codesign-env
+    name: ant_full_transformer
+    env_name: ant-multimorph-env
     multi_gpu: False
     ppo: True
     mixed_precision: True
