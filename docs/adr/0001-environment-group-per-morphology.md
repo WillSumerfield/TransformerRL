@@ -1,0 +1,3 @@
+# One EnvironmentGroup per morphology (real leg removal)
+
+Each morphology gets its own vsim build, instantiated as one vlearn `EnvironmentGroup`, rather than running a single full-leg body and freezing unused joints per env. Per-env joint masking was rejected because frozen legs still exist in physics — they carry collision geometry and inertia, so a "3-leg" masked ant is not dynamically the same body as a real 3-leg ant. Real leg removal requires a distinct vsim per morphology, hence one group each (e.g. 131 groups for the full ant). Motors for all groups are batched into one GPU array; kinematic state is get/set per group.

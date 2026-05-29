@@ -1,10 +1,15 @@
 # Adaptive Ant Fixes
 
 This document records the bugs found and fixed while making the **adaptive ant**
-(`AntAdaptiveEnv`, a codesign env restricted to morphology `{2,4,6,8}`) train
+(`AntAdaptiveEnv`, at the time restricted to morphology `{2,4,6,8}`) train
 equivalently to the **classic ant** (`AntEnv`), plus the masking machinery that
 makes the shared 8-leg transformer work. It is organized symptom-first: skim the
 quick-reference table, then read the entry for whatever you're chasing.
+
+> **Note:** the parity claims below were validated against the `{2,4,6,8}` morphology;
+> the adaptive ant has since broadened to all 46 stable 3–4-leg morphologies. The
+> validation harnesses cited here (`test_ant_parity.py`, `test_mask_norm.py`,
+> `test_pos_emb_permutation.py`) live on branch `tests/adaptive-ant-fixes`, not `main`.
 
 ---
 
@@ -13,7 +18,7 @@ quick-reference table, then read the entry for whatever you're chasing.
 | Symptom | Root cause | Fix | File |
 |---|---|---|---|
 | Adaptive ≠ classic on a synced rollout | vsim emits DOFs in reverse leg order; scatter assumed ascending | Declare hip/ankle joints in reverse so DOFs come out ascending | `envs/ant_envs/build_vsim.py` |
-| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant limb-mask to 0 (fp32 rounding); every leg reads "inactive" | Mask-passthrough model: leave `obs[107:123]` un-normalized | `transformer_rl/models.py`, configs |
+| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant DOF mask to 0 (fp32 rounding); every leg reads "inactive" | Mask-passthrough model: leave `obs[107:123]` un-normalized | `transformer_rl/models.py`, configs |
 | Spiky `a_loss`, jerky reward; LR pinned at `0.01` | `σ=e⁻¹⁰` on inactive dims poisons `policy_kl` (−0.5/dim → ≈−4 KL), so adaptive LR cranks to max | Inactive `log_std = 0` (σ=1) instead of `-10` | `transformer_rl/models.py` |
 | Inactive `log_std_param` drifts under entropy bonus | Entropy gradient hit every dim, masked or not | Gradient-gate: `log_std = mask_dof * log_std_param` | `transformer_rl/models.py` |
 | (ruled out) Suspected pos-emb index mismatch | — | Proven to be pure relabeling; no effect | `scripts/test_pos_emb_permutation.py` |
@@ -30,8 +35,8 @@ Understanding three layout facts makes every entry below clearer.
 
 - **Two ants, two obs sizes.** Classic `AntEnv` is a fixed 4-leg ant: **59-D obs,
   8-D actions**, network `LegTransformer(n_legs=4)`. Adaptive `AntAdaptiveEnv`
-  inherits the codesign stack: **123-D obs, 16-D actions** (always padded to
-  8 legs), network `DynamicLegTransformer(n_legs=8)`.
+  inherits the multi-morphology stack: **123-D obs, 16-D actions** (always padded to
+  8 legs), network `MultiMorphLegTransformer(n_legs=8)`.
 
 - **The 8-leg obs layout (123-D):**
   ```
@@ -40,9 +45,9 @@ Understanding three layout facts makes every entry below clearer.
   [27:43]   dof_vel   (16 slots, inactive = 0)
   [43:59]   last_act  (16 slots, inactive = 0)
   [59:107]  force sensors (8 legs × 6)
-  [107:123] limb_mask (16 bits: 1 = active DOF, 0 = inactive)   ← the crux
+  [107:123] dof_mask (16 bits: 1 = active DOF, 0 = inactive)   ← the crux
   ```
-  The limb mask is written **once** at allocation and never touched during
+  The DOF mask is written **once** at allocation and never touched during
   stepping. The tokenizer (`tokenize_8`) and the policy builder both read
   `obs[107:123]` purely through a `> 0` boolean test to decide which legs exist.
 
@@ -58,7 +63,7 @@ Understanding three layout facts makes every entry below clearer.
 
 **Observed.** We built a parity harness (`scripts/test_ant_parity.py`) that resets
 classic ant, copies its kinematic state into adaptive ant (`{2,4,6,8}`), and feeds
-both the same `DynamicLegTransformer` weights. Obs matched at reset, the forward
+both the same `MultiMorphLegTransformer` weights. Obs matched at reset, the forward
 pass matched — but after **one physics step**, state diverged hugely:
 
 ```
@@ -79,7 +84,7 @@ adaptive : [hip_8, ankle_8, hip_6, ankle_6, hip_4, ankle_4, hip_2, ankle_2]  (DE
 **Root cause.** vsim builds its DOF order by a depth-first traversal that visits a
 torso's child joints in **reverse declaration order**. `build_vsim` declared hips
 ascending (`hip_2, hip_4, …`), so vsim emitted them descending. But
-`AntCodesignEnv.compute_observations` scatters `dof_pos[i]` into the obs slot for
+`AntMultiMorphEnv.compute_observations` scatters `dof_pos[i]` into the obs slot for
 the *i-th active leg in ascending order* — so leg N's reading landed in the obs
 slot (and motor) of the diametrically opposite leg. Parity at *reset* still
 passed because both the bad sync and the bad scatter cancelled when all values are
@@ -99,7 +104,7 @@ for n in reversed(active):
 After the fix the adaptive DOF order is `[hip_2, ankle_2, hip_4, …]` and all parity
 checks drop to `0.000e+00`.
 
-**Why it's useful.** Without this, *every* codesign morphology was training on
+**Why it's useful.** Without this, *every* multi-morphology was training on
 mirror-scrambled observations — the policy had to learn to compensate for a
 permutation, and any checkpoint trained pre-fix is on corrupted data.
 
@@ -153,7 +158,7 @@ def norm_obs(self, observation):
 ```
 
 It's registered as `transformer_masked_a2c_logstd` (`train_utils.py:365`) and
-selected via `model.name` in `ppo_ant_adaptive.yaml` and `ppo_ant_dynamic_p1.yaml`.
+selected via `model.name` in `ppo_ant_adaptive.yaml` and `ppo_ant_full.yaml`.
 The mask size comes from the existing `MASK_DIM_8` constant (shared with the
 tokenizer — single source of truth), and a build-time assert enforces
 `obs == OBS_DIM_8 + MASK_DIM_8 (123)`.
@@ -205,7 +210,7 @@ instead of `-10`. Combined with the gradient-gating, both builders use:
 log_std = mask_dof * self.log_std_param   # active: log_std_param; inactive: 0 (σ=1)
 ```
 
-The env already zeros inactive actions (`_act_buf = actions * limb_mask`), so the
+The env already zeros inactive actions (`_act_buf = actions * dof_mask`), so the
 inactive σ is **irrelevant to dynamics** — but a moderate σ keeps `policy_kl`
 well-conditioned. After the fix, an unchanged 16-D policy reports `KL ≈ 8e-5`
 (was `−3.99`), so the controller tracks the real active-dim KL.
@@ -237,17 +242,6 @@ one line; either way the gating property holds.
 
 ---
 
-### Ruled out: position-embedding index mismatch
-
-Before the real causes were nailed down, we suspected the 8-leg transformer's
-position embeddings (active legs use `pos_emb[2,4,6,8]`) vs the 4-leg's
-(`pos_emb[1,2,3,4]`) caused divergent training. `scripts/test_pos_emb_permutation.py`
-permutes the rows and remaps `pos_ids`, producing **bit-identical** outputs — so
-pos-emb indexing is pure relabeling and cannot cause a systematic gap. Recorded so
-we don't re-investigate it.
-
----
-
 ## How the masking generalizes to multi-morphology (3- and 4-leg mixes)
 
 All three masking changes are **per-env**, so a batch mixing a 3-leg morph
@@ -269,33 +263,3 @@ different bodies with different reward scales; `normalize_value` /
 `normalize_advantage` pool across all of them, and the adaptive LR adapts to the
 *mean* KL. If per-morph imbalance shows up, look at per-morph advantage
 normalization or reward scaling — not the mask plumbing.
-
----
-
-## Tests added
-
-| Test | What it guards | How to run |
-|---|---|---|
-| `scripts/test_ant_parity.py` | classic ↔ adaptive`{2,4,6,8}` bit-parity over 10 steps (obs, mu, value, reward, term/trunc, all loss components) + mask preservation + log_std gradient-gating | `uv run python scripts/test_ant_parity.py` |
-| `scripts/test_mask_norm.py` | mask survives input normalization (standard model collapses, masked model preserves raw `{0,1}` and still normalizes physical dims) | `uv run python scripts/test_mask_norm.py` |
-| `scripts/test_pos_emb_permutation.py` | pos-emb index choice is pure relabeling (outputs identical) | `uv run python scripts/test_pos_emb_permutation.py` |
-
-`test_ant_parity.py` runs each env in its own subprocess because vlearn's gym is a
-process singleton; the classic phase dumps a trajectory, the adaptive phase syncs
-and replays it.
-
-## Files changed
-
-- `envs/ant_envs/build_vsim.py` — reverse joint declaration order (DOF-order fix).
-- `transformer_rl/models.py` — `TransformerMaskedNorm` model; `log_std = mask_dof * log_std_param` in both builders.
-- `transformer_rl/train_utils.py` — register `transformer_masked_a2c_logstd`.
-- `configs/ppo_ant_adaptive.yaml`, `configs/ppo_ant_dynamic_p1.yaml` — `model.name: transformer_masked_a2c_logstd`.
-
-## Open questions
-
-1. Should entropy/neglogp be masked to active dims so the readout matches classic
-   (`≈11.35`)? Currently cosmetic-only; left as-is.
-2. Multi-morph codesign: do we need per-morph advantage/reward normalization once
-   morphologies with very different dynamics are mixed?
-3. Any adaptive checkpoints trained before the `build_vsim` fix are on scrambled
-   obs and should be discarded — confirm none are being resumed.

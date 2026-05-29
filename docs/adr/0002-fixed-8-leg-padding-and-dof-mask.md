@@ -1,0 +1,3 @@
+# Fixed 8-leg / 16-DOF padding with a DOF mask
+
+Every morphology presents the same shape to the policy — 8 leg slots, 16 DOF slots — with inactive slots zeroed and a 16-bit DOF mask (obs `[107:123]`) marking which DOFs are real. We chose fixed padding over variable-length observations so one shared policy, value function, and batched motor array span all morphologies without ragged tensors. The cost is the DOF-mask machinery this forces everywhere: the tokenizer and policy gate on `mask > 0`, the input normalizer must not collapse the constant mask (see the masked-norm model), and inactive DOFs need careful σ/gradient handling (see `docs/adaptive_ant_fixes.md`). The mask is written once at allocation and is constant per env.
