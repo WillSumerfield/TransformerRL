@@ -30,13 +30,16 @@ def _str_to_bool(s: str) -> bool:
 
 
 def _adjust_minibatch(cfg: dict, n_envs: int, h_len: int) -> None:
-    mb = cfg["minibatch_size"]
+    requested = cfg["minibatch_size"]
     batch = h_len * n_envs
-    n_batches = (batch + mb - 1) // mb
+    n_batches = (batch + requested - 1) // requested
     mb = batch // n_batches if n_batches > 1 else batch
     if batch % mb != 0:
         print(f"Error: batch ({batch}) not divisible by minibatch ({mb})")
         sys.exit(1)
+    if mb != requested:
+        print(f"Warning: minibatch_size {requested} does not divide batch {batch} "
+              f"(num_actors={n_envs} * horizon={h_len}); snapped to {mb} ({n_batches} minibatches).")
     cfg["minibatch_size"] = mb
 
 
@@ -188,6 +191,8 @@ class FollowCamera:
     ant's episode ends (its progress counter resets).
     """
 
+    MAX_FRAMES_PER_MORPH = 250
+
     def __init__(self, env, offset_xyz=CAMERA_OFFSET):
         import vlearn as v
         self._v = v
@@ -200,6 +205,7 @@ class FollowCamera:
         self._last_set = None
         self._cur_idx = None
         self._last_progress = -1
+        self._start_time = 0
         self._pick_new()
 
     def _next_set(self) -> int:
@@ -218,9 +224,12 @@ class FollowCamera:
 
     def update(self) -> None:
         prog = int(self.env.progress_buf[self._cur_idx].item())
-        if 0 <= self._last_progress and prog < self._last_progress:
+        time_w_current_morph = prog - self._start_time
+        env_reset = prog < self._last_progress
+        if time_w_current_morph > self.MAX_FRAMES_PER_MORPH or env_reset:
             self._pick_new()
             prog = int(self.env.progress_buf[self._cur_idx].item())
+            self._start_time = prog
         self._last_progress = prog
         eye = self.env.follow_world_pos(self._cur_idx) + self.offset
         self.env.gym_render.reset_camera(eye, self.look)
@@ -359,9 +368,10 @@ def run_training(
     config["params"]["config"]["player"]["use_vecenv"] = True
     config["params"]["config"]["player"]["print_stats"] = False
     cfg = config["params"]["config"]
+    cfg.setdefault("use_diagnostics", True)  # enables diagnostics/exp_var, clip_frac, rms_value
     exp_name = cfg.get("name", "run").removeprefix("ant_")
-    cfg["train_dir"] = f"{train_dir}/{exp_name}"
-    cfg["full_experiment_name"] = datetime.now().strftime("%d-%H-%M-%S")
+    cfg.setdefault("train_dir", f"{train_dir}/{exp_name}")
+    cfg.setdefault("full_experiment_name", datetime.now().strftime("%d-%H-%M-%S"))
 
     # --- Seed ---
     if args.seed is not None:
@@ -466,6 +476,11 @@ def run_training(
             print("[play] No checkpoint provided; running with randomly initialized model")
 
     runner = Runner()
+    # Swap in the metrics-logging agent for all continuous PPO runs (see logging_agent.py).
+    from .logging_agent import LoggingA2CAgent
+    runner.algo_factory.register_builder(
+        'a2c_continuous', lambda **kwargs: LoggingA2CAgent(**kwargs)
+    )
     runner.load(config)
     try:
         runner.run(run_args)
