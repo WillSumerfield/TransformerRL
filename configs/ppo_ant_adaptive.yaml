@@ -19,10 +19,10 @@ params:
           val: 0
         fixed_sigma: True
     transformer:
-      d_model: 208
-      n_heads: 8
+      d_model: 160
+      n_heads: 16
       n_layers: 1
-      ffn: 832
+      ffn: 640
       torso_dim: 11
       hip_dim: 5
       ankle_dim: 11
@@ -42,22 +42,22 @@ params:
     normalize_advantage: True
     gamma: 0.98
     tau: 0.95
-    learning_rate: 7e-4
+    learning_rate: 6e-4
     lr_schedule: adaptive
     schedule_type: legacy
-    kl_threshold: 0.015
+    kl_threshold: 0.0235
     score_to_win: 10000
-    max_epochs: 1000
+    max_epochs: 1500
     save_best_after: 200
     save_frequency: 50
-    grad_norm: 1.0
-    entropy_coef: 0.001
+    grad_norm: 1.6
+    entropy_coef: 0.0015
     truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
-    minibatch_size: 32768
+    minibatch_size: 32768  # auto-snapped to divide batch if needed (see _adjust_minibatch)
     mini_epochs: 4
-    critic_coef: 2
+    critic_coef: 3.25
     clip_value: True
     seq_length: 4
     bounds_loss_coef: 0.0
