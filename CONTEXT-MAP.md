@@ -56,6 +56,21 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
 - **Shared kernel** (below): Morphology, Leg, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign — defined once here, used identically across all contexts.
 
+## Upstream — vlearn / VSim
+
+This repo runs on the **vlearn** RL framework and the **VSim** GPU simulator, vendored as a sibling checkout at [`../vlearn-main`](../vlearn-main). Coupling: every env/script inserts `../vlearn-main/train` on `sys.path` and `import vlearn` (`vlearn.spaces`, `vlearn.torch_utils`); `AntMultiMorphEnv` and `AntEnv` subclass `EnvironmentGpu` (via `envs.ant_environment_gpu.AntEnvironmentGpu`).
+
+Reference these when working on env physics or the group/motor/sensor plumbing:
+
+- **Glossaries** (same CONTEXT.md style): [`../vlearn-main/train/CONTEXT.md`](../vlearn-main/train/CONTEXT.md) (VLearn framework — `EnvironmentGpu`) and [`../vlearn-main/docs/api/CONTEXT.md`](../vlearn-main/docs/api/CONTEXT.md) (VSim simulator).
+- **API reference** (markdown): [`../vlearn-main/docs/api/index.md`](../vlearn-main/docs/api/index.md). Most-used here:
+  - [`environments.md`](../vlearn-main/docs/api/environments.md) — `EnvironmentGroup`/`EnvironmentDef` (our one-group-per-morphology unit; see ADR 0001)
+  - [`training.md`](../vlearn-main/docs/api/training.md) — `EnvironmentGpu` RL base class
+  - [`control.md`](../vlearn-main/docs/api/control.md) — motors / joint commands · [`sensors.md`](../vlearn-main/docs/api/sensors.md) — force sensors · [`gpu_arrays.md`](../vlearn-main/docs/api/gpu_arrays.md) — batched motor/sensor buffers
+- **Built HTML** (browsable): `../vlearn-main/vlearn-docs/html/index.html`; type stubs in `../vlearn-main/docs/stubs/`.
+
+Our local [`docs/vsim_geometry_api.md`](./docs/vsim_geometry_api.md) covers the geometry subset `build_vsim.py` uses.
+
 ## Shared Language
 
 **Codesign**:
