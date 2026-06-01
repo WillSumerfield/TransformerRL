@@ -35,6 +35,9 @@ _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
 **Adaptive ant**:
 `AntAdaptiveEnv` — the multi-morphology ant restricted to the 46 stable 3–4-leg morphologies. The easier curriculum subset of the full ant.
 
+**Morphology resampling**:
+Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
+
 **Morphology split**:
 A stratified partition of a morphology set into *train morphologies* and *test morphologies*, derived deterministically from the config seed. Stratified by leg count — each leg-count stratum is split independently at `train_pct` so both halves see proportional coverage. Requires a seed; errors if `train_pct < 1.0` and no seed is set.
 _Parameters_: `train_pct: float` (fraction kept for training, default `1.0` = no split), `test_set: bool` (use test morphologies instead of train).

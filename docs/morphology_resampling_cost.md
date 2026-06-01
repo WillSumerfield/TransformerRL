@@ -2,9 +2,10 @@
 
 How expensive it is to resample the full ant's morphology set mid-training, why the cost lives where
 it does, and how to pick a resample cadence. The architectural decision (resampling *is* a full gym
-rebuild, vs. alternatives) belongs to a future ADR; this doc is the cost model that informs the
-cadence knob. Benchmarked 2026-06-01 (single `cuda:0`; absolute seconds are machine-specific — the
-*ratios* are the durable part).
+rebuild, vs. alternatives) is recorded in
+[ADR-0005](adr/0005-runtime-morphology-resampling-via-gym-rebuild.md); this doc is the cost model
+that informs the cadence knob. Benchmarked 2026-06-01 (single `cuda:0`; absolute seconds are
+machine-specific — the *ratios* are the durable part).
 
 ## Why resampling means a full rebuild
 

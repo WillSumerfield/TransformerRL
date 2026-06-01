@@ -18,7 +18,7 @@ quick-reference table, then read the entry for whatever you're chasing.
 | Symptom | Root cause | Fix | File |
 |---|---|---|---|
 | Adaptive ≠ classic on a synced rollout | vsim emits DOFs in reverse leg order; scatter assumed ascending | Declare hip/ankle joints in reverse so DOFs come out ascending | `envs/ant_envs/build_vsim.py` |
-| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant DOF mask to 0 (fp32 rounding); every leg reads "inactive" | Mask-passthrough model: leave `obs[107:123]` un-normalized | `transformer_rl/models.py`, configs |
+| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant DOF mask to 0 (fp32 rounding); every leg reads "inactive" | Mask-passthrough model: leave `obs[123:139]` (the mask tail) un-normalized | `transformer_rl/models.py`, configs |
 | Spiky `a_loss`, jerky reward; LR pinned at `0.01` | `σ=e⁻¹⁰` on inactive dims poisons `policy_kl` (−0.5/dim → ≈−4 KL), so adaptive LR cranks to max | Inactive `log_std = 0` (σ=1) instead of `-10` | `transformer_rl/models.py` |
 | Inactive `log_std_param` drifts under entropy bonus | Entropy gradient hit every dim, masked or not | Gradient-gate: `log_std = mask_dof * log_std_param` | `transformer_rl/models.py` |
 | (ruled out) Suspected pos-emb index mismatch | — | Proven to be pure relabeling; no effect | `scripts/test_pos_emb_permutation.py` |
@@ -35,21 +35,22 @@ Understanding three layout facts makes every entry below clearer.
 
 - **Two ants, two obs sizes.** Classic `AntEnv` is a fixed 4-leg ant: **59-D obs,
   8-D actions**, network `LegTransformer(n_legs=4)`. Adaptive `AntAdaptiveEnv`
-  inherits the multi-morphology stack: **123-D obs, 16-D actions** (always padded to
+  inherits the multi-morphology stack: **139-D obs, 16-D actions** (always padded to
   8 legs), network `MultiMorphLegTransformer(n_legs=8)`.
 
-- **The 8-leg obs layout (123-D):**
+- **The 8-leg obs layout (139-D):**
   ```
   [0:11]    torso (y, quat, lin vel, ang vel)
   [11:27]   dof_pos   (16 slots, inactive = 0)
   [27:43]   dof_vel   (16 slots, inactive = 0)
   [43:59]   last_act  (16 slots, inactive = 0)
   [59:107]  force sensors (8 legs × 6)
-  [107:123] dof_mask (16 bits: 1 = active DOF, 0 = inactive)   ← the crux
+  [107:123] segment lengths (8 hip, 8 ankle; raw, RMS-normalized; inactive = 0)
+  [123:139] dof_mask (16 bits: 1 = active DOF, 0 = inactive)   ← the crux
   ```
   The DOF mask is written **once** at allocation and never touched during
   stepping. The tokenizer (`tokenize_8`) and the policy builder both read
-  `obs[107:123]` purely through a `> 0` boolean test to decide which legs exist.
+  `obs[123:139]` purely through a `> 0` boolean test to decide which legs exist.
 
 - **`{2,4,6,8}` ≡ classic.** build_vsim places leg `n` at angle `(n-1)·45°`, so
   legs `{2,4,6,8}` sit at `45/135/225/315°` — exactly the classic ant's four
@@ -126,7 +127,7 @@ The numbers decode exactly. Entropy of a diagonal Gaussian is
   read as inactive.
 
 **Investigation.** The mask is constant per env, and `log_std=-10` is applied to
-any dim where `(obs[107:123] > 0)` is false. So the cliff meant the *active* mask
+any dim where `(obs[123:139] > 0)` is false. So the cliff meant the *active* mask
 entries had become ≤ 0. The only thing between the env (which writes raw `{0,1}`)
 and the network is rl_games' `RunningMeanStd`. Simulating it with the real batch
 size reproduced the cliff precisely:
@@ -150,18 +151,18 @@ but overrides `norm_obs` to restore the raw mask after normalization:
 
 ```python
 def norm_obs(self, observation):
-    normed = super().norm_obs(observation)        # standard RMS (jit, 123-D)
+    normed = super().norm_obs(observation)        # standard RMS (jit, 139-D)
     if self.normalize_input:
         normed = normed.clone()
         normed[..., -DYN_MASK_DIM:] = observation[..., -DYN_MASK_DIM:]   # restore raw {0,1}
     return normed
 ```
 
-It's registered as `transformer_masked_a2c_logstd` (`train_utils.py:365`) and
+It's registered as `transformer_masked_a2c_logstd` (in `train_utils.py`) and
 selected via `model.name` in `ppo_ant_adaptive.yaml` and `ppo_ant_full.yaml`.
 The mask size comes from the existing `MASK_DIM_8` constant (shared with the
 tokenizer — single source of truth), and a build-time assert enforces
-`obs == OBS_DIM_8 + MASK_DIM_8 (123)`.
+`obs == OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8 (139)`.
 
 **Why this design.** `norm_obs` is the single normalization chokepoint (training
 *and* the player both call it), while checkpoint save/load and the `.eval()` that

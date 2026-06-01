@@ -80,7 +80,7 @@ Jointly optimizing the ant's morphology and its transformer controller in one lo
 _Avoid_: using "codesign" for the multi-morphology env `AntMultiMorphEnv` (it does no codesign; see Morphology context)
 
 **Morphology** (morph):
-A specific ant body — which legs exist and where. Drawn from a fixed enumerated set; each maps to one vsim build / EnvironmentGroup. "Morph" is an accepted shorthand.
+A specific ant body — which legs exist, where, and (full ant) each leg's hip/ankle segment lengths. Either drawn from a fixed enumerated set (adaptive) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
 
 **Leg**:
 One ant appendage. Up to 8 legs, placed at multiples of 45° around the torso. Each leg has exactly 2 DOFs (a hip and an ankle).
