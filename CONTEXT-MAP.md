@@ -10,6 +10,7 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 ├── docs/
 │   ├── adr/                          ← system-wide decisions
 │   ├── adaptive_ant_fixes.md
+│   ├── group_count_throughput.md     (playbook: group-count-independent env throughput)
 │   └── vsim_geometry_api.md
 ├── envs/                             ← Morphology context
 │   ├── CONTEXT.md
@@ -51,7 +52,7 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 
 ## Relationships
 
-- **Morphology → Control**: Morphology emits a 123-D observation (107 physical + 16-D DOF mask); Control tokenizes it and reads the DOF mask to decide which leg tokens exist.
+- **Morphology → Control**: Morphology emits a 139-D observation (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask); Control tokenizes it and reads the DOF mask to decide which leg tokens exist.
 - **Control → Training**: Control registers networks/models with rl_games under names Training selects via config `model.name` / `network.name`.
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
 - **Shared kernel** (below): Morphology, Leg, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign — defined once here, used identically across all contexts.
@@ -95,7 +96,7 @@ A leg or DOF is *active* if it exists in the current morphology, *inactive* if i
 A morphology that is dynamically viable as a walker: ≥3 legs and no circular gap between adjacent legs > 135°.
 
 **DOF mask**:
-The 16-bit `{0,1}` vector (obs `[107:123]`) marking which DOFs are active. Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.
+The 16-bit `{0,1}` vector (obs `[123:139]`) marking which DOFs are active. Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.
 _Avoid_: limb_mask (old code identifier; per-DOF not per-leg), bare "mask"
 
 **EnvironmentGroup** (group):
