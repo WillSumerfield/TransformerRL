@@ -16,14 +16,16 @@ from envs.ant_environment_common import (
 from envs.common import create_plane
 
 from ..multigroup_environment import MultiGroupEnvironmentGpu
-from .build_vsim import write_vsim_cached
+from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE
 
 
 _N_DOFS_FULL = 16   # 8 hips + 8 ankles (DOF order: h1,a1,...,h8,a8)
 _N_LEGS      = 8
-_OBS_BASE    = 107  # 1+4+3+3+16+16+16+8*6
+_OBS_BASE    = 107  # 1+4+3+3+16+16+16+8*6 (physical obs)
+_LEN_DIM     = 16   # 8 hip + 8 ankle segment lengths (raw; RMS-normalized by the policy)
 _MASK_DIM    = 16
-_OBS_TOTAL   = _OBS_BASE + _MASK_DIM  # 123
+# obs layout: [0:107] physical, [107:123] lengths, [123:139] dof mask
+_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 139
 
 # Empty grid cells of padding between adjacent morphology sets (in units of `spacing`).
 _SET_GAP_CELLS = 4
@@ -77,6 +79,28 @@ def morph_split(
     return test if test_set else train
 
 
+def sample_morphologies(num: int, seed: int) -> list[Morphology]:
+    """Sample `num` full morphologies: leg count uniform in 3..8, topology uniform within that count,
+    each active leg's hip/ankle length uniform in its range. Seeded for reproducible runs."""
+    import random as _random
+    rng = _random.Random(seed)
+    by_legs: dict[int, list[frozenset]] = {}
+    for m in _stable_morphologies():
+        by_legs.setdefault(len(m), []).append(m)
+    leg_counts = sorted(by_legs)
+    out = []
+    for _ in range(num):
+        legs = rng.choice(by_legs[rng.choice(leg_counts)])
+        hip = {n: rng.uniform(*HIP_RANGE) for n in legs}
+        ank = {n: rng.uniform(*ANKLE_RANGE) for n in legs}
+        out.append(Morphology(legs, hip, ank))
+    return out
+
+
+def _as_morphology(m) -> Morphology:
+    return m if isinstance(m, Morphology) else Morphology.from_legs(m)
+
+
 class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
     """One EnvironmentGroup per stable morphology. Obs is 123D; actions are always 16D."""
 
@@ -121,16 +145,27 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         with_window: bool = True,
         seed: int = None,
         raise_exception: bool = True,
-        morphologies: list[frozenset] | None = None,
+        morphologies: list | None = None,
+        sample_morphs: bool = False,
         train_pct: float = 1.0,
         test_set: bool = False,
         **kwargs,
     ):
-        self._morphologies = morphologies if morphologies is not None else _stable_morphologies()
-        if train_pct < 1.0:
+        # Full ant: sample `num_envs` variable-length bodies (one per env). Otherwise use the given
+        # topology set (or the stable set), optionally train/test-split, at default lengths.
+        self._sample_morphs = sample_morphs
+        self._sample_seed = seed
+        if sample_morphs:
             if seed is None:
-                raise ValueError("seed required when train_pct < 1.0")
-            self._morphologies = morph_split(self._morphologies, train_pct, seed, test_set)
+                raise ValueError("seed required when sample_morphs=True")
+            self._morphologies = sample_morphologies(num_envs, seed)
+        else:
+            morphs = morphologies if morphologies is not None else _stable_morphologies()
+            if train_pct < 1.0:
+                if seed is None:
+                    raise ValueError("seed required when train_pct < 1.0")
+                morphs = morph_split(morphs, train_pct, seed, test_set)
+            self._morphologies = [_as_morphology(m) for m in morphs]
         self.n_morphs = len(self._morphologies)
         self.envs_per_morph = max(1, num_envs // self.n_morphs)
         total_envs = self.n_morphs * self.envs_per_morph
@@ -199,10 +234,10 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         n_grp_cols   = max(1, ceil(len(self._morphologies) ** 0.5))
 
         for gi, morph in enumerate(self._morphologies):
-            active = sorted(morph)
+            active = sorted(morph.legs)
             n_dofs = len(active) * 2
 
-            tmpfile = write_vsim_cached(morph)
+            tmpfile = write_vsim(morph, gi)
 
             name           = f"ant_morph_{gi}"
             env_def_handle = self.gym.create_environment_def(name)
@@ -265,6 +300,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self._set_root_pose = torch.zeros((N, 7), dtype=torch.float32, device=self.device)
         self._set_root_vel  = torch.zeros((N, 6), dtype=torch.float32, device=self.device)
         self._global_dof_mask = torch.zeros((N, _N_DOFS_FULL), dtype=torch.float32, device=self.device)
+        # Per-env segment lengths, constant per body: [hip_leg1..8, ankle_leg1..8], 0 for inactive legs.
+        self._global_lengths = torch.zeros((N, _LEN_DIM), dtype=torch.float32, device=self.device)
 
         # DOF/sensor data is ragged (per-morphology width + a per-morphology slot permutation), so
         # it can't share a rectangular tensor. Each quantity gets ONE flat buffer holding every
@@ -324,6 +361,14 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 dtype=torch.float32, device=self.device,
             )
             self._global_dof_mask[start:end] = g["dof_mask"]
+
+            morph = g["morph"]
+            lvec = torch.zeros(_LEN_DIM, dtype=torch.float32, device=self.device)
+            for n in g["active"]:
+                lvec[n - 1]           = morph.hip_lengths[n]
+                lvec[_N_LEGS + n - 1] = morph.ankle_lengths[n]
+            self._global_lengths[start:end] = lvec
+
             self._flat_dof_init[doff:doff + EPM * n_dofs] = g["dof_pos_init"].reshape(-1)
 
             # Commands aliased to reshaped flat slices (root buffers stay global row-slices).
@@ -381,8 +426,9 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 zero_l,
             )
 
-        # Constant dof_mask block in obs (107:123); whole-tensor, set once.
-        self._obs_buf[:, _OBS_BASE:_OBS_TOTAL] = self._global_dof_mask
+        # Constant length + dof_mask blocks in obs; whole-tensor, set once.
+        self._obs_buf[:, _OBS_BASE:_OBS_BASE + _LEN_DIM]   = self._global_lengths
+        self._obs_buf[:, _OBS_BASE + _LEN_DIM:_OBS_TOTAL]  = self._global_dof_mask
 
         # Batch commands across all groups into single GPU arrays.
         self.all_motor_cmd_array  = self.gym.create_gpu_array(all_motor_cmds)

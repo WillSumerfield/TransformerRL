@@ -30,8 +30,8 @@ params:
       n_layers: 1
       ffn: 640
       torso_dim: 11
-      hip_dim: 5
-      ankle_dim: 11
+      hip_dim: 6      # + hip segment length
+      ankle_dim: 12   # + ankle segment length
 
   config:
     name: ant_adaptive_transformer_p1

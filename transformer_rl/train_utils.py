@@ -108,7 +108,7 @@ def _print_and_save_test_results(
     import csv as _csv
     from matplotlib.patches import Patch
 
-    morphs = [sorted(g['morph']) for g in groups]
+    morphs = [sorted(g['morph'].legs) for g in groups]
     labels = [_morph_label(m) for m in morphs]
     leg_counts = [len(m) for m in morphs]
     has_split = split_labels is not None

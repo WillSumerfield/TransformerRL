@@ -1,5 +1,6 @@
 # TODO: update obs dims / transformer dims once vsim 8-leg model is configured
 env:
+  sample_morphs: true       # sample num_envs variable-length bodies (one per env), seeded
   train_pct: 1.0
   test_set: false
   onset_start: 0
@@ -7,7 +8,7 @@ env:
   flip_prob: 0.5
 
 params:
-  seed:
+  seed: 42                   # seeds morphology sampling for reproducible runs
 
   algo:
     name: a2c_continuous
@@ -34,8 +35,8 @@ params:
       n_layers: 1
       ffn: 832
       torso_dim: 11
-      hip_dim: 5
-      ankle_dim: 11
+      hip_dim: 6      # + hip segment length
+      ankle_dim: 12   # + ankle segment length
 
   config:
     name: ant_full_transformer

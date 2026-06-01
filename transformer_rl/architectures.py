@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-from .tokenize import tokenize_4, tokenize_8, TORSO_DIM, HIP_DIM, ANKLE_DIM
+from .tokenize import tokenize_4, tokenize_8, TORSO_DIM, HIP_DIM, ANKLE_DIM, HIP_DIM_8, ANKLE_DIM_8
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
@@ -100,4 +100,6 @@ class LegTransformer(nn.Module):
 
 def MultiMorphLegTransformer(n_layers: int = 3, **kwargs) -> LegTransformer:
     kwargs.setdefault('n_legs', 8)
+    kwargs.setdefault('hip_dim', HIP_DIM_8)      # 8-leg tokens carry segment lengths
+    kwargs.setdefault('ankle_dim', ANKLE_DIM_8)
     return LegTransformer(n_layers=n_layers, **kwargs)

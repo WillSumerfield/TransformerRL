@@ -111,7 +111,7 @@ class LoggingA2CAgent(A2CAgent):
         if env is None or not hasattr(env, 'envs_per_morph') or not hasattr(env, 'groups'):
             self._morph_meta = False
             return False
-        morphs = [sorted(g['morph']) for g in env.groups]
+        morphs = [sorted(g['morph'].legs) for g in env.groups]
         by_legs: dict[int, list[int]] = {}
         for i, m in enumerate(morphs):
             by_legs.setdefault(len(m), []).append(i)

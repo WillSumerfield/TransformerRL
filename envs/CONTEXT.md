@@ -8,28 +8,28 @@ The ant body design space and its physics: which ant bodies exist, how they're b
 The GPU physics simulator this repo runs on (replaces an earlier MuJoCo stack). Bodies are described by vsim XML; one build per morphology.
 
 **Morphology set**:
-The list of morphologies a single env instance spans — one EnvironmentGroup per entry. For the full ant, morphologies are sampled (topology + per-leg lengths) at startup; choosing N and the seed defines the set.
+The list of morphologies a single env instance spans — one EnvironmentGroup per entry. For the full ant it is *sampled*: one body per env (leg count uniform in 3–8, topology uniform within that count, per-leg hip/ankle lengths uniform in range), reproducible from the run seed. For the adaptive ant and other fixed-topology envs it is the enumerated topologies at default lengths.
 
 **Morphology** (Morphology dataclass):
 Represents one specific body: `legs` (frozenset of active leg indices 1–8), `hip_lengths` (dict leg→float, hip segment length per active leg), `ankle_lengths` (dict leg→float, ankle segment length per active leg). Replaces the bare `frozenset` used when lengths were fixed.
 
 **Hip segment**:
-The upper leg link (aux link) connecting the hip joint to the ankle joint. Length ranges [0.5×, 1.5×] the default (0.1414–0.4243). One scalar per leg, stored in `Morphology.hip_lengths`. In obs: `obs[107:115]`, one slot per leg slot (0 for inactive), normalized.
+The upper leg link (aux link) connecting the hip joint to the ankle joint. Length ranges [0.5×, 1.5×] the default (0.1414–0.4243). One scalar per leg, stored in `Morphology.hip_lengths`. In obs: `obs[107:115]`, one slot per leg slot (0 for inactive), stored raw (RMS-normalized by the policy input normalizer). Fed to the leg's hip token.
 _Avoid_: upper leg, aux
 
 **Ankle segment**:
-The lower leg link connecting the ankle joint to the foot (force sensor). Length ranges [0.5×, 1.5×] the default (0.3163–0.9488). One scalar per leg, stored in `Morphology.ankle_lengths`. In obs: `obs[115:123]`, normalized.
+The lower leg link connecting the ankle joint to the foot (force sensor). Length ranges [0.5×, 1.5×] the default (0.3163–0.9488). One scalar per leg, stored in `Morphology.ankle_lengths`. In obs: `obs[115:123]`, stored raw (RMS-normalized by the policy input normalizer). Fed to the leg's ankle token.
 _Avoid_: lower leg, leg link
 
 **Classic ant**:
 `AntEnv` — the fixed 4-leg baseline (legs at 45/135/225/315°). 59-D obs, 8-D actions. The parity target everything else is checked against.
 
 **Multi-morphology ant**:
-The base env that spans a morphology set; 123-D obs, 16-D actions, always padded to 8 legs / 16 DOFs. Parameterized by its morphology set.
+The base env that spans a morphology set; 139-D obs, 16-D actions, always padded to 8 legs / 16 DOFs. Parameterized by its morphology set.
 _Avoid_: codesign ant (the env does no codesign — "codesign" is reserved for the future loop). Class `AntMultiMorphEnv`, env key `ant-multimorph-env`.
 
 **Full ant**:
-The multi-morphology ant over N randomly sampled (topology, per-leg lengths) morphologies. The hard variant. `scripts/train_ant_full.py` + `configs/ppo_ant_full.yaml`; geometry source: `ant_8leg.vsim`. N is a config param; seeded sampling controls reproducibility.
+The multi-morphology ant over a sampled morphology set — one variable-length body per env (N = num_envs). The hard variant. `scripts/train_ant_full.py` + `configs/ppo_ant_full.yaml` (`env.sample_morphs`); geometry source: `ant_8leg.vsim`. Seeded sampling controls reproducibility.
 _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
 
 **Adaptive ant**:
