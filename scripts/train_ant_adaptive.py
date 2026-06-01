@@ -11,18 +11,11 @@ from envs.ant_envs.ant_adaptive import AntAdaptiveEnv, _MORPHOLOGIES
 from transformer_rl import MultiMorphLegTransformerBuilder
 
 
-def post_config(args, config):
-    n_morphs = len(_MORPHOLOGIES)
-    n_envs = config["params"]["config"]["num_actors"]
-    epm = max(1, n_envs // n_morphs)
-    config["params"]["config"]["num_actors"] = n_morphs * epm
-
-
 run_training(
     default_config="ppo_ant_adaptive.yaml",
     train_dir="runs/ant_adaptive",
     env_class=AntAdaptiveEnv,
     env_name="ant-adaptive-env",
     network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
-    post_config_fn=post_config,
+    morphology_set=_MORPHOLOGIES,
 )

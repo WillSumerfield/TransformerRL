@@ -10,19 +10,11 @@ from transformer_rl.train_utils import run_training
 from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _stable_morphologies
 from transformer_rl import MultiMorphLegTransformerBuilder
 
-
-def post_config(args, config):
-    n_morphs = len(_stable_morphologies())
-    n_envs = config["params"]["config"]["num_actors"]
-    epm = max(1, n_envs // n_morphs)
-    config["params"]["config"]["num_actors"] = n_morphs * epm
-
-
 run_training(
     default_config="ppo_ant_full.yaml",
     train_dir="runs/ant_full",
     env_class=AntMultiMorphEnv,
     env_name="ant-multimorph-env",
     network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
-    post_config_fn=post_config,
+    morphology_set=_stable_morphologies(),
 )

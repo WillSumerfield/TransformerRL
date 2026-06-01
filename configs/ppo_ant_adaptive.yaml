@@ -1,4 +1,10 @@
+env:
+  train_pct: 0.5
+  test_set: false
+
 params:
+  seed: 42
+
   algo:
     name: a2c_continuous
 
