@@ -38,6 +38,33 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
         self._morph_hist: list = []  # per-epoch per-morph reward, for the heatmap
+        self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
+
+    def train_epoch(self):
+        out = super().train_epoch()
+        self._maybe_resample()
+        return out
+
+    def _maybe_resample(self):
+        """Every resample_interval episodes, draw a fresh morphology set (full gym rebuild) and
+        refresh the agent's cached obs. No-op unless the env samples morphologies and the knob is set.
+        See docs/morphology_resampling_cost.md."""
+        interval = self.config.get('resample_interval', 0)  # episodes between resamples; 0 = off
+        if not interval:
+            return
+        env = getattr(getattr(self.vec_env, 'envs', None), 'env', None)
+        if env is None or not getattr(env, '_sample_morphs', False):
+            return
+        self._steps_since_resample += self.horizon_length
+        if self._steps_since_resample < interval * env.max_episode_length:
+            return
+        print(f"[resample] new morphology set (every {interval} episodes)", flush=True)
+        env.resample()
+        self.obs = self.env_reset()             # rebuilt env -> refresh stale rollout-start obs
+        self.current_rewards.zero_()            # the hard reset ends all episodes; drop partials
+        self.current_lengths.zero_()
+        self._morph_meta = None                 # morphs changed -> re-detect per-morph logging labels
+        self._steps_since_resample = 0
 
     def prepare_dataset(self, batch_dict):
         # Raw advantage scale, before rl_games normalizes it to ~N(0,1) (mirrors a2c_common:1030,1038).

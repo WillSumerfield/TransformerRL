@@ -73,9 +73,10 @@ class MultiGroupEnvironmentGpu(ABC):
         if max_contact_patches_per_env == -1:
             max_contact_patches_per_env = max_contact_pairs_per_env
 
-        self.gym = v.create_gym(
-            self.rendering,
-            self.enable_scene_query,
+        # Saved so the gym can be torn down and recreated in place (morphology resampling needs a
+        # full rebuild — geometry is baked at finalize). total_num_envs is invariant, so the
+        # contact-buffer sizes are fixed at construction.
+        self._gym_params = dict(
             treat_warning_as_error=treat_warning_as_error,
             up_axis=up_axis,
             with_window=with_window,
@@ -86,26 +87,34 @@ class MultiGroupEnvironmentGpu(ABC):
             * self.total_num_envs,
             update_scene_dependent_components_in_step=update_scene_dependent_components_in_step,
             cuda_device=device.index,
-            enable_graph_captures=True,
             seed=seed,
             verbose=verbose,
         )
-
-        self.gym.set_timestep(timestep)
+        self._timestep = timestep
+        self._initial_is_paused = initial_is_paused
+        self._initial_render_substep = initial_render_substep
 
         self.up_axis = up_axis
         self.up_axis_rotation = v.shortest_rotation(up_axis, v.Vec3(0, 1, 0))
 
-        self.gym_render = self.gym.get_render() if self.rendering else None
-        self._render_finished = False
-        if self.rendering:
-            self.gym_render.set_paused(initial_is_paused)
-            self.render_substep = initial_render_substep
-
-        self.gym.set_gravity(self.gravity)
+        self._create_gym()
 
         # Multi-group support
         self.env_groups = []
+
+    def _create_gym(self):
+        """Create the gym + render and apply timestep/gravity. Called at init and on rebuild."""
+        self.gym = v.create_gym(
+            self.rendering, self.enable_scene_query,
+            enable_graph_captures=True, **self._gym_params,
+        )
+        self.gym.set_timestep(self._timestep)
+        self.gym_render = self.gym.get_render() if self.rendering else None
+        self._render_finished = False
+        if self.rendering:
+            self.gym_render.set_paused(self._initial_is_paused)
+            self.render_substep = self._initial_render_substep
+        self.gym.set_gravity(self.gravity)
 
     # ---- Space accessors -------------------------------------------------------
 

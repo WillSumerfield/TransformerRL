@@ -1,4 +1,6 @@
 """AntMultiMorphEnv: train one controller across many morphologies, one group per morphology."""
+import gc
+import random
 import sys
 from math import ceil
 from pathlib import Path
@@ -79,11 +81,11 @@ def morph_split(
     return test if test_set else train
 
 
-def sample_morphologies(num: int, seed: int) -> list[Morphology]:
+def sample_morphologies(num: int, seed: int = None, rng: "random.Random" = None) -> list[Morphology]:
     """Sample `num` full morphologies: leg count uniform in 3..8, topology uniform within that count,
-    each active leg's hip/ankle length uniform in its range. Seeded for reproducible runs."""
-    import random as _random
-    rng = _random.Random(seed)
+    each active leg's hip/ankle length uniform in its range. Pass a persistent `rng` for a
+    reproducible resample stream, or a `seed` for a one-off draw."""
+    rng = rng if rng is not None else random.Random(seed)
     by_legs: dict[int, list[frozenset]] = {}
     for m in _stable_morphologies():
         by_legs.setdefault(len(m), []).append(m)
@@ -102,7 +104,7 @@ def _as_morphology(m) -> Morphology:
 
 
 class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
-    """One EnvironmentGroup per stable morphology. Obs is 123D; actions are always 16D."""
+    """One EnvironmentGroup per morphology. Obs is 139D; actions are always 16D."""
 
     @property
     def unwrapped(self):
@@ -158,7 +160,9 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         if sample_morphs:
             if seed is None:
                 raise ValueError("seed required when sample_morphs=True")
-            self._morphologies = sample_morphologies(num_envs, seed)
+            # Persistent rng so the initial draw + every resample form one reproducible stream.
+            self._morph_rng = random.Random(seed)
+            self._morphologies = sample_morphologies(num_envs, rng=self._morph_rng)
         else:
             morphs = morphologies if morphologies is not None else _stable_morphologies()
             if train_pct < 1.0:
@@ -474,7 +478,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         else:
             obs[:, 59:107].zero_()
 
-        # [107:123] = dof_mask — set once at allocate time, preserved here
+        # [107:123] = lengths, [123:139] = dof_mask — set once at allocate time, preserved here
 
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         # Reward needs only root pose plus the already-global act/old-root/progress buffers, so it
@@ -517,4 +521,35 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self.gym.compute_kinematics()
         self.compute_observations(self._act_buf)
         return self.obs_buf.clone(), {}
+
+    def resample(self):
+        """Draw a fresh sampled body set and rebuild the sim in place (full gym rebuild).
+
+        vsim bakes link geometry at finalize, so new segment lengths require tearing the gym down
+        and recreating it; see docs/morphology_resampling_cost.md. The caller must reset afterwards
+        (the env is left rebuilt-but-unreset). Only valid for the sampled (full ant) configuration.
+        """
+        if not getattr(self, "_sample_morphs", False):
+            raise RuntimeError("resample() requires sample_morphs=True")
+        self._morphologies = sample_morphologies(self.total_num_envs, rng=self._morph_rng)
+        self._rebuild()
+
+    def _rebuild(self):
+        # Drop every gym-backed reference so delete_gym frees cleanly, then recreate the scene
+        # exactly as __init__ does after gym creation.
+        self._get_cmd_array = self._set_cmd_array = None
+        self.all_motor_cmd_array = self.all_sensor_cmd_array = None
+        self.groups = []
+        self.env_groups = []
+        self.gym = self.gym_render = None
+        gc.collect()
+
+        v.delete_gym()
+        self._create_gym()
+        self.groups = []
+        self.create_envs()
+        self.allocate_buffers()
+        create_plane(self.gym)
+        self.gym.set_num_solver_iterations(8)
+        self.gym.finalize()
 

@@ -65,6 +65,7 @@ params:
     entropy_coef: 0.001
     truncate_grads: True
     e_clip: 0.2
+    resample_interval: 2    # episodes between full morphology resamples (gym rebuild); 0 = off
     horizon_length: 16
     minibatch_size: 32768
     mini_epochs: 4
