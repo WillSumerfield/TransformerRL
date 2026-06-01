@@ -1,6 +1,7 @@
 """Programmatic vsim XML generation for 8-leg ant morphology variants."""
-import tempfile
 from pathlib import Path
+
+_GENERATED_DIR = Path(__file__).parent / "assets" / "generated"
 
 _EFFORT = "3.40282347e+38"
 _DENSITY = "5.0"
@@ -235,11 +236,10 @@ def build_ant_vsim(active_legs: frozenset) -> str:
     return '\n'.join(parts)
 
 
-def write_vsim_tempfile(xml: str) -> Path:
-    """Write vsim XML to a named temp file. Caller is responsible for deletion."""
-    f = tempfile.NamedTemporaryFile(
-        mode='w', suffix='.vsim', delete=False, prefix='ant_morph_'
-    )
-    f.write(xml)
-    f.close()
-    return Path(f.name)
+def write_vsim_cached(active_legs: frozenset) -> Path:
+    """Write vsim XML to a deterministic path; always overwrites."""
+    _GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+    name = "ant_morph_" + "".join(str(n) for n in sorted(active_legs)) + ".vsim"
+    path = _GENERATED_DIR / name
+    path.write_text(build_ant_vsim(active_legs))
+    return path
