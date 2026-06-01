@@ -11,6 +11,7 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 │   ├── adr/                          ← system-wide decisions
 │   ├── adaptive_ant_fixes.md
 │   ├── group_count_throughput.md     (playbook: group-count-independent env throughput)
+│   ├── morphology_resampling_cost.md (playbook: rebuild cost + resample cadence for the full ant)
 │   └── vsim_geometry_api.md
 ├── envs/                             ← Morphology context
 │   ├── CONTEXT.md
