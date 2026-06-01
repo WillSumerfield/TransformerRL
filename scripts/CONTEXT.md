@@ -25,3 +25,8 @@ Cumulative raw reward over one episode (sum of `_rew_buf` across steps until ter
 
 **`resample_interval`**:
 Config knob (full ant only): episodes between morphology resamples. The training agent rebuilds the sim with a fresh sampled body set every `resample_interval` episodes; `0` (default elsewhere) disables it. The mechanism and cost live in the Morphology context — [Morphology resampling](../envs/CONTEXT.md) and [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
+
+**Base config** (`configs/defaults/base.yaml`):
+Shared rl_games boilerplate deep-merged *under* every `ppo_*.yaml` at load (per-config values win on conflict). Holds the keys every config shares and nobody tunes per-experiment — `algo.name`, the continuous action space block, `separate`, and the always-on rl_games flags (`ppo`, `multi_gpu`, the normalization/precision toggles, `lr_schedule`/`schedule_type`, `score_to_win`, …). The run's *identity* fields are not in any yaml: `env_name`, `model.name`, `network.name`, and `config.name` (the experiment-family label, which drives the `train_dir` subfolder) are all injected by `run_training` from the training script's own args (`env_name=`, `model=`, `network=(name, builder)`, `name=`), so they can't drift from what's registered. A runnable config therefore lists only what it actually varies: the `env` block, `seed`, architecture dims, and PPO hyperparameters. See [ADR-0006](../docs/adr/0006-shared-base-config-for-rl_games-boilerplate.md).
+_Invariant_: a config is **not** a complete rl_games config on its own; it's only valid after the base merge + identity injection in `run_training`.
+_Avoid_: pasting boilerplate or identity fields back into individual configs to make them self-contained.
