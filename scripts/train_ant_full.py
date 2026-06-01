@@ -15,7 +15,9 @@ from transformer_rl import MultiMorphLegTransformerBuilder
 run_training(
     default_config="ppo_ant_full.yaml",
     train_dir="runs/ant_full",
+    name="ant_full_transformer",
     env_class=AntMultiMorphEnv,
     env_name="ant-multimorph-env",
     network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
+    model="transformer_masked_a2c_logstd",
 )

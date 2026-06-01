@@ -14,8 +14,10 @@ from transformer_rl import MultiMorphLegTransformerBuilder
 run_training(
     default_config="ppo_ant_adaptive.yaml",
     train_dir="runs/ant_adaptive",
+    name="ant_adaptive_transformer",
     env_class=AntAdaptiveEnv,
     env_name="ant-adaptive-env",
     network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
+    model="transformer_masked_a2c_logstd",
     morphology_set=_MORPHOLOGIES,
 )

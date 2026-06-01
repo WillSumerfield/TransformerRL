@@ -35,6 +35,7 @@ def post_config(args, config):
 run_training(
     default_config="ppo_ant.yaml",
     train_dir="runs/ant",
+    name="ant_transformer",
     env_class=AntEnv,
     env_name="ant-env",
     network=("leg_transformer", LegTransformerBuilder),

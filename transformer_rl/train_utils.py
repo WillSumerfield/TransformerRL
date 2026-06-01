@@ -290,6 +290,17 @@ def _str_to_bool(s: str) -> bool:
     return s.lower() == "true"
 
 
+def _deep_merge(base: dict, over: dict) -> dict:
+    """Recursive dict merge; `over` wins on conflict. Returns a new dict."""
+    out = dict(base)
+    for k, v in over.items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
 def _adjust_minibatch(cfg: dict, n_envs: int, h_len: int) -> None:
     requested = cfg["minibatch_size"]
     batch = h_len * n_envs
@@ -523,8 +534,6 @@ def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
         rendering=True,
         raise_exception=True,
         seed=args.seed,
-        onset_end=0,
-        flip_prob=0.5,
     )
     act_low = torch.tensor(env.action_space.low, device=device)
     act_high = torch.tensor(env.action_space.high, device=device)
@@ -549,7 +558,9 @@ def run_training(
     train_dir: str,
     env_class,
     env_name: str,
+    name: str,
     network: tuple | None = None,
+    model: str = "continuous_a2c_logstd",
     extra_args_fn=None,
     post_config_fn=None,
     morphology_set: list | None = None,
@@ -634,6 +645,21 @@ def run_training(
         else _PROJECT_ROOT / "configs" / default_config
     with open(config_path) as f:
         config = yaml.safe_load(f)
+
+    # Merge shared rl_games boilerplate (configs/defaults/base.yaml) UNDER the
+    # config so per-config values win; then pin the identity fields the training
+    # script already owns (env_name, network/model name) so they can't drift from
+    # what's registered, and the experiment yaml holds only config.name + knobs.
+    # See ADR-0006.
+    with open(_PROJECT_ROOT / "configs" / "defaults" / "base.yaml") as f:
+        base = yaml.safe_load(f)
+    config = _deep_merge(base, config)
+    params = config["params"]
+    params["config"]["env_name"] = env_name
+    params["config"]["name"] = name        # experiment-family label (drives train_dir)
+    params.setdefault("model", {})["name"] = model
+    if network is not None:
+        params.setdefault("network", {})["name"] = network[0]
 
     if "player" not in config["params"]["config"]:
         config["params"]["config"]["player"] = {}
@@ -792,7 +818,8 @@ def run_training(
 
     if network is not None:
         net_name, net_builder = network
-        mb_module.register_network(net_name, net_builder)
+        if net_builder is not None:  # None = rl_games built-in (e.g. actor_critic); name only
+            mb_module.register_network(net_name, net_builder)
 
     # Mask-passthrough normalizer variant (used by configs via model.name; harmless otherwise).
     from .models import TransformerMaskedNorm

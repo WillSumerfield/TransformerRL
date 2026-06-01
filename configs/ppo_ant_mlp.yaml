@@ -1,29 +1,8 @@
-env:
-  train_pct: 1.0
-  test_set: false
-
+# Shared rl_games boilerplate lives in configs/defaults/base.yaml (merged at load). See ADR-0006.
 params:
   seed:
 
-  algo:
-    name: a2c_continuous
-
-  model:
-    name: continuous_a2c_logstd
-
   network:
-    name: actor_critic
-    separate: False
-    space:
-      continuous:
-        mu_activation: None
-        sigma_activation: None
-        mu_init:
-          name: default
-        sigma_init:
-          name: const_initializer
-          val: 0
-        fixed_sigma: True
     mlp:
       units: [512, 256, 128]
       activation: elu
@@ -31,36 +10,21 @@ params:
         name: default
 
   config:
-    name: ant_mlp
-    env_name: ant-env
-    multi_gpu: False
-    ppo: True
-    mixed_precision: True
-    normalize_input: True
-    normalize_value: True
-    value_bootstrap: True
     num_actors: 8192
     reward_shaper:
       scale_value: 0.01
-    normalize_advantage: True
     gamma: 0.98
     tau: 0.95
     learning_rate: 7e-4
-    lr_schedule: adaptive
-    schedule_type: legacy
     kl_threshold: 0.015
-    score_to_win: 10000
     max_epochs: 500
     save_best_after: 200
     save_frequency: 50
     grad_norm: 1.0
     entropy_coef: 0.001
-    truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
     minibatch_size: 32768
     mini_epochs: 4
     critic_coef: 2
-    clip_value: True
-    seq_length: 4
     bounds_loss_coef: 0.0

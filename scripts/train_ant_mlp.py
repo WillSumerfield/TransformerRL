@@ -11,6 +11,8 @@ from envs.ant_envs.ant import AntEnv
 run_training(
     default_config="ppo_ant_mlp.yaml",
     train_dir="runs/ant",
+    name="ant_mlp",
     env_class=AntEnv,
     env_name="ant-env",
+    network=("actor_critic", None),  # rl_games built-in; name only, no builder to register
 )

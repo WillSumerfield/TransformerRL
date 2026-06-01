@@ -1,69 +1,34 @@
+# Shared rl_games boilerplate lives in configs/defaults/base.yaml (merged at load). See ADR-0006.
 env:
-  train_pct: 0.5
+  train_pct: 0.5            # fraction of morphologies for training (rest = held-out test set)
   test_set: false
 
 params:
   seed: 42
 
-  algo:
-    name: a2c_continuous
-
-  model:
-    name: transformer_masked_a2c_logstd
-
   network:
-    name: multimorph_leg_transformer
-    separate: False
-    space:
-      continuous:
-        mu_activation: None
-        sigma_activation: None
-        mu_init:
-          name: default
-        sigma_init:
-          name: const_initializer
-          val: 0
-        fixed_sigma: True
     transformer:
       d_model: 160
       n_heads: 16
       n_layers: 1
       ffn: 640
-      torso_dim: 11
-      hip_dim: 6      # + hip segment length
-      ankle_dim: 12   # + ankle segment length
 
   config:
-    name: ant_adaptive_transformer_p1
-    env_name: ant-adaptive-env
-    multi_gpu: False
-    ppo: True
-    mixed_precision: True
-    normalize_input: True
-    normalize_value: True
-    value_bootstrap: True
     num_actors: 4096
     reward_shaper:
       scale_value: 0.01
-    normalize_advantage: True
     gamma: 0.98
     tau: 0.95
     learning_rate: 6e-4
-    lr_schedule: adaptive
-    schedule_type: legacy
     kl_threshold: 0.0235
-    score_to_win: 10000
     max_epochs: 1500
     save_best_after: 200
     save_frequency: 50
     grad_norm: 1.6
     entropy_coef: 0.0015
-    truncate_grads: True
     e_clip: 0.2
     horizon_length: 16
     minibatch_size: 32768  # auto-snapped to divide batch if needed (see _adjust_minibatch)
     mini_epochs: 4
     critic_coef: 3.25
-    clip_value: True
-    seq_length: 4
     bounds_loss_coef: 0.0

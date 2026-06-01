@@ -1,0 +1,35 @@
+# Shared rl_games boilerplate, deep-merged UNDER every ppo_ant_*.yaml at load
+# (per-config values win on conflict). See docs/adr/0006. Keys here are uniform
+# across all configs and not tuned per-experiment; a runnable config lists only
+# what it varies. The identity fields (env_name, network.name, model.name,
+# config.name) are injected by run_training from the script's args, not set here.
+params:
+  algo:
+    name: a2c_continuous
+
+  network:
+    separate: False
+    space:
+      continuous:
+        mu_activation: None
+        sigma_activation: None
+        mu_init:
+          name: default
+        sigma_init:
+          name: const_initializer
+          val: 0
+        fixed_sigma: True
+
+  config:
+    ppo: True
+    multi_gpu: False
+    mixed_precision: True
+    normalize_input: True
+    normalize_value: True
+    value_bootstrap: True
+    normalize_advantage: True
+    clip_value: True
+    truncate_grads: True
+    lr_schedule: adaptive
+    schedule_type: legacy
+    score_to_win: 10000
