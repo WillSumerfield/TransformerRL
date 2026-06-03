@@ -20,6 +20,11 @@ Optional parameter to `run_training`. When provided, enables `--train-pct`/`--te
 **`--compare`**:
 `test` mode flag. Requires `--train-pct < 1.0` and a seed. Runs the full morphology set in one env instance, then labels each morph's scores as train or test post-hoc. The Summary and By Leg Count sections of all outputs break down stats by split (train row, test row, global row). Produces a single chart with blues (train morphs, shaded by leg count) and oranges (test morphs, shaded by leg count). Incompatible with `--test-set`.
 
+**Follow camera**:
+The viewer's camera controller in `play`/`random`. Has three viewing states: **auto-cycle** (default — hops to a random ant each episode), **manual-follow** (locked to one operator-chosen group+env, persists across episode resets), and **free-cam** (camera detached, driven by the renderer's built-in WASD/drag). Group = morphology (`EnvironmentGroup`), env = one ant instance within it. Auto-cycle and manual-follow are mutually exclusive; free-cam is an orthogonal overlay that restores the prior state on exit.
+In both fixed states (auto-cycle and manual-follow) the operator can **orbit** (rotate the viewpoint around the focused ant) and **zoom** (the focus distance); the chosen angle and distance persist as the focus hops between ants. Orbit/zoom have no effect in free-cam (the built-in controls own the camera there).
+_Avoid_: calling free-cam "manual" — manual-follow still tracks an ant; free-cam tracks nothing. Orbit is not free-cam: orbit keeps the ant centred, free-cam does not.
+
 **Episode score**:
 Cumulative raw reward over one episode (sum of `_rew_buf` across steps until termination or truncation). The unit of measurement in `test` mode results.
 

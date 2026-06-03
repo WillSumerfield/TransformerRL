@@ -1,6 +1,7 @@
 """Shared boilerplate for rl_games-based ant training scripts."""
 from __future__ import annotations
 
+import math
 import os
 import random
 import sys
@@ -456,55 +457,190 @@ class _VideoRecorder:
 
 
 class FollowCamera:
-    """Drives the viewer camera to follow one ant, switching each episode.
+    """Drives the viewer camera, with operator override via keys + GUI panel.
 
-    Picks a new environment-set in a no-repeat random order (reshuffles once all
-    sets are exhausted), then a random ant within it. Switches when the followed
-    ant's episode ends (its progress counter resets).
+    Three viewing states (see scripts/CONTEXT.md "Follow camera"):
+      - auto-cycle : hops to a random ant each episode (the unattended default).
+      - manual-follow : locked to one chosen group+env, persists across resets.
+      - free-cam : camera detached; the renderer's built-in WASD/drag fly it.
+    auto/manual are mutually exclusive; free-cam is an orthogonal overlay that
+    leaves the underlying mode untouched (toggling it off resumes that mode).
+
+    Discrete keys (single-step, rising-edge; vsim is_key_down is alphanumeric-only
+    so the arrow/Tab analogues are remapped to the IJKL inverted-T + two mode keys):
+      J / L  prev / next group        I / K  prev / next env
+      F      toggle free-cam          C      back to auto-cycle
+    Continuous keys (level-polled while held), active in both fixed states (no
+    effect in free-cam, where the built-in controls own the camera):
+      Q / E  orbit azimuth            T / G  orbit elevation     Z / X  zoom in / out
+    The viewpoint in fixed states is a spherical offset (azimuth, elevation,
+    radius) around the focused ant; orbit/zoom mutate it and it persists as the
+    focus hops between ants. The GUI panel mirrors and also drives the discrete
+    state plus the focus distance (bidirectional); keys win over a same-frame
+    widget click.
     """
 
     MAX_FRAMES_PER_MORPH = 250
+    _KEYS = ("j", "l", "i", "k", "f", "c")          # discrete (rising-edge)
+    _ORBIT_KEYS = ("q", "e", "t", "g", "z", "x")    # continuous (level-polled)
+    ORBIT_SPEED = math.radians(1.5)                 # per frame while held
+    ZOOM_FACTOR = 1.03                              # radius multiply per frame
+    ELEV_MIN = math.radians(0.0)                  # don't look up from below the ant
+    ELEV_MAX = math.radians(85.0)                   # clamp near top to avoid pole flip
+    RADIUS_MIN, RADIUS_MAX = 1.0, 30.0
 
     def __init__(self, env, offset_xyz=CAMERA_OFFSET):
         import vlearn as v
         self._v = v
         self.env = env
-        self.offset = v.Vec3(*offset_xyz)
-        n = (offset_xyz[0] ** 2 + offset_xyz[1] ** 2 + offset_xyz[2] ** 2) ** 0.5
-        self.look = v.Vec3(-offset_xyz[0] / n, -offset_xyz[1] / n, -offset_xyz[2] / n)
+        # Spherical viewpoint around the focus, seeded from the static offset so
+        # the default view is unchanged. azimuth in XZ plane, elevation above it.
+        ox, oy, oz = offset_xyz
+        self.radius = (ox * ox + oy * oy + oz * oz) ** 0.5
+        self.azimuth = math.atan2(oz, ox)
+        self.elevation = math.asin(oy / self.radius)
         self.sets = env.follow_sets()
+        self.n_groups = len(self.sets)
+        self.epm = len(self.sets[0]) if self.sets else 1
+
+        self.mode = "auto"          # "auto" | "manual"
+        self.free = False
+        self.gi = 0                 # group index
+        self.ei = 0                 # env index within group
         self._order = []
         self._last_set = None
-        self._cur_idx = None
         self._last_progress = -1
         self._start_time = 0
-        self._pick_new()
+        self._prev_keys = {k: False for k in self._KEYS}
+        self._pick_new_auto()
 
+        self._build_panel()
+        print("[camera] J/L group  I/K env  Q/E+T/G orbit  Z/X zoom  F free-cam  C auto-cycle")
+
+    def _offset_look(self):
+        """Camera offset (focus->eye) and look direction from the spherical state."""
+        v = self._v
+        horiz = self.radius * math.cos(self.elevation)
+        ox = horiz * math.cos(self.azimuth)
+        oz = horiz * math.sin(self.azimuth)
+        oy = self.radius * math.sin(self.elevation)
+        look = v.Vec3(-ox / self.radius, -oy / self.radius, -oz / self.radius)
+        return v.Vec3(ox, oy, oz), look
+
+    # --- GUI panel (bidirectional). Keys are embedded in the labels as the
+    # in-window legend (vsim has no text/label widget). ---
+    def _build_panel(self) -> None:
+        v, r = self._v, self.env.gym_render
+        self.w_group = v.UserCombo("Group (J/L)", [str(i) for i in range(self.n_groups)], self.gi)
+        self.w_env = v.UserCombo("Env (I/K)", [str(i) for i in range(self.epm)], self.ei)
+        self.w_free = v.UserCheckbox("Free cam (F)", self.free)
+        self.w_auto = v.UserCheckbox("Auto-cycle (C)", True)
+        self.w_dist = v.UserSlider("Distance — Z/X zoom, Q/E/T/G orbit",
+                                   self.RADIUS_MIN, self.RADIUS_MAX, self.radius)
+        for w in (self.w_group, self.w_env, self.w_free, self.w_auto, self.w_dist):
+            r.register_menu_item(w)
+        self._sync_panel()
+
+    def _sync_panel(self) -> None:
+        self.w_group.set_current_index(self.gi)
+        self.w_env.set_current_index(self.ei)
+        self.w_free.set_value(self.free)
+        self.w_auto.set_value(self.mode == "auto")
+        self.w_dist.set_value(self.radius)
+        self._synced = (self.gi, self.ei, self.free, self.mode == "auto", self.radius)
+
+    # --- auto-cycle selection ---
     def _next_set(self) -> int:
         if not self._order:
-            self._order = list(range(len(self.sets)))
+            self._order = list(range(self.n_groups))
             random.shuffle(self._order)
             if len(self._order) > 1 and self._order[0] == self._last_set:
                 self._order.append(self._order.pop(0))
         return self._order.pop(0)
 
-    def _pick_new(self) -> None:
-        si = self._next_set()
-        self._last_set = si
-        self._cur_idx = random.choice(self.sets[si])
+    def _pick_new_auto(self) -> None:
+        self.gi = self._last_set = self._next_set()
+        self.ei = random.randrange(self.epm)
+        self._start_time = int(self.env.progress_buf[self._cur_idx()].item())
         self._last_progress = -1
 
+    def _cur_idx(self) -> int:
+        return self.sets[self.gi][self.ei]
+
+    def _enter_manual(self) -> None:
+        # Grab whatever is currently followed (gi/ei already point at it) and lock.
+        self.mode = "manual"
+        self.free = False
+
+    # --- per-frame update ---
     def update(self) -> None:
-        prog = int(self.env.progress_buf[self._cur_idx].item())
-        time_w_current_morph = prog - self._start_time
-        env_reset = prog < self._last_progress
-        if time_w_current_morph > self.MAX_FRAMES_PER_MORPH or env_reset:
-            self._pick_new()
-            prog = int(self.env.progress_buf[self._cur_idx].item())
-            self._start_time = prog
-        self._last_progress = prog
-        eye = self.env.follow_world_pos(self._cur_idx) + self.offset
-        self.env.gym_render.reset_camera(eye, self.look)
+        r = self.env.gym_render
+
+        # Rising-edge key events.
+        cur = {k: r.is_key_down(k) for k in self._KEYS}
+        ev = {k: cur[k] and not self._prev_keys[k] for k in self._KEYS}
+        self._prev_keys = cur
+
+        # Widget user-changes since last sync (only meaningful if no key overrides).
+        sg, se, sfree, sauto, sradius = self._synced
+        u_group = self.w_group.get_current_index() != sg
+        u_env = self.w_env.get_current_index() != se
+        u_free = self.w_free.get_value() != sfree
+        u_auto = self.w_auto.get_value() != sauto
+
+        dg = (1 if ev["l"] else 0) - (1 if ev["j"] else 0)
+        de = (1 if ev["k"] else 0) - (1 if ev["i"] else 0)
+
+        # Keys win over widget clicks. Selection > auto-toggle > free-toggle.
+        if dg or de:
+            self._enter_manual()
+            self.gi = (self.gi + dg) % self.n_groups
+            self.ei = (self.ei + de) % self.epm
+        elif ev["c"]:
+            self._pick_new_auto()
+            self.mode, self.free = "auto", False
+        elif ev["f"]:
+            self.free = not self.free
+        elif u_group or u_env:
+            self._enter_manual()
+            self.gi = self.w_group.get_current_index()
+            self.ei = self.w_env.get_current_index()
+        elif u_auto:
+            if self.w_auto.get_value():
+                self._pick_new_auto()
+                self.mode, self.free = "auto", False
+            else:
+                self._enter_manual()
+        elif u_free:
+            self.free = self.w_free.get_value()
+
+        # Orbit/zoom: continuous (level-polled) and inert in free-cam. Keys win;
+        # otherwise adopt a dragged Distance slider.
+        if not self.free:
+            o = {k: r.is_key_down(k) for k in self._ORBIT_KEYS}
+            self.azimuth += self.ORBIT_SPEED * ((1 if o["e"] else 0) - (1 if o["q"] else 0))
+            self.elevation += self.ORBIT_SPEED * ((1 if o["t"] else 0) - (1 if o["g"] else 0))
+            self.elevation = max(self.ELEV_MIN, min(self.ELEV_MAX, self.elevation))
+            if o["z"] or o["x"]:
+                self.radius *= self.ZOOM_FACTOR ** ((1 if o["x"] else 0) - (1 if o["z"] else 0))
+            elif abs(self.w_dist.get_value() - sradius) > 1e-4:
+                self.radius = self.w_dist.get_value()
+            self.radius = max(self.RADIUS_MIN, min(self.RADIUS_MAX, self.radius))
+
+        # Auto-cycle hops to a new ant when the followed episode ends or times out.
+        if self.mode == "auto":
+            prog = int(self.env.progress_buf[self._cur_idx()].item())
+            if prog - self._start_time > self.MAX_FRAMES_PER_MORPH or prog < self._last_progress:
+                self._pick_new_auto()
+                prog = int(self.env.progress_buf[self._cur_idx()].item())
+                self._start_time = prog
+            self._last_progress = prog
+
+        self._sync_panel()
+        if not self.free:
+            offset, look = self._offset_look()
+            eye = self.env.follow_world_pos(self._cur_idx()) + offset
+            r.reset_camera(eye, look)
 
 
 def _attach_render_callback(env, recorder=None) -> None:
