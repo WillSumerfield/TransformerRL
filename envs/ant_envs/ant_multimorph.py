@@ -136,7 +136,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         enable_scene_query: bool = False,
         max_episode_length: int = 1000,
         ctrl_cost_weight: float = 0.5,
-        healthy_reward: float = 1.0,
+        healthy_reward: float = 2.0,
         healthy_y_range: tuple = (0.3, 1.1),
         reset_noise_scale: float = 1.0,
         gravity: v.Vec3 = v.Vec3(0, -9.81, 0),
