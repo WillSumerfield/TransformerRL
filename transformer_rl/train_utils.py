@@ -31,52 +31,6 @@ def _morph_label(legs) -> str:
     return "·".join(_LEG_CODE[n] for n in sorted(legs))
 
 
-class _TestDone(Exception):
-    pass
-
-
-class _TestTracker:
-    """Wraps AntMultiMorphEnv; tracks per-env episode rewards, raises _TestDone when done."""
-
-    def __init__(self, env, num_episodes: int):
-        from tqdm import tqdm
-        self._env = env
-        self._num_ep = num_episodes
-        n = env.total_num_envs
-        self._epm = env.envs_per_morph
-        self._n_morphs = len(env.groups)
-        self._ep_counts = [0] * n
-        self._cur_rew = [0.0] * n
-        self._scores: list[list[float]] = [[] for _ in range(self._n_morphs)]
-        self.done = False
-        self._bar = tqdm(total=n * num_episodes, unit="ep", desc="testing")
-
-    def __getattr__(self, name):
-        return getattr(self._env, name)
-
-    def step(self, actions):
-        result = self._env.step(actions)
-        rew = self._env._rew_buf.cpu()
-        done = (self._env._term_buf | self._env._trunc_buf).cpu()
-        for i in range(len(done)):
-            self._cur_rew[i] += float(rew[i])
-            if done[i]:
-                gi = i // self._epm
-                if self._ep_counts[i] < self._num_ep:
-                    self._scores[gi].append(self._cur_rew[i])
-                    self._bar.update(1)
-                self._ep_counts[i] += 1
-                self._cur_rew[i] = 0.0
-        if all(c >= self._num_ep for c in self._ep_counts):
-            self._bar.close()
-            self.done = True
-            raise _TestDone
-        return result
-
-    def get_scores(self) -> list[list[float]]:
-        return self._scores
-
-
 class _PlayLimiter:
     """Wraps env; stops play after max_steps total steps."""
 
@@ -749,6 +703,8 @@ def run_training(
     parser.add_argument("--max_epochs", type=int)
     parser.add_argument("--horizon_length", type=int)
     parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--name", type=str, default=None,
+                        help="Run name: leaf output dir (runs/env/model/<name>) instead of timestamp.")
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--train-pct", type=float, default=None, dest="train_pct",
                         help="Fraction of morphologies for training (rest = test set).")
@@ -756,6 +712,13 @@ def run_training(
                         help="Use held-out test morphologies (play/test only).")
     parser.add_argument("--compare", action="store_true", default=False,
                         help="Test mode: run on full morph set, chart train vs test morphs.")
+    parser.add_argument("--data-type", choices=["summary", "full"], default="summary",
+                        dest="data_type",
+                        help="Test mode: 'summary' = per-morph score table; "
+                             "'full' = per-step value/reward traces + per-env CSV (morph-value sweep).")
+    parser.add_argument("--num-samples", type=int, default=1, dest="num_samples",
+                        help="Test/full: number of fresh morphology draws (resample between). "
+                             "Requires env sample_morphs=True when > 1.")
     if extra_args_fn is not None:
         extra_args_fn(parser)
     args = parser.parse_args()
@@ -805,7 +768,11 @@ def run_training(
     cfg.setdefault("use_diagnostics", True)  # enables diagnostics/exp_var, clip_frac, rms_value
     exp_name = cfg.get("name", "run").removeprefix("ant_")
     cfg.setdefault("train_dir", f"{train_dir}/{exp_name}")
-    cfg.setdefault("full_experiment_name", datetime.now().strftime("%d-%H-%M-%S"))
+    run_name = args.name or datetime.now().strftime("%d-%H-%M-%S")
+    if mode == "train" and Path(cfg["train_dir"], run_name).exists():
+        print(f"Error: run '{run_name}' already exists at {cfg['train_dir']}/{run_name}")
+        sys.exit(1)
+    cfg.setdefault("full_experiment_name", run_name)
 
     # --- Seed ---
     if args.seed is not None:
@@ -923,7 +890,7 @@ def run_training(
 
     # --- Env + vecenv registration ---
     num_episodes = args.num_episodes
-    tracker_ref: list[_TestTracker | None] = [None]
+    env_ref: list = [None]   # test mode owns the rollout loop; keep a handle to the real env
 
     def create_envs(n, **kw):
         assert torch.cuda.is_available()
@@ -932,10 +899,8 @@ def run_training(
         if mode in ("play", "test"):
             envs.inference_mode_post_init_callback()
         if mode == "test":
-            ep = num_episodes if num_episodes is not None else 10
-            tracker = _TestTracker(envs, ep)
-            tracker_ref[0] = tracker
-            return NewToOldAPICompatilibity(tracker)
+            env_ref[0] = envs
+            return NewToOldAPICompatilibity(envs)
         _attach_render_callback(envs, recorder)
         if mode == "play" and num_episodes is not None:
             max_ep = env_kwargs.get("max_episode_length", 1000)
@@ -962,19 +927,6 @@ def run_training(
     mb_module.register_model('transformer_masked_a2c_logstd', TransformerMaskedNorm)
 
     # --- Run ---
-    run_args = {"train": mode == "train", "play": mode in ("play", "test")}
-    if checkpoint:
-        run_args["checkpoint"] = checkpoint
-
-    if mode == "play":
-        if checkpoint:
-            print(f"[play] Loading model from checkpoint: {checkpoint}")
-        else:
-            print("[play] No checkpoint provided; running with randomly initialized model")
-    elif mode == "test":
-        ep = num_episodes if num_episodes is not None else 10
-        print(f"[test] {ep} episodes per env slot  |  checkpoint: {checkpoint}")
-
     runner = Runner()
     # Swap in the metrics-logging agent for all continuous PPO runs (see logging_agent.py).
     from .logging_agent import LoggingA2CAgent
@@ -982,15 +934,46 @@ def run_training(
         'a2c_continuous', lambda **kwargs: LoggingA2CAgent(**kwargs)
     )
     runner.load(config)
+
+    # test mode owns its rollout loop (ADR-0007): reuse the player only to restore the
+    # checkpoint (weights + obs/value normalizers), then drive our own loop so we can read
+    # per-step value estimates and resample the morph set between Samples.
+    if mode == "test":
+        if args.num_samples > 1 and not config.get("env", {}).get("sample_morphs", False):
+            raise SystemExit("--num-samples > 1 requires an env with sample_morphs=True (full ant)")
+        if args.data_type == "summary" and args.num_samples > 1:
+            raise SystemExit("--num-samples > 1 requires --data-type full")
+        ep = num_episodes if num_episodes is not None else 10
+        if args.data_type == "full":
+            print(f"[test] full capture: {args.num_samples} sample(s), first episode/env  "
+                  f"|  checkpoint: {checkpoint}")
+        else:
+            print(f"[test] summary: {ep} episodes per env slot  |  checkpoint: {checkpoint}")
+
+        from .rollout import run_test_rollout
+        player = runner.create_player()
+        player.restore(checkpoint)
+        reward_scale = config["params"]["config"].get("reward_shaper", {}).get("scale_value", 1.0)
+        # Output key: explicit --name, else the checkpoint's run-dir name (.../<run>/nn/<ckpt>.pth),
+        # so distinct runs don't collide on the shared checkpoint filename.
+        out_stem = args.name or Path(checkpoint).resolve().parent.parent.name
+        run_test_rollout(
+            player, env_ref[0], data_type=args.data_type, num_episodes=ep,
+            num_samples=args.num_samples, reward_scale=reward_scale, checkpoint=checkpoint,
+            out_stem=out_stem, split_labels=compare_labels_ref[0],
+        )
+        return
+
+    run_args = {"train": mode == "train", "play": mode == "play"}
+    if checkpoint:
+        run_args["checkpoint"] = checkpoint
+    if mode == "play":
+        if checkpoint:
+            print(f"[play] Loading model from checkpoint: {checkpoint}")
+        else:
+            print("[play] No checkpoint provided; running with randomly initialized model")
     try:
         runner.run(run_args)
-    except _TestDone:
-        tracker = tracker_ref[0]
-        if tracker is not None:
-            _print_and_save_test_results(
-                tracker.get_scores(), tracker._env.groups, checkpoint,
-                split_labels=compare_labels_ref[0],
-            )
     except Exception:
         # vsim's render() raises a bare Exception to signal shutdown. When the
         # recorder finished on purpose, that's a clean stop; otherwise re-raise.
