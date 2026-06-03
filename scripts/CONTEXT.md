@@ -7,9 +7,15 @@ PPO training, Optuna tuning, and play/render/test orchestration for the leg tran
 **Run mode**:
 The first positional arg to any `train_ant_*.py`: `train` (default), `play`, `random`, or `test`. Headless defaults: `train` and `test` are headless; `play` opens a render window. `--video` is not supported in `train` mode.
 
+**Run name**:
+The leaf label identifying a single training run, the last segment of its output dir (`runs/<env>/<model>/<run-name>`). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.
+
 **test mode**:
-Headless evaluation mode. Runs a loaded checkpoint on the env for a fixed number of episodes per env slot, then prints a per-morph results table and saves a CSV, bar-chart PNG, and markdown summary to `results/` alongside the checkpoint directory. Requires a checkpoint. Default: 10 episodes per env slot.
+Headless evaluation mode. Requires a checkpoint. Owns its own rollout loop (reuses the rl_games player only to restore the checkpoint; see [ADR-0007](../docs/adr/0007-test-mode-owns-rollout-loop.md)). Two `--data-type`s: `summary` (default) runs a fixed number of episodes per env slot, then prints a per-morph results table and saves a CSV, bar-chart PNG, and markdown summary to `results/` alongside the checkpoint; `full` runs the [morph-value sweep](../experiments/CONTEXT.md) — one self-contained `.npz` (per-step value/reward traces + per-env morph features) to `data/morph_value_sweep/`, keyed by the checkpoint's run-dir name or `--name`.
 _Avoid_: calling it "evaluation" (ambiguous with rl_games internal eval metrics).
+
+**`--data-type`** / **`--num-samples`** (`test` only):
+`--data-type summary|full` selects the per-morph score table vs the full per-step capture. `--num-samples N` is the number of fresh morphology draws (resample between [Samples](../experiments/CONTEXT.md)); default 1, hard-errors if `>1` unless the env has `sample_morphs=True`, and requires `--data-type full`. The sweep uses `--num-samples 5 --num-episodes 1 --data-type full`; run once per checkpoint, same `--seed`, to align the morph draws across models. The `.npz` is keyed by the checkpoint's run-dir name; pass `--name <label>` to override (the notebook's `STEMS` list these labels).
 
 **`--num-episodes`**:
 In `test` mode: episodes per env slot to collect (default 10). In `play` mode: stops the player after `num_episodes × max_episode_length` total steps (default: runs until window closed). When `--video` is set in `play` or `random` mode: bounds recording duration (default 1 episode when unset).
