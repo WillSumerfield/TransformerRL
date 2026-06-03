@@ -636,11 +636,15 @@ def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
         # tripping env.render_finished (which would raise via raise_exception).
         recorder = _VideoRecorder(video_path, max_frames=num_episodes * max_ep, stop_env=False)
     _attach_render_callback(env, recorder)
-    while not env.render_finished:
-        if recorder is not None and recorder.done:
-            break
-        actions = act_low + torch.rand(total, act_low.shape[0], device=device) * (act_high - act_low)
-        env.step(actions)
+    from envs.multigroup_environment import RenderFinished
+    try:
+        while not env.render_finished:
+            if recorder is not None and recorder.done:
+                break
+            actions = act_low + torch.rand(total, act_low.shape[0], device=device) * (act_high - act_low)
+            env.step(actions)
+    except RenderFinished:
+        pass  # window closed mid-step (render() raises from inside env.step)
 
 
 def run_training(
@@ -972,12 +976,13 @@ def run_training(
             print(f"[play] Loading model from checkpoint: {checkpoint}")
         else:
             print("[play] No checkpoint provided; running with randomly initialized model")
+    from envs.multigroup_environment import RenderFinished
     try:
         runner.run(run_args)
-    except Exception:
-        # vsim's render() raises a bare Exception to signal shutdown. When the
-        # recorder finished on purpose, that's a clean stop; otherwise re-raise.
+    except RenderFinished:
+        # Intended viewer shutdown: window closed, --num-episodes cap, or video
+        # budget reached. Any other Exception is a real crash and propagates.
         if recorder is not None and recorder.done:
             print("Recording complete, exiting.")
         else:
-            raise
+            print("Play finished, exiting.")

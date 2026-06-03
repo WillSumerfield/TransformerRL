@@ -15,6 +15,15 @@ from vlearn.spaces import Box
 import vlearn as v
 
 
+class RenderFinished(Exception):
+    """Sentinel raised by render() to signal an intended viewer shutdown.
+
+    Distinguishes a clean stop (window closed, --num-episodes cap, video budget)
+    from a real crash. Caught at the play loop's runner.run() and in _run_random
+    (see docs/adr/0003); any other Exception propagates as a genuine error.
+    """
+
+
 class MultiGroupEnvironmentGpu(ABC):
 
     def __init__(
@@ -327,7 +336,7 @@ class MultiGroupEnvironmentGpu(ABC):
     def render(self):
         self.render_finished = self.gym_render.render(self.render_callback)
         if self.render_finished and self.raise_exception:
-            raise Exception
+            raise RenderFinished
 
     def render_callback(self):
         pass
