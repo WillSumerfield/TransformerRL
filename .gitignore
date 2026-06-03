@@ -7,6 +7,8 @@ videos/
 .claude/
 TurboActivate.dat
 envs/ant_envs/assets/generated/
+imgui.ini
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
