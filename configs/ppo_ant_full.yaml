@@ -7,10 +7,10 @@ params:
 
   network:
     transformer:
-      d_model: 208
+      d_model: 160
       n_heads: 8
       n_layers: 1
-      ffn: 832
+      ffn: 640
 
   config:
     num_actors: 4096
@@ -18,17 +18,17 @@ params:
       scale_value: 0.01
     gamma: 0.98
     tau: 0.95
-    learning_rate: 7e-4
-    kl_threshold: 0.015
-    max_epochs: 1000
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
     save_best_after: 200
     save_frequency: 50
-    grad_norm: 1.0
-    entropy_coef: 0.001
-    e_clip: 0.2
-    resample_interval: 2    # episodes between full morphology resamples (gym rebuild); 0 = off
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5    # episodes between full morphology resamples (gym rebuild); 0 = off
     horizon_length: 16
     minibatch_size: 32768
     mini_epochs: 4
-    critic_coef: 2
-    bounds_loss_coef: 0.0
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
