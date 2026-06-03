@@ -468,10 +468,13 @@ def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Pat
             f.write("\n=== stderr ===\n")
             f.write((r.stderr or "") if not timed_out else "(timed out)\n")
 
-        if timed_out:
-            return None  # no retry on timeout
-        if not ok:
-            return _NEGINF
+        if not ok and not timed_out:
+            return _NEGINF  # real failure/crash: worst score, eligible for one retry
+        # Success OR soft-capped timeout: score on the TB log. A timed-out trial is
+        # scored on the partial run (its best metric so far), not discarded — the
+        # timeout is a wall-clock safety net, not a death sentence. (At a 30-min cap
+        # the run has logged many epochs, so _read_tb returns a real value, not
+        # _NEGINF, and the no-retry intent for timeouts holds in practice.)
         summaries_subdir = sc.get("summaries_subdir", "")
         log_dir = output_dir / "runs" / f"tune_trial_{num}"
         if summaries_subdir:
