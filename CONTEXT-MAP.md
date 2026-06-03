@@ -9,6 +9,7 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 ├── CONTEXT-MAP.md                    ← this file; shared kernel below
 ├── docs/
 │   ├── adr/                          ← system-wide decisions
+│   ├── transformer_architecture.md   (living doc: full obs→action flow, shapes, why)
 │   ├── adaptive_ant_fixes.md
 │   ├── group_count_throughput.md     (playbook: group-count-independent env throughput)
 │   ├── morphology_resampling_cost.md (playbook: rebuild cost + resample cadence for the full ant)
