@@ -28,6 +28,7 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 │   ├── architectures.py              (LegTransformer, MultiMorphLegTransformer)
 │   ├── tokenize.py                   (obs → torso/hip/ankle tokens)
 │   ├── models.py                     (rl_games model/network builders)
+│   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
 │   └── train_utils.py
 ├── scripts/                          ← Training context
