@@ -21,7 +21,6 @@ from rl_games.algos_torch.a2c_continuous import A2CAgent
 _LEG_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
 _LEADERBOARD_EVERY = 50  # epochs
 _LEADERBOARD_K = 5       # top-k and bottom-k
-_HEATMAP_EVERY = 50      # epochs
 
 
 def _morph_label(legs) -> str:
@@ -37,7 +36,6 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_mean: float | None = None  # per-epoch (set in prepare_dataset)
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
-        self._morph_hist: list = []  # per-epoch per-morph reward, for the heatmap
         self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
 
     def train_epoch(self):
@@ -172,11 +170,6 @@ class LoggingA2CAgent(A2CAgent):
         for k, idxs in meta['by_legs'].items():
             w.add_scalar(f'morph_reward_legs/{k}', pm[torch.tensor(idxs)].mean().item(), frame)
 
-        self._morph_hist.append(pm.numpy().copy())  # (n_morphs,) per epoch
-
-        if epoch_num and epoch_num % _HEATMAP_EVERY == 0:
-            self._log_morph_heatmap(w, frame, meta)
-
         if epoch_num and epoch_num % _LEADERBOARD_EVERY == 0:
             order = torch.argsort(pm, descending=True).tolist()
             k = min(_LEADERBOARD_K, n)
@@ -190,33 +183,3 @@ class LoggingA2CAgent(A2CAgent):
                 i = order[r]
                 rows.append(f'| {r + 1} | {meta["labels"][i]} | {meta["leg_counts"][i]} | {pm[i]:.3f} |')
             w.add_text('morph_leaderboard', '\n'.join(rows), frame)
-
-    def _log_morph_heatmap(self, w, frame, meta):
-        """All-morphs-over-time heatmap (rows sorted by current reward, best/worst rows labeled)."""
-        import numpy as np
-        import matplotlib
-        matplotlib.use('Agg', force=False)
-        import matplotlib.pyplot as plt
-
-        hist = np.stack(self._morph_hist, axis=1)      # (n_morphs, T)
-        order = np.argsort(hist[:, -1])[::-1]          # best (highest current reward) first
-        data = hist[order]
-        labels, leg_counts = meta['labels'], meta['leg_counts']
-        n = data.shape[0]
-
-        fig, ax = plt.subplots(figsize=(10, 8))
-        im = ax.imshow(data, aspect='auto', cmap='viridis', interpolation='nearest')
-        fig.colorbar(im, ax=ax, label='mean reward/step')
-        ax.set_xlabel('iteration (logged epoch)')
-        ax.set_ylabel('morph (sorted by current reward)')
-        ax.set_title(f'per-morph reward over training ({n} morphs)')
-        # Label only the best-k and worst-k rows so 100+ morphs stay legible.
-        k = min(3, n // 2)
-        ticks = list(range(k)) + list(range(n - k, n))
-        ax.set_yticks(ticks)
-        ax.set_yticklabels(
-            [f'{labels[order[i]]} ({leg_counts[order[i]]}L)' for i in ticks], fontsize=7
-        )
-        fig.tight_layout()
-        w.add_figure('morph_heatmap', fig, frame)
-        plt.close(fig)
