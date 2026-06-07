@@ -1,0 +1,39 @@
+# Binary-leg experiment env (value-gradient study). See docs/value_gradient_propagation.md.
+# All 8 legs present + DOF-mask-active; on/off carried by length (on=1x, off=0.05x build / 0 obs),
+# hip+ankle tied. Stable on-sets most of the time + an unstable_fraction tail so the critic sees
+# bad bodies. Shared rl_games boilerplate lives in configs/defaults/base.yaml (merged at load).
+env:
+  sample_morphs: true        # all-8-leg bodies; AntBinaryLegEnv draws per-leg presence prob p, builds Bernoulli(p)
+  off_scale: 0.05            # off-leg build length (hidden from obs, which reports p, not geometry)
+  unstable_fraction: 0.25    # fraction of bias-center draws from the unstable/marginal topology tail
+
+params:
+  seed: 42                   # override per run with --seed (3 seeds: 42/43/44)
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
+    save_best_after: 200
+    save_frequency: 50
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5     # episodes between on/off-topology resamples (gym rebuild); 0 = off
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
