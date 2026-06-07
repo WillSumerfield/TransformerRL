@@ -162,7 +162,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 raise ValueError("seed required when sample_morphs=True")
             # Persistent rng so the initial draw + every resample form one reproducible stream.
             self._morph_rng = random.Random(seed)
-            self._morphologies = sample_morphologies(num_envs, rng=self._morph_rng)
+            self._morphologies = self._draw_morphs(num_envs)
         else:
             morphs = morphologies if morphologies is not None else _stable_morphologies()
             if train_pct < 1.0:
@@ -531,8 +531,14 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         """
         if not getattr(self, "_sample_morphs", False):
             raise RuntimeError("resample() requires sample_morphs=True")
-        self._morphologies = sample_morphologies(self.total_num_envs, rng=self._morph_rng)
+        self._morphologies = self._draw_morphs(self.total_num_envs)
         self._rebuild()
+
+    def _draw_morphs(self, num: int) -> list:
+        """Draw `num` sampled bodies (full-ant config). Overridable so experiment subclasses can
+        change the sampling distribution (e.g. AntBinaryLegEnv) while reusing the build/resample
+        machinery."""
+        return sample_morphologies(num, rng=self._morph_rng)
 
     def _rebuild(self):
         # Drop every gym-backed reference so delete_gym frees cleanly, then recreate the scene
