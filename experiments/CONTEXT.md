@@ -40,5 +40,27 @@ A **base morph** is one sampled intact body (the [Token](../transformer_rl/CONTE
 **Ablation set**:
 The unit of the leg-ablation sweep: one base morph plus all N of its ablations, built as N+1 [EnvironmentGroups](../scripts/CONTEXT.md) in a single env (group 0 = intact, group i = leg-i-removed). Each group gets an equal env budget (`envs_per_group`, fixed across the study and capped so the 8-leg worst case of 9 groups fits the env ceiling). Rolled out until **every env has completed exactly K episodes** — K fixed per env so unstable bodies can't contribute extra short episodes and bias the per-group statistics. One ablation set is processed at a time; the body geometry differs per set, so each is a fresh env build.
 
+**Value gradient** (presence gradient):
+`∂V/∂p` — the critic's value sensitivity to a leg's **presence probability** `p`, the
+candidate training signal for a future morphology generator (ascend `V`). The **raw
+sensitivity** ("which way should this input move"), *not* an attribution of how much the
+input contributes to the current value — the two have opposite signs and only the
+sensitivity drives ascent. Studied in [the value-gradient propagation study](../docs/value_gradient_propagation.md).
+_Avoid_: reading it as leg attribution/importance (that's **Leg importance**, a finite
+difference, below).
+
+**Presence probability** (`p`):
+A leg's continuous probability of being built, in `[0,1]` — the morphology input the critic
+sees in the [value-gradient propagation study](../docs/value_gradient_propagation.md) (replacing the earlier binary on/off). The body is built
+by **Bernoulli-sampling** `p`, so `V(p)` is the *expected* return over the bodies `p`
+induces and `∂V/∂p` (the **Value gradient**) is a smooth, in-distribution codesign signal.
+Distinct from a leg's **segment length** (hip/ankle), which `p` here does not vary.
+
+**Should-be sign**:
+The convention that a value-gradient's sign tracks a leg's **desired** state, independent
+of its current state: positive = should be on (grow it), negative = should be off (shrink
+it). A helpful leg is positive whether currently on or off. Distinct from the
+current-on/off state, which the gradient never reports.
+
 **Leg importance** (predicted vs realized):
 For a leg i within an **Ablation set**: **value-predicted importance** = `V(intact) − V(ablate_i)` and **realized importance** = `Return(intact) − Return(ablate_i)`, both joined within the set. The sweep's headline is how well predicted tracks realized — i.e. whether the critic anticipates which legs the body actually needs. Paired only within a base morph (the intact group is the reference); never compared across base morphs without re-pairing.
