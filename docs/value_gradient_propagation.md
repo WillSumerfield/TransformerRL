@@ -1,52 +1,81 @@
 # Value-gradient propagation for codesign
 
 Can the control critic's gradient `∂V/∂p` (per-leg presence) act as a training signal for a
-morphology **generator** — emit a body, push it uphill on `V`? This study answers **yes on sign,
-no on magnitude**: across 3 seeds the gradient is positive almost everywhere (no myopia), it
-interpolates onto held-out bodies, and it survives composition through a soft generator network
-(sign-alignment 0.94) — the failure mode that killed the earlier binary version. But grounded against
-*realized return*, the gradient's **sign is right 99% of the time while its magnitude barely predicts
-which leg actually helps** (Pearson +0.17), and only in bodies that already walk. Full figures and the
-numeric pipeline live in [`notebooks/value_grad_prop.ipynb`](../notebooks/value_grad_prop.ipynb);
-experiment scripts are `experiments/value_grad_prop.py` (Step 1), `value_grad_step2.py`,
-`value_grad_step3.py`, `value_grad_phase2.py`, and `value_grad_ablation.py` (grounding). First run 2026-06.
+morphology **generator** — emit a body, push it uphill on `V`? The short answer: **yes on sign and
+shape, no on magnitude — and it depends sharply on how good the control policy/value function is.**
+
+This is the third version of the experiment, and the headline is a **contrast between a poor control
+and a good one**. The previous version (a *stochastic-build* env: body `Bernoulli(p)`, critic blind to
+the realized body) produced a misleading signal — the diminishing-returns curve came out *inverted*,
+the `p=0/1` corners looked out-of-distribution, and the value function was blind to per-leg structure
+in un-walkable bodies. This version (a *deterministic-build* env: body = a clean stable center, `p` fed
+to obs/value only) trains a much stronger policy (seed-avg return 3992 vs 2545 per body, see
+[the variant comparison](#contrast-poor-vs-good-control)) and the signal cleans up: the
+diminishing-returns curve is now **correct** (largest exactly where a generator must bootstrap a leg),
+corners are well-behaved, and value is rank-calibrated to realized return. **Magnitude is still not a
+reliable "which leg" signal** — but the *reason* changed, which is the most interesting finding (see
+[the diagnosis](#why-magnitude-still-fails--but-differently-than-before)).
+
+Full figures and the numeric pipeline live in
+[`notebooks/value_grad_prop.ipynb`](../notebooks/value_grad_prop.ipynb); scripts are
+`experiments/value_grad_prop.py` (Step 1), `value_grad_step2.py`, `value_grad_step3.py`,
+`value_grad_phase2.py`, and `value_grad_ablation.py` (grounding). Previous (stochastic-build) results
+are archived under `data/value_grad_prop/_archive_v2/`. Re-run on the `*_nobern` checkpoints 2026-06.
 
 ## Background
 
-The codesign loop we want is: a generator emits a body, the trained critic scores it, and we
-backprop `∂V/∂(morph)` into the generator to make it emit better bodies. That only works if the
-critic's morphology gradient has **sensible sign and magnitude** and **survives being composed with
-a generator network**. This study tests both.
+The codesign loop we want is: a generator emits a body, the trained critic scores it, and we backprop
+`∂V/∂(morph)` into the generator to make it emit better bodies. That only works if the critic's
+morphology gradient has **sensible sign and magnitude** and **survives composition with a generator
+network**. This study tests both — and, across three env versions, shows that *all of it is gated by
+the quality of the underlying control policy/value function*.
 
-An earlier **binary** `{0,1}` presence version failed in Phase 2: a discrete generator's saturated
-sigmoid collapsed the gradient to ~zero. This recast fixes that by construction — presence is a
-**continuous probability** `p ∈ [0,1]`, so the critic natively consumes the soft output a generator
-produces, with no discrete bottleneck.
+**Three versions, each fixing the last:**
+
+1. **Binary `{0,1}` presence.** Failed in Phase 2: a discrete generator's saturated sigmoid collapsed
+   the gradient to ~zero. (On clean bodies this policy is also the weakest — seed-avg return 869.)
+2. **Continuous-`p`, stochastic build ("the previous experiment").** Presence is a probability
+   `p ∈ [0,1]`; the body is built by `Bernoulli(p)` and the obs reports `p`, so `V(p) ≈ E[return]`.
+   This fixed Phase 2 by removing the discrete bottleneck. **But the critic never sees the body it is
+   actually controlling** (the policy acts under a body it can't observe), and `V` is smeared over a
+   distribution of degraded bodies (with `√U` sampling, an "on" leg is physically built only ~⅔ of the
+   time). The result is a **poor value function**: the codesign signal it produces is misleading
+   (details throughout). Its low *logged* training reward (~320) was a metric artifact of averaging
+   over junk bodies, but per-body it still walks (seed-avg return 2545).
+3. **Continuous-`p`, deterministic build (this experiment).** The body is built **exactly = the stable
+   bias center `S`**; `p` (a `√U` cloud around `S`) is fed to obs/value **only**, never to geometry. The
+   policy always controls a real, clean stable morph → it trains to a much stronger policy (seed-avg
+   return 3992) and `V(p)` learns the value of the center implied by `p`. This is the **good control**.
+
+This document reports version 3 and contrasts it against version 2 throughout — *the same probes, run
+on a poor vs a good control/value function.*
 
 ### The sign convention (read this first)
 
-The quantity is **raw sensitivity** `∂V/∂p` — *which way a leg should move* — **not** an attribution
-of how much a leg currently contributes. The sign tracks the *desired* state regardless of the
-current one: a **helpful** leg is **+** (grow it) whether currently on or off; a **harmful** leg is
-**−** (shrink it) either way. A critical-but-currently-*off* leg should be the single **largest
-positive** gradient ("add me"). This is exactly what gradient ascent consumes.
+The quantity is **raw sensitivity** `∂V/∂p` — *which way a leg should move* — **not** an attribution of
+how much a leg currently contributes. The sign tracks the *desired* state regardless of the current
+one: a **helpful** leg is **+** (grow it) whether currently on or off; a **harmful** leg is **−**
+(shrink it) either way. A critical-but-currently-*off* leg should be the largest **positive** gradient
+("add me"). This is exactly what gradient ascent consumes.
 
 ## What was tested
 
 An **experiment-only** ant variant (`AntBinaryLegEnv`, not the production controller):
 
-- **All 8 legs always DOF-mask-active.** The production net zeroes masked tokens, giving them
-  *exactly zero* length gradient. To get any presence gradient every leg must stay active; presence
-  is carried purely by the input `p`.
-- **Continuous presence `p ∈ [0,1]`**, tied across a leg's hip and ankle slots (`∂V/∂p` = sum of
-  the two slot gradients). `p` is a *probability*, not a length.
-- **Stochastic build.** The body is built by `Bernoulli(p)` per leg (on → 1×, off → a hidden 0.05×
-  stub), but the **obs reports `p`, not the sampled outcome**, so `V(p) ≈ E[return]` and `∂V/∂p` is
-  in-distribution everywhere. Training draws `p` as `√U` for on-legs / `1−√U` for off-legs around a
-  bias center `S`, whose equal mixture is marginally `Uniform(0,1)` → uniform coverage of the knob.
-- **Held-out set (guard).** All 56 five-leg topologies + 3 curated Step-2 sets are stripped from the
-  pick-pool and rejected-and-resampled if a Bernoulli draw lands on them — so Steps 2/3 can probe
-  the gradient *off* the training set.
+- **All 8 legs always DOF-mask-active.** The production net zeroes masked tokens, giving them *exactly
+  zero* length gradient. To get any presence gradient every leg must stay active; presence is carried
+  purely by the input `p`.
+- **Continuous presence `p ∈ [0,1]`**, tied across a leg's hip and ankle slots (`∂V/∂p` = sum of the
+  two slot gradients). `p` is a *signal*, not a length.
+- **Deterministic build (this version).** The body is built **exactly = the stable bias center `S`**
+  (on-legs 1×, off-legs a hidden 0.05× stub). `p` is drawn `√U` for on-legs / `1−√U` for off-legs
+  around `S` (equal mixture marginally `Uniform(0,1)` → uniform coverage of the knob) and fed to **obs
+  and value only** — never to geometry. So the policy always controls a clean, fully-realized morph,
+  and `V(p)` learns the value of the center `p` implies. *(Contrast: the previous version built
+  `Bernoulli(p)` and the policy was blind to the realized body.)*
+- **Held-out set.** All 56 five-leg topologies + 3 curated Step-2 sets are stripped from the pick-pool,
+  so a center — hence a trained body — is never held-out, and Steps 2/3 can probe the gradient *off*
+  the training set. (No Bernoulli draw to guard against anymore.)
 - Two metrics per leg: **`ḡ`** (∂V/∂p averaged over a rollout — the signal a generator sees) and
   **`g0`** (at the t=0 reset pose — the static prior). **3 seeds** (s42/s43/s44), report mean±std.
 
@@ -54,213 +83,226 @@ The four probes and the conditioning check:
 
 | | question | how |
 |---|---|---|
-| **Step 1** (myopia) | is `∂V/∂p` positive at low `p`, so ascent can grow a near-off leg? | bin `ḡ` by `p` over the training population |
-| **Step 2** (curated) | does the gradient match intuition on 3 held-out shapes, and agree with a trained twin? | deterministic builds vs a mirror/rotation twin |
+| **Step 1** (myopia + shape) | is `∂V/∂p` positive at low `p`, and is it largest there (so ascent can grow a near-off leg, with diminishing returns)? | bin `ḡ` by `p` over the training population |
+| **Step 2** (curated) | does the gradient match intuition on 3 held-out shapes and agree with a trained twin? | deterministic builds vs a mirror/rotation twin, at corner & interior `p` |
 | **Step 3** (interpolation) | does the gradient generalize to held-out 5-leg bodies? | overlay held-out `∂V/∂p`-vs-`p` on Step 1 |
-| **Grounding** | does `V` and its gradient predict *realized return*? | toggle each leg of 16 base bodies, correlate `V`/`∂V/∂p` vs realized `R`/`ΔR` |
+| **Grounding** | do `V` and its gradient predict *realized return*? | toggle each leg of 16 base bodies, correlate `V`/`∂V/∂p` vs realized `R`/`ΔR` |
 | **Phase 2** (conditioning) | does the sign survive composition through a generator net? | pretrain a scatter-gather transformer, compose in front of `V`, backprop to its input |
 
 ## Results
 
-### Step 1 — myopia averted, but weakest where it's needed most
+### Step 1 — diminishing returns now correct, and no myopia
 
-Premise sanity holds: mean episode reward rises monotonically with sampled on-leg count (s42:
-2-leg 341 → 8-leg 4948; 5 absent = holdout). The headline `∂V/∂p`-vs-`p` curve (seed-avg):
+Premise sanity holds strongly: mean episode reward rises monotonically with center leg-count (3-leg
+1230 → 4-leg 1891 → 6-leg 4992 → 7-leg 6656 → 8-leg 8193; 5 absent = holdout). The headline
+`∂V/∂p`-vs-`p` curve (seed-pooled):
 
-| p-bin | 0.0–0.1 | 0.3–0.4 | 0.6–0.7 | 0.7–0.8 | 0.9–1.0 |
-|---|---|---|---|---|---|
-| mean `∂V/∂p` | +2.7 | +4.7 | +6.9 | +6.9 | +6.2 |
-| frac > 0 | ~0.88 | ~0.90 | ~0.92 | ~0.93 | ~0.94 |
+| p-bin | 0.0–0.1 | 0.2–0.3 | 0.4–0.5 | 0.6–0.7 | 0.8–0.9 | 0.9–1.0 |
+|---|---|---|---|---|---|---|
+| **this (good control)** | **+10.2** | +10.6 | +8.6 | +7.2 | +4.5 | +3.3 |
+| *prev (poor control)* | *+2.7* | *—* | *+7* | *+6.9* | *—* | *+6.2* |
+| frac > 0 (this) | 0.99 | 0.99 | 0.99 | 0.98 | 0.92 | 0.87 |
 
-**Positive everywhere** (frac > 0 never drops below ~0.85, even at the lowest `p`) → **no myopia**:
-ascent can discover and grow a near-off leg. But the **magnitude shape is the opposite of the
-predicted "diminishing returns, largest at low `p`"** — it's *weakest* at low `p` (~+2.7) and
-*strongest* mid/high (~+7), barely drooping at `p=1`. The signal is **smallest exactly where a
-generator most needs it** (bootstrapping a leg from near-off): ascent is slow-to-start, not stuck.
+**Positive everywhere at low `p` (frac > 0 ≈ 0.99) → no myopia**, and now the **magnitude has the
+correct diminishing-returns shape**: *largest at low `p`* (+10.2, where a leg is near-off and most
+worth adding) and decaying toward `p=1` (+3.3, redundancy). **This is the exact inverse of the previous
+experiment**, where the signal was *weakest* at low `p` (+2.7) — smallest exactly where a generator
+must bootstrap a leg. The fix came entirely from giving the critic clean, observable bodies to value.
 
 Two supporting reads:
 
-- **Split by body fullness:** the predicted diminishing-returns shape *does* exist, but only
-  **conditionally**. In **lean bodies (≤3 legs)** `∂V/∂p` rises with `p` (+1.7 → +6.8); in **full
-  bodies (≥6 legs)** it's high and *declines* toward `p=1` (+5.6 → +7.9 → +5.5, i.e. redundancy).
-  The pooled curve averages these.
-- **`g0` (static prior) vs `ḡ` (rollout):** weak agreement (corr 0.32, sign-agree 0.87). `g0` has
-  **~4× the absolute spread** of `ḡ` (std 20.6 vs 5.4, range −61…+148) at the **same coefficient of
-  variation** (≈1.0) — i.e. uniformly inflated and noisier in absolute terms, sign-flipping more.
+- **Split by body fullness:** both lean and full bodies are positive throughout; the diminishing-
+  returns droop is steepest in **full bodies (≥6 legs)** (low `+13.3` → high `+3.0`, i.e. strong
+  redundancy at the top), and gentle in **lean bodies (≤3 legs)** (`+7.6` → `+6.0`). The pooled
+  low-`p`-high shape is dominated by the full-body curve. *(Previously this split was the only place
+  diminishing returns appeared at all; now it is the pooled headline.)*
+- **`g0` (static prior) vs `ḡ` (rollout):** weak agreement (corr 0.32, sign-agree 0.93). `g0` has
+  **~1.9× the absolute spread** of `ḡ` (std 10.1 vs 5.4) — uniformly inflated and sign-flipping more.
   **Trust `ḡ`; the static reset-pose prior is a poor proxy.**
 
-### Step 2 — corners are OOD; interior `p` recovers the expected signal, and twins agree
+### Step 2 — corners are no longer OOD; per-leg twin agreement is noisy
 
-Two findings co-headline here.
+This is where the *poor → good control* shift is most visible — and where the limits of the good
+control's magnitude show up.
 
-**(a) The `p=0/1` corners are out-of-distribution.** Training never places off-legs at *exactly* 0,
-so corner gradients are distorted. On `critical_missing` (held `{5,6,7}`), the prediction was that
-the *off* front/right legs should be the largest positive ("add me"). At the corner they were
-**flat** (1F +0.7, 8FL +3.6) while the on-cluster dominated (6BL +22.0). At **interior `p`
-(0.75 on / 0.25 off)** the prediction is **restored** — front-leg "add me" gradients grow and
-on-cluster "keep" gradients collapse:
+**(a) The `p=0/1` corners are well-behaved now.** The previous experiment's signature failure was that
+training never placed off-legs at exactly 0, so corner gradients were distorted and flipped the
+expected importance ordering — "evaluate at interior `p`, never the corners" was a headline caveat.
+Under the good control this **largely dissolves**: on `critical_missing` (held `{5,6,7}`) the off
+front/right legs that should say "add me" are already positive at the corner (1F +3.9, 2FR +6.3,
+3R +6.4), and interior `p` only sharpens them (1F +6.2, 2FR +10.6, 3R +10.8). For the two *walkable*
+curated pairs, the held body's per-leg pattern actually correlates with its trained twin **better at
+the corner** than at the interior (redundancy +0.59, symmetric +0.73 at corner). The corner-OOD
+artifact was a symptom of the poor value function, not a property of the probe.
 
-| `critical_missing` leg | 1F | 4BR | 5B* | 6BL* | 7L* | 8FL |
-|---|---|---|---|---|---|---|
-| corner `p∈{0,1}` | +0.7 | +4.3 | +9.7 | +22.0 | +14.6 | +3.6 |
-| interior 0.75/0.25 | +2.9 | +7.9 | **−3.4** | +12.0 | **+1.4** | **+9.2** |
-
-(\* = currently-on leg.) **Read all curated gradients at interior `p`, not the corners.** Even at
-interior `p` the recovery is partial: the *cluster-adjacent* front-left (8FL +9.2) and the *balancing*
-back-right (4BR +7.9) become strongly positive, but the *isolated* pure-front leg (1F +2.9) stays weak —
-its payoff is contingent on co-adding partners, which a first-order signal can't see. The Grounding
-section shows this is real, not an artifact: in sparse bodies the gradient's magnitude doesn't track
-which leg actually helps.
-
-**(b) Held-out shapes agree with trained twins.** At interior `p`, the mirror twin (`redundancy`:
-lone leg 2FR held +16.4 vs twin +18.2) and rotation twin (`symmetric`: 1F held +13.4 vs twin +12.4)
-≈ coincide after remapping — topology-specific generalization holds. `critical_missing` is the
-noisiest comparison only because it's a near-dead body (reward ~30 vs `symmetric` ~2200).
+**(b) But per-leg twin agreement is only moderate, and noisy.** Aligned held-vs-twin per-leg
+correlations are middling on the walkable pairs (+0.59 / +0.73 at corner; weaker and even negative at
+interior) and meaningless on `critical_missing` — that body barely moves (reward ~25 vs symmetric
+~3200), so its gradient is noise (corr −0.55/−0.88). The takeaway is consistent with grounding below:
+the **fine-grained per-leg ordering does not transfer cleanly** even under a good control — the
+gradient is a reliable *sign/direction* signal, not a reliable per-leg *ranking*.
 
 ### Step 3 — the signal interpolates; adding a leg cleanly shrinks the rest
 
 **(a) Held-out 5-leg interpolation.** The held-out 5-leg `∂V/∂p`-vs-`p` curve coincides with the
-in-distribution Step-1 curve in sign and shape (slightly *higher* at low `p`):
+in-distribution Step-1 curve in sign and shape (slightly *higher*, as 5 legs sit between lean and
+full):
 
 | p-bin | low | mid | high |
 |---|---|---|---|
-| Step 1 (in-dist) | +2.7 | +6.9 | +6.2 |
-| Step 3 (held-out 5-leg) | +4.0 | +6.9 | +6.7 |
+| Step 1 (in-dist, pooled) | +10.2 | +8.6 | +3.3 |
+| Step 3 (held-out 5-leg) | +12.3 | +10.4 | +5.6 |
 
-→ **The codesign signal survives off the training set.**
+→ **The codesign signal survives off the training set**, with the same diminishing-returns shape.
 
 **(b) Per-limb add/remove** (mean `∂V/∂p` over present limbs, 3 held-out 5-leg bases):
 
 | base | base | +1 leg | −1 leg |
 |---|---|---|---|
-| {3,4,5,6,8} | +9.65 | **+7.71** | +7.44 |
-| {1,3,4,6,8} | +8.53 | **+6.47** | +9.05 |
-| {3,4,5,7,8} | +10.05 | **+8.64** | +9.41 |
+| {3,4,5,6,8} | +7.95 | **+6.07** | +6.10 |
+| {1,3,4,6,8} | +7.47 | **+6.10** | +7.21 |
+| {3,4,5,7,8} | +8.01 | **+7.61** | +6.44 |
 
 **Adding a leg consistently lowers every remaining limb's marginal value** (all 3 bases) — clean
-per-body diminishing returns, consistent with the fullness-split. **Removing is mixed/noisier**
-(1 down, 2 up): no clean symmetric story.
+per-body diminishing returns, consistent with the fullness split. **Removing is mixed** (no clean
+symmetric "removal raises the rest" story — magnitudes drift without consistent direction), echoing the
+per-leg ranking noise from Step 2.
 
-### Grounding — great sign, poor magnitude, and only useful once the body walks
+### Grounding — value rank-calibrated, magnitude still unreliable
 
 Steps 1–3 judged the gradient against *intuition*; this grounds it against *realized return*. For 16
 in-distribution base bodies (4 each at 3/4/6/7 legs), we build each base plus its 8 single-leg
 **toggles** (flip each leg on↔off) at interior `p`, and measure realized return `R`, value `V`, and
 per-leg `∂V/∂p` (seed-avg over s42/43/44). Two tests:
 
-- **Value calibration — strong (in rank).** `V` vs `R` over all 144 bodies: **Pearson +0.93,
-  Spearman +0.93**. The critic orders bodies good→bad correctly. (Absolute `V` is *compressed* —
-  range ~24–89 vs realized 24–5187 — because it predicts *discounted* return-to-go; calibration is in
+- **Value calibration — strong (in rank).** `V` vs `R` over all 144 bodies: **Pearson +0.89,
+  Spearman +0.87**. The critic orders bodies good→bad correctly. (Absolute `V` is still *compressed* —
+  ~[105,136] vs realized 1252–6675 — because it predicts *discounted* return-to-go; calibration is in
   rank, not scale.)
-- **Gradient grounding — right sign, wrong magnitude.** `∂V/∂p_L` vs the realized marginal value
-  `ΔR_L = R(with L) − R(without L)`: **sign-agreement 0.99** (the gradient nearly always knows a leg
-  is worth adding/keeping — and nearly every leg has positive realized value), but **Pearson only
-  +0.17** — magnitude barely predicts *which* leg helps. The gradient is squashed into +2.7…+15 while
-  realized leg values span −330…+2800 (~10×).
+- **Gradient grounding — right sign, unreliable magnitude.** `∂V/∂p_L` vs the realized marginal value
+  `ΔR_L = R(with L) − R(without L)`: **sign-agreement 1.00** (every leg has positive realized value and
+  the gradient is positive — so sign-agreement is real but partly trivial), but **Pearson −0.08** —
+  magnitude does not predict *which* leg helps.
 
-The decisive cut is **by body fullness**:
+The by-fullness cut **inverts relative to the previous experiment**:
 
 | base leg-count | 3 | 4 | 6 | 7 |
 |---|---|---|---|---|
-| Pearson(`∂V/∂p`, `ΔR`) | −0.01 | −0.05 | **+0.37** | **+0.35** |
+| Pearson(`∂V/∂p`, `ΔR`) — this | **+0.35** | −0.09 | −0.20 | +0.03 |
+| Pearson — *prev (poor control)* | *−0.01* | *−0.05* | *+0.37* | *+0.35* |
 
-**The magnitude is informative only in bodies that already walk.** In sparse/broken bodies (3–4 legs)
-it carries *no* information about which leg matters — exactly the `critical_missing` regime. Adding is
-somewhat predictable (r≈+0.30); removing is not (ρ≈+0.03). This is the contingency limitation made
-concrete: from a bad body a generator gets a reliable "add legs" *direction* but no reliable guidance
-on *which* — see the diagnosis below for why.
+The poor control got magnitude right only in *functional* bodies; the good control gets it (weakly)
+right only in *sparse* bodies, and adds-side is the only consistent winner (add r=+0.45, remove
+ρ=−0.17). Either way, **magnitude is not a dependable "which leg" signal** — but for a very different
+reason, next.
 
-### Why the magnitude fails on poor morphs — a value-learning failure, not a calculus artifact
+### Why magnitude still fails — but differently than before
 
-Two candidate causes for the sparse-body failure: **(A)** the gradient is a *local slope* that can't
-see the discrete "tips it over the locomotion threshold" jump adding a leg causes, or **(B)** the
-value function never learned which leg matters in the un-walkable region. Three checks (all on the
-ablation data) say **(B), decisively**:
+The previous experiment's diagnosis was a **value-learning failure at the floor**: in un-walkable
+bodies the critic's value `V` had never learned which leg mattered, and the proof was that the critic's
+*own finite-difference* `ΔV = V(with leg) − V(without leg)` failed *identically* to the gradient there
+(both ≈ 0 in sparse bodies, both recovering only at 6–7 legs). You can't differentiate your way to
+information `V` never contained.
 
-- **Not a calculus artifact.** Compare the gradient to the critic's *own finite-difference*
-  `ΔV = V(with leg) − V(without leg)` — which actually crosses the toggle, no derivative. It fails
-  *identically*: 3-leg grad −0.01 / `ΔV` +0.06; 4-leg both ≈ −0.05; both recover only at 6–7 legs.
-  If (A) were the cause, `ΔV` would beat the gradient. It doesn't → `V` itself doesn't encode the
-  per-leg structure; the gradient faithfully reports a `V` that's wrong there.
-- **Not noise.** The sparse-body per-leg signal is large and seed-reproducible (gradient SNR ≈ 1.9,
-  *higher* than full bodies' 0.8). `V` confidently assigns a per-leg ranking that just doesn't match
-  reality — wrong, not random.
-- **`V` starves the floor.** It compresses all 3-leg bodies into `V ∈ [35,39]` (realized returns in
-  the hundreds), allocating almost no output range to the un-walkable region.
+**Under the good control, that diagnosis no longer holds.** Comparing the analytic gradient to the
+critic's own finite-difference, by leg-count:
 
-**Mechanism.** Below quorum a body can't walk *regardless of which legs it has*, so the training
-return signal carries ~no information about per-leg importance there (every bad body returns ~floor).
-`V` can't learn structure it never saw — it interpolates from functional bodies, getting the sign
-right but the magnitudes arbitrary. Compounded by **credit assignment** (a broken body never *uses* a
-leg on-policy) and **complementarity** (the true per-leg value depends on *absent* legs — not a
-function of the current body at all). You can't differentiate your way to information the value
-function never contained. The implication: the fix is **data/representation in the floor region**
-(curriculum, oversampling near-threshold bodies, informative shaping below quorum) — *not* value
-normalization (calibration rank is already fine) — or accept the gradient as a **sign-only** proposer.
+| legs | gradient `∂V/∂p` | finite-diff `ΔV` |
+|---|---|---|
+| 3 | +0.35 | +0.47 |
+| 4 | −0.08 | −0.08 |
+| 6 | **−0.20** | **+0.20** |
+| 7 | **+0.03** | **+0.42** |
+
+On **functional bodies (6–7 legs) the critic's `ΔV` is clearly positive** (+0.20, +0.42) — i.e. `V`
+*does* now encode which leg matters — **yet the analytic gradient diverges from it** (−0.20, +0.03).
+The good value function learned the per-leg structure (finite-diff recovers it), but its **local slope
+in `p` no longer points the same way as a discrete leg toggle**. So the failure mode moved from "the
+value function is blind" (poor control) to "the value function knows, but the *gradient* doesn't read
+it out" (good control) — a gradient-vs-finite-difference divergence, plausibly because under the
+deterministic build `∂V/∂p` is a sensitivity to the *obs signal* with the body held fixed, whereas a
+real leg toggle changes the body. Practically: **on functional bodies, prefer the critic's
+finite-difference `ΔV` over the analytic gradient for magnitude; use the gradient for sign/direction.**
 
 ### Phase 2 — the soft generator preserves the sign
 
 A small transformer is pretrained (MSE 0.0005) to regress each leg's `p` from a **scattered** token
-encoding (forcing attention to gather it), frozen, and composed in front of `V`; gradients backprop
-to its input.
+encoding (forcing attention to gather it), frozen, and composed in front of `V`; gradients backprop to
+its input.
 
 | metric | value | meaning |
 |---|---|---|
-| **sign alignment** | **0.938** | input-grad sign matches the direct `∂V/∂p` — the headline |
-| magnitude corr | +0.554 | sign survives strongly; magnitude only moderately |
-| chain norms (out→in) | 1935 → 415 → 5540 → 3342 | **no collapse** (ends above where it starts) |
+| **sign alignment** | **0.953** | input-grad sign matches the direct `∂V/∂p` — the headline |
+| magnitude corr | +0.586 | sign survives strongly; magnitude only moderately |
+| chain norms (out→in) | 998 → 248 → 2641 → 1622 | **no collapse** (ends above where it starts) |
 
-**The conditioning check passes.** This is the direct contrast with the binary generator, whose
-saturated sigmoid collapsed the gradient — the continuous-`p` recast removes that bottleneck by
-construction. Sign (what ascent consumes) survives at 0.94; magnitude survives only moderately, as
-expected.
+**The conditioning check passes**, as in version 2 — the continuous-`p` recast removes the binary
+version's saturated-sigmoid collapse by construction, and the good control doesn't change that. Sign
+(what ascent consumes) survives at 0.95; magnitude survives only moderately, as expected.
+
+## Contrast: poor vs good control
+
+The same probes, run on a value function learned over degraded/unobservable bodies (previous,
+stochastic-build) vs clean/observable ones (this, deterministic-build):
+
+| aspect | **poor control** (stochastic build) | **good control** (deterministic build) |
+|---|---|---|
+| what the critic values | `Bernoulli(p)` body, policy blind to it | clean center `S`, fully observed |
+| per-body policy (seed-avg return) | 2545 | **3992** |
+| Step 1 `∂V/∂p` vs `p` | **inverted** — weakest at low `p` (+2.7) | **correct** — largest at low `p` (+10.2) |
+| `p=0/1` corners | OOD, flip the ordering | well-behaved (agree with twins) |
+| value rank-calibration (Spearman V,R) | +0.93 | +0.87 |
+| magnitude grounding (where it works) | functional bodies only (6–7: +0.35) | sparse bodies only (3: +0.35); add-side +0.45 |
+| value at the floor | doesn't encode per-leg (`ΔV` fails w/ grad) | **does** encode it (`ΔV` +0.2/+0.4 on functional) |
+| residual magnitude failure | value-learning gap at the floor | gradient ≠ finite-diff on functional bodies |
+| sign (grounding / Phase 2) | 0.99 / 0.94 | 1.00 / 0.95 |
+
+**The meta-finding:** the value gradient is only as good as the control policy/value function behind
+it. A poorly-trained critic produces a *misleading* codesign signal (inverted shape, fake OOD corners,
+floor blindness); a well-trained one produces the **right sign and shape** and a rank-calibrated value
+— but a usable per-leg *magnitude* requires more than control quality alone.
 
 ## What we learned
 
-- **The value gradient is a usable codesign signal on sign.** Positive almost everywhere (no
-  myopia), interpolates to held-out bodies, survives a generator network (sign-align 0.94), and agrees
-  with *realized* leg value 99% of the time on sign. The directional premise holds.
-- **Magnitude is the soft spot — and grounding shows it's worse than "soft".** The gradient is
-  *weakest at low `p`*, only *moderately* magnitude-correlated through the generator (corr 0.55), and
-  against realized return its magnitude correlation is just **+0.17** — and **zero in sparse bodies**
-  (3–4 legs), rising to ~+0.35 only once the body walks. So ascent gets a trustworthy "add legs"
-  direction but, from a bad body, can't tell *which* leg matters — the contingency/quorum limitation.
-- **Value is well-calibrated in rank but blind to per-leg structure at the floor.** `V` orders bodies
-  well (Spearman +0.93) yet doesn't encode *which* leg matters in un-walkable bodies — its own
-  finite-difference fails there just like the gradient, so it's a value-*learning* gap (the floor
-  carries no per-leg training signal), not a derivative artifact or noise. The root of the
-  magnitude-poor gradient.
-- **Evaluate at interior `p`, never the `{0,1}` corners** — corners are OOD and flip/distort the
-  expected importance ordering (Step 2).
-- **Trust the rollout-averaged `ḡ`, not the static `g0`** — the reset-pose prior is a 4×-inflated,
+- **The value gradient is a usable codesign signal on sign and shape — given a good control.** Positive
+  almost everywhere (no myopia), correct diminishing-returns curve (largest at low `p`), interpolates
+  to held-out bodies, and survives a generator network (sign-align 0.95). The directional premise
+  holds, and holds *better* than under the poor control.
+- **Control quality gates the signal.** Every qualitative failure of the previous experiment (inverted
+  low-`p` shape, OOD corners, floor value-blindness) was an artifact of valuing degraded/unobservable
+  bodies, and disappears under a policy that controls clean morphs. Diagnose the control before
+  trusting the gradient.
+- **Magnitude is still not a reliable "which leg" signal**, and now for a subtler reason: on functional
+  bodies the good `V` *does* encode per-leg structure (its finite-difference recovers it, +0.2/+0.4),
+  but the analytic `∂V/∂p` diverges from that finite-difference. Use the gradient for sign; use `ΔV`
+  (or realized-return ablation) for magnitude.
+- **Value is well-calibrated in rank** (Spearman +0.87) but scale-compressed (predicts discounted
+  return-to-go), so read it as an ordering, not a return estimate.
+- **Trust the rollout-averaged `ḡ`, not the static `g0`** — the reset-pose prior is a ~1.9×-inflated,
   weakly-correlated proxy.
-- **Diminishing returns is real but conditional** — it appears in full bodies and on the add-side of
-  Step 3, not in the pooled low-`p` curve.
 
 ## Caveats
 
 - **All-mask-active ≠ production controller.** The deployed mask-based net gives masked tokens zero
-  gradient, so this mechanism can't be read off it directly; productionizing presence-gradients
-  needs the real controller retrained all-active. *Headline caveat.*
-- **Mild extrapolation only.** Steps 2/3 test held-out *topologies* and *leg count*; far-novel
-  bodies, where `V` may be garbage, remain untested.
-- **`critical_missing` twin is noisy** because the body barely moves (reward ~30) — its twin
-  agreement is the weakest of the three and should not be over-read.
-- **Grounding bodies are in-distribution.** The grounding test uses stable, non-held-out bases at the
-  interior operating point, so its correlations are a *best case*; the gradient's magnitude on
-  far-novel bodies is likely worse, not better.
-- **Stochastic build → noisy PPO targets.** A fixed `p` builds a different Bernoulli body each draw;
-  `V` learns the expectation but training sees higher-variance returns than the old deterministic
-  regime.
+  gradient, so this mechanism can't be read off it directly; productionizing presence-gradients needs
+  the real controller retrained all-active. *Headline caveat.*
+- **`p` is obs/value-only now.** `V(p)` is the value of the *center implied by* `p` with the body held
+  fixed — not `E_Bernoulli[return]`. This is why `∂V/∂p` (obs-signal sensitivity) can diverge from a
+  real leg toggle (`ΔV`) on functional bodies.
+- **Per-leg ranking is noisy** even under the good control (Step 2 twin agreement, Step 3 removal,
+  grounding magnitude) — the gradient is a direction, not a ranking.
+- **`critical_missing` is a near-dead body** (reward ~25); its twin comparison is noise and should not
+  be over-read.
+- **Grounding bodies are in-distribution.** Stable, non-held-out bases at the interior operating point,
+  so the correlations are a *best case*; magnitude on far-novel bodies is likely worse, not better.
 
 ## Next
 
-The capstone the premise actually demands: a **gradient-ascent test** — freeze `V`, ascend the raw
-`p` vector (and through the generator), and check it converges to known-good morphologies. Grounding
-predicts it gets the *direction* right (add legs) but bootstraps slowly and may stall on *which* leg
-from a sparse start. Two leads worth chasing first: (1) **feed the floor region information** — the
-diagnosis shows `V` is blind to per-leg structure where bodies can't walk because the return signal
-there is flat (curriculum / oversample near-threshold bodies / shaping that's informative below
-quorum), then re-check grounding; (2) accept the gradient as a *sign-only* proposer and let
-realized-return ablation resolve magnitude. Beyond presence: continuous **segment-length**
-(`∂V/∂length`) and **leg-angle** (`∂V/∂θ`) gradients.
+The capstone the premise actually demands: a **gradient-ascent test** — freeze `V`, ascend the raw `p`
+vector (and through the generator), and check it converges to known-good morphologies. With the good
+control, Step 1 predicts ascent now bootstraps *fast* (the signal is largest at low `p`) and gets the
+direction right; grounding predicts it may still mis-rank *which* leg from a given body. Two leads: (1)
+for magnitude, **use the critic's finite-difference `ΔV` rather than the analytic gradient** on
+functional bodies (it recovers per-leg structure the gradient misses), and probe why the two diverge;
+(2) accept the gradient as a *sign/shape* proposer and let realized-return ablation resolve magnitude.
+Beyond presence: continuous **segment-length** (`∂V/∂length`) and **leg-angle** (`∂V/∂θ`) gradients.
