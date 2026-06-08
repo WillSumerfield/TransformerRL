@@ -2,27 +2,30 @@
 
 All 8 legs are always physically present and DOF-mask-active. A leg's presence is carried by a
 continuous **presence probability** `p ∈ [0,1]`, fed to the policy in BOTH the leg's hip and ankle
-length obs slots. The physical body is built by **Bernoulli-sampling** `p` per leg: an ON sample
-builds at 1x default, an OFF sample at a small `off_scale` (0.05x) so vsim stays non-degenerate (a 0x
-link is massless and won't finalize). The OBSERVATION reports `p` (NOT the sampled 0/1 and NOT the
-build length), so `V(p) ≈ E_{Bernoulli(p)}[return]` and `∂V/∂p` is a smooth, in-distribution codesign
-signal. Hip and ankle of a leg share the same `p`.
+length obs slots. The physical body is built **deterministically from the stable bias center S** (the
+morph the p's were sampled around): on-legs at 1x default, off-legs at a small `off_scale` (0.05x) so
+vsim stays non-degenerate (a 0x link is massless and won't finalize). `p` is an OBS/VALUE-ONLY signal
+(NOT the build geometry): obs reports the continuous `p`, so `V(p)` learns the value of the center
+implied by `p` and `∂V/∂p` is a smooth, in-distribution codesign signal. The policy always controls a
+real stable morph. Hip and ankle of a leg share the same `p`.
 
 Sampling (training / Step 1): pick a valid bias center `S` from the pick-pool, then draw each leg's
 `p` independently — `p = √U` for on-legs (`∈ S`), `p = 1 − √U` for off-legs (`U ~ Uniform(0,1)`). The
-equal mixture of √U and 1−√U is marginally Uniform(0,1), so the [0,1] knob is covered uniformly.
-Bodies are Bernoulli-sampled from `p`; a **guard** rejects any sampled body in the held-out set and
-**redraws `p`** (same `S`) until the body is admissible. Held-out = all 5-leg topologies + 3 curated
-Step-2 sets; these are also stripped from the default pick-pool so a bias center is never held-out.
+equal mixture of √U and 1−√U is marginally Uniform(0,1), so the [0,1] knob is covered uniformly. The
+**body is always S** (no Bernoulli resampling) — the policy controls a clean stable morph and `p` only
+perturbs the obs. Held-out = all 5-leg topologies + 3 curated Step-2 sets; these are stripped from the
+default pick-pool so a center (hence a trained body) is never held-out — no guard needed.
 
-Pick-pool: stable bodies (>=3 legs, gap<=135 deg) most of the time, with an `unstable_fraction` tail
-of marginal/unstable topologies (down to 2 legs, or gap>135) so the critic sees bad bodies too.
+Pick-pool: stable bodies (>=3 legs, gap<=135 deg). An optional `unstable_fraction` tail draws marginal
+topologies (down to 2 legs, or gap>135) as bias centers; default 0.0 (off) — the 0.25 tail degraded
+policy training. Machinery is kept; set `unstable_fraction>0` to re-enable. (Note: even tail-off, the
+√U sampling around stable centers still produces some sparse sampled bodies.)
 
 Eval modes:
   - `on_sets=...`     : deterministic curated bodies (Step 2). `p ∈ {0,1}` exactly = each on-set; no
                         sampling, no guard. obs slots hold 1.0 (on) / 0.0 (off).
-  - `pick_pool=..., guard=False` : fixed bias-center set with √U sampling and guard off (Step 3:
-                        5-leg interpolation, builds held-out 5-leg bodies on purpose).
+  - `pick_pool=...`   : fixed bias-center set; body = center, obs = √U cloud around it (Step 3:
+                        5-leg interpolation, builds held-out 5-leg bodies on purpose). `guard` is moot.
 
 See docs/value_gradient_propagation.md. NOT for production training.
 """
@@ -57,8 +60,9 @@ HELDOUT = set(_all_topologies(5, 5)) | set(CURATED_HELDOUT)
 
 
 class AntBinaryLegEnv(AntMultiMorphEnv):
-    """All-8-leg ant where presence is a continuous probability `p`, body Bernoulli-sampled. See
-    module docstring."""
+    """All-8-leg ant where presence is a continuous signal `p` fed to obs/value only; the body is
+    built deterministically from the stable bias center S (no Bernoulli resampling). See module
+    docstring."""
 
     def __init__(
         self,
@@ -66,7 +70,7 @@ class AntBinaryLegEnv(AntMultiMorphEnv):
         device,
         *,
         off_scale: float = 0.05,
-        unstable_fraction: float = 0.25,
+        unstable_fraction: float = 0.0,
         min_on_stable: int = 3,
         min_on_unstable: int = 2,
         max_on: int = 8,
@@ -137,22 +141,19 @@ class AntBinaryLegEnv(AntMultiMorphEnv):
         return np.where(center_mask, root, 1.0 - root)
 
     def _draw_morphs(self, num: int) -> list:
+        # Body = the clean stable bias center S (NO Bernoulli resampling). p is an obs/value-only
+        # continuous presence signal drawn around S (√U on / 1−√U off): obs reports p, so V(p) learns
+        # the value of the center implied by p and ∂V/∂p its marginal sensitivity. The policy always
+        # controls a real stable morph. Centers already exclude the held-out set (see _pick_center),
+        # so no guard is needed.
         centers = [self._pick_center() for _ in range(num)]
         center_mask = np.zeros((num, _N_LEGS), dtype=bool)
         for e, s in enumerate(centers):
             for n in s:
                 center_mask[e, n - 1] = True
 
-        p = self._draw_p(center_mask)
-        on = self._np_rng.random((num, _N_LEGS)) < p
-        if self._guard:                                  # redraw p (same S) until body is admissible
-            for e in range(num):
-                while frozenset(i + 1 for i in range(_N_LEGS) if on[e, i]) in self._held_out:
-                    p[e] = self._draw_p(center_mask[e])
-                    on[e] = self._np_rng.random(_N_LEGS) < p[e]
-
-        self._p = p.astype(np.float32)
-        self._on_sets = [frozenset(i + 1 for i in range(_N_LEGS) if on[e, i]) for e in range(num)]
+        self._p = self._draw_p(center_mask).astype(np.float32)   # obs/value-only presence signal
+        self._on_sets = [frozenset(s) for s in centers]          # body built exactly = center
         return [self._binary_morph(s) for s in self._on_sets]
 
     def allocate_buffers(self):
