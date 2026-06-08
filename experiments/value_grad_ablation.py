@@ -39,7 +39,7 @@ B_PER_COUNT  = 4
 ENVS_PER     = 128
 SEL_SEED     = 7              # fixed -> same bases across trained seeds
 EVAL_SEED    = 123
-SEEDS        = ["s42", "s43", "s44"]
+SEEDS        = ["s42_nobern", "s43_nobern", "s44_nobern"]
 
 if len(sys.argv) > 1 and sys.argv[1] == "smoke":
     COUNTS, B_PER_COUNT, ENVS_PER, SEEDS = (3, 4), 1, 16, ["s42"]   # fast path for a wiring check

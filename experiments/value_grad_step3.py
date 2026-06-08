@@ -26,13 +26,13 @@ import yaml
 import experiments.value_grad_prop as vg
 from envs.ant_envs.ant_binary_leg import AntBinaryLegEnv, _all_topologies, _N_LEGS
 
-RUN        = "s42"
+RUN        = "s42_nobern"
 SEED       = 124          # eval seed (distinct from Step 1's 123)
 N_PATTERNS = 1024
 
 # --- addrm mode (python value_grad_step3.py addrm): per-limb dV/dp on 3 held-out 5-leg bases, each
 # vs a +1 (random added leg -> 6) and a -1 (random removed leg -> 4) variant, at interior obs-p. ---
-SEEDS      = ["s42", "s43", "s44"]
+SEEDS      = ["s42_nobern", "s43_nobern", "s44_nobern"]
 ENVS_PER   = 256
 ON_P, OFF_P = 0.75, 0.25  # interior obs-p (in-distribution); bodies still built exactly
 SEL_SEED   = 0            # fixed -> same 3 bases + added/removed legs across all trained seeds

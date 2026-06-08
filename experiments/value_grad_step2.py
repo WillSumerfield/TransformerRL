@@ -45,7 +45,7 @@ PAIRS = [
 ]
 TRANSFORMS = [MIRROR, MIRROR, ROT1]
 ENVS_PER  = 256
-SEEDS     = ["s42", "s43", "s44"]
+SEEDS     = ["s42_nobern", "s43_nobern", "s44_nobern"]
 EVAL_SEED = 123
 
 

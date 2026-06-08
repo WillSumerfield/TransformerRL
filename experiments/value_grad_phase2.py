@@ -37,7 +37,7 @@ import yaml
 import experiments.value_grad_prop as vg
 from envs.ant_envs.ant_binary_leg import AntBinaryLegEnv
 
-RUN            = "s43"      # value-net seed to compose against (override with argv[1])
+RUN            = "s43_nobern"  # value-net seed to compose against (override with argv[1])
 N_PATTERNS     = 512        # reference states to align over
 GEN_LAYERS     = 1
 GEN_D          = 32

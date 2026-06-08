@@ -46,7 +46,7 @@ _N_ACT     = 16
 _N_LEGS    = 8
 
 # --- template constants: run name selects the checkpoint; override with argv[1] (e.g. s43) ------
-RUN        = "s42"        # run dir under runs/ant_binary/binary_transformer/<RUN>/
+RUN        = "s42_nobern" # run dir under runs/ant_binary/binary_transformer/<RUN>/
 CONFIG     = _ROOT / "configs/ppo_ant_binary.yaml"
 SEED       = 123          # eval seed (distinct from training seed); draws the on/off population
 N_PATTERNS = 1024         # distinct on/off patterns (one env each, epm=1)
