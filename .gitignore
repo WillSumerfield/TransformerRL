@@ -9,6 +9,7 @@ TurboActivate.dat
 envs/ant_envs/assets/generated/
 imgui.ini
 .vscode/
+temp/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
