@@ -37,3 +37,19 @@ The attention-level masking of inactive legs: their token embeddings are zeroed 
 
 **Masked-norm model**:
 The rl_games model wrapper that runs the stock input normalizer but restores the raw `{0,1}` DOF mask afterward, so normalization can't collapse the constant mask. Registered as `transformer_masked_a2c_logstd`. (See `docs/adaptive_ant_fixes.md` for why.)
+
+## Generation (morphology generator)
+
+The control-side realization of the planned generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **classic policy-gradient (PPG)** on the same reward the controller earns. Architecture/wiring details (PPG phases, training schedule, sampling cadence) live in `docs/morphology_generator.md`, not here.
+
+**Morphology generator** (generator):
+A **state-conditioned policy** that reads the observation and emits the ant's designed morphology as per-leg **attribute** actions, trained by **classic PPG** (policy-gradient, not value-ascent) on the **control reward** — a body is good if the controller earns high return on it. A separate instance of the **leg transformer** (same architecture, fully separate weights) with a **morphology policy head** plus a PPG **auxiliary value head**. Acts **once per resample window** (a body→body transition policy conditioned on the window-start state); its body never enters the control's per-step action stream — it is applied to the env at resample. Emits morphology, not per-DOF actions.
+_Avoid_: conflating with the control **actor** (emits per-DOF actions) or with the **critic** (the disjoint value net whose advantages it uses).
+
+**Full token / Attribute token / Designed token** (nested views of a part-token):
+- **Full token** — every feature the control policy consumes: physical state (pos, vel, sensors, last action) + leg encoding + morphology lengths. What the **leg transformer** reads.
+- **Attribute token** — the morphology-defining subset only: **presence**, hip/ankle segment **length**, leg **angle**. The body properties that *could* be designed; excludes physical state. `Attribute ⊆ Full`.
+- **Designed token** — the attributes a given codesign run actually generates and optimizes. The v1 ant designs **presence only**; segment lengths and angle stay fixed (deferred), so `Designed ⊊ Attribute` for v1. The framework permits any subset. `Designed ⊆ Attribute ⊆ Full`.
+
+**Presence** (p):
+A leg's existence, emitted by the generator as a per-leg **Bernoulli action** (presence logits → sampled `{0,1}` body). The sampled body is **built** for the resample window and its **discrete** presence is fed into obs (no continuous/differentiable signal — the value-ascent design that needed continuous `p` is retired). The generator's policy-gradient log-prob is the sum of per-leg Bernoulli log-probs.
