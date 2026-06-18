@@ -32,7 +32,8 @@ class LegTransformerBuilder(NetworkBuilder):
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
-            mu, value = self.net(obs)
+            out = self.net(obs)
+            mu, value = out['mu'], out['value']
             if obs.shape[-1] >= OBS_DIM + MASK_DIM:
                 mask_dof = (obs[..., OBS_DIM : OBS_DIM + MASK_DIM] > 0).float()
                 # Inactive dims -> log_std 0 (sigma=1). The env masks inactive actions anyway,
@@ -70,7 +71,8 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
-            mu, value = self.net(obs)
+            out = self.net(obs)
+            mu, value = out['mu'], out['value']
             if obs.shape[-1] >= _DYN_MASK_OFF + DYN_MASK_DIM:
                 mask_dof = (obs[..., _DYN_MASK_OFF : _DYN_MASK_OFF + DYN_MASK_DIM] > 0).float()
                 # Inactive dims -> log_std 0 (sigma=1). The env masks inactive actions anyway,

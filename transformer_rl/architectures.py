@@ -1,4 +1,5 @@
-"""Transformer architectures for ant envs. Each returns (mu, value)."""
+"""Transformer architectures for ant envs. forward returns a dict with keys
+'mu'/'value' for whichever heads the net was built with (policy_head/value_head)."""
 import torch
 import torch.nn as nn
 
@@ -23,10 +24,14 @@ class LegTransformer(nn.Module):
         torso_dim: int = TORSO_DIM,
         hip_dim: int = HIP_DIM,
         ankle_dim: int = ANKLE_DIM,
+        policy_head: bool = True,
+        value_head: bool = True,
     ):
         super().__init__()
         self.n_tokens = 1 + 2 * n_legs
         self.tokenize_fn = _TOKENIZE[n_legs]
+        self.has_policy_head = policy_head
+        self.has_value_head = value_head
 
         self.embed_torso = nn.Linear(torso_dim, d_model)
         self.embed_hip   = nn.Linear(hip_dim,   d_model)
@@ -48,10 +53,12 @@ class LegTransformer(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
                                              enable_nested_tensor=False)
 
-        self.joint_head = nn.Linear(d_model, 1)
-        nn.init.zeros_(self.joint_head.weight)
-        nn.init.zeros_(self.joint_head.bias)
-        self.value_head = nn.Linear(d_model, 1)
+        if policy_head:
+            self.joint_head = nn.Linear(d_model, 1)
+            nn.init.zeros_(self.joint_head.weight)
+            nn.init.zeros_(self.joint_head.bias)
+        if value_head:
+            self.value_head = nn.Linear(d_model, 1)
         self._xavier_init()
 
     def _xavier_init(self) -> None:
@@ -63,7 +70,7 @@ class LegTransformer(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(p)
 
-    def forward(self, obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, obs: torch.Tensor, compute_value: bool = True) -> dict[str, torch.Tensor]:
         torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
         B = obs.shape[0]
 
@@ -89,13 +96,15 @@ class LegTransformer(nn.Module):
         x = self.encoder(x, src_key_padding_mask=pad_mask)
         x = x * token_mask  # zero inactive outputs (cuts gradient through transformer)
 
-        joints = x[:, 1:, :]
-        a_nat  = torch.tanh(self.joint_head(joints).squeeze(-1))
-        a_nat  = a_nat * active_mask
-        mu     = a_nat.index_select(-1, self.nat_to_dof)
-
-        value = self.value_head(x[:, 0, :])
-        return mu, value
+        out: dict[str, torch.Tensor] = {}
+        if self.has_policy_head:
+            joints = x[:, 1:, :]
+            a_nat  = torch.tanh(self.joint_head(joints).squeeze(-1))
+            a_nat  = a_nat * active_mask
+            out['mu'] = a_nat.index_select(-1, self.nat_to_dof)
+        if compute_value and self.has_value_head:
+            out['value'] = self.value_head(x[:, 0, :])
+        return out
 
 
 def MultiMorphLegTransformer(n_layers: int = 3, **kwargs) -> LegTransformer:
