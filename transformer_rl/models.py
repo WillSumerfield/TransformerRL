@@ -14,6 +14,14 @@ _DYN_MASK_OFF = DYN_OBS_DIM + DYN_LEN_DIM   # mask follows the length block: obs
 _DYN_OBS_TOTAL = DYN_OBS_DIM + DYN_LEN_DIM + DYN_MASK_DIM  # 139
 
 
+def _restore_mask_tail(normed, observation, normalize_input):
+    """Re-insert the raw {0,1} DOF mask tail after normalization (see TransformerMaskedNorm)."""
+    if normalize_input:
+        normed = normed.clone()
+        normed[..., -DYN_MASK_DIM:] = observation[..., -DYN_MASK_DIM:]
+    return normed
+
+
 class LegTransformerBuilder(NetworkBuilder):
     """rl_games builder for 4-leg ant (ant / ant_adaptive)."""
 
@@ -71,8 +79,8 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
-            out = self.net(obs)
-            mu, value = out['mu'], out['value']
+            out = self.net(obs, compute_value=obs_dict.get('compute_value', True))
+            mu, value = out['mu'], out.get('value')  # value None when aux head skipped
             if obs.shape[-1] >= _DYN_MASK_OFF + DYN_MASK_DIM:
                 mask_dof = (obs[..., _DYN_MASK_OFF : _DYN_MASK_OFF + DYN_MASK_DIM] > 0).float()
                 # Inactive dims -> log_std 0 (sigma=1). The env masks inactive actions anyway,
@@ -111,8 +119,55 @@ class TransformerMaskedNorm(ModelA2CContinuousLogStd):
             )
 
         def norm_obs(self, observation):
-            normed = super().norm_obs(observation)
-            if self.normalize_input:
-                normed = normed.clone()
-                normed[..., -DYN_MASK_DIM:] = observation[..., -DYN_MASK_DIM:]
-            return normed
+            return _restore_mask_tail(super().norm_obs(observation), observation, self.normalize_input)
+
+
+class MultiMorphValueBuilder(NetworkBuilder):
+    """rl_games builder for the PPG disjoint value net (8-leg, value head only)."""
+
+    def load(self, params):
+        self.params = params
+
+    class Network(NetworkBuilder.BaseNetwork):
+        def __init__(self, params, **kwargs):
+            nn.Module.__init__(self)
+            kwargs.pop('actions_num', None)
+            kwargs.pop('input_shape', None)
+            kwargs.pop('num_seqs', None)
+            tc = params.get('transformer', {})
+            self.net = MultiMorphLegTransformer(policy_head=False, value_head=True, **tc)
+
+        def forward(self, obs_dict):
+            return self.net(obs_dict['obs'])['value']
+
+        def is_rnn(self):
+            return False
+
+    def build(self, name, **kwargs):
+        return MultiMorphValueBuilder.Network(self.params, **kwargs)
+
+
+class TransformerMaskedValue(ModelA2CContinuousLogStd):
+    """Value-only model for the PPG disjoint critic.
+
+    Reuses ModelA2CContinuousLogStd's value_mean_std / denorm_value and the
+    mask-restoring norm_obs, but its network has no policy head, so forward
+    returns only a value (no action distribution / Normal).
+    """
+
+    class Network(ModelA2CContinuousLogStd.Network):
+        def __init__(self, a2c_network, **kwargs):
+            super().__init__(a2c_network, **kwargs)
+            obs_total = self.obs_shape[0] if isinstance(self.obs_shape, (tuple, list)) else self.obs_shape
+            assert obs_total == _DYN_OBS_TOTAL, (
+                f"transformer_masked_value expects obs of {_DYN_OBS_TOTAL}, got {obs_total}"
+            )
+
+        def norm_obs(self, observation):
+            return _restore_mask_tail(super().norm_obs(observation), observation, self.normalize_input)
+
+        def forward(self, input_dict):
+            is_train = input_dict.get('is_train', True)
+            input_dict['obs'] = self.norm_obs(input_dict['obs'])
+            value = self.a2c_network(input_dict)
+            return {'values': value if is_train else self.denorm_value(value)}

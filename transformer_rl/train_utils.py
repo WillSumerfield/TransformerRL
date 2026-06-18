@@ -927,8 +927,11 @@ def run_training(
             mb_module.register_network(net_name, net_builder)
 
     # Mask-passthrough normalizer variant (used by configs via model.name; harmless otherwise).
-    from .models import TransformerMaskedNorm
+    from .models import TransformerMaskedNorm, MultiMorphValueBuilder, TransformerMaskedValue
     mb_module.register_model('transformer_masked_a2c_logstd', TransformerMaskedNorm)
+    # PPG disjoint value net + value-only model (built by PPGAgent; harmless otherwise).
+    mb_module.register_network('multimorph_leg_value', MultiMorphValueBuilder)
+    mb_module.register_model('transformer_masked_value', TransformerMaskedValue)
 
     # --- Run ---
     runner = Runner()
