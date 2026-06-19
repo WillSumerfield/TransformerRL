@@ -124,6 +124,26 @@ class PPGAgent(LoggingA2CAgent):
         super().set_train()
         self.value_model.train()
 
+    def train(self):
+        # compile value_model after restore (torch_runner only compiles self.model)
+        cc = self.config.get('torch_compile', True)
+        if cc is not False and not getattr(self, '_value_compiled', False):
+            mode = cc if isinstance(cc, str) else (cc.get('mode', 'default') if isinstance(cc, dict) else 'default')
+            self.value_model = torch.compile(self.value_model, mode=mode)
+            self._value_compiled = True
+        return super().train()
+
+    def get_full_state_weights(self):
+        state = super().get_full_state_weights()  # policy model (+ its normalizers) + policy opt + scaler
+        state['value_model'] = self.value_model.state_dict()
+        state['value_optimizer'] = self.value_optimizer.state_dict()
+        return state
+
+    def set_full_state_weights(self, weights, set_epoch=True):
+        super().set_full_state_weights(weights, set_epoch=set_epoch)
+        self.value_model.load_state_dict(weights['value_model'])
+        self.value_optimizer.load_state_dict(weights['value_optimizer'])
+
     # ---- PPG policy phase (Stage 3: aux phase not yet implemented) ----------------
 
     def train_epoch(self):

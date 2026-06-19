@@ -1,0 +1,51 @@
+# PPG controller (Cobbe 2020): disjoint policy/value nets. Mirrors ppo_ant_full.yaml
+# (the PPO parity baseline) + algo.name=ppg_continuous + a config.ppg block.
+# Shared rl_games boilerplate lives in configs/defaults/base.yaml (merged at load).
+env:
+  sample_morphs: true       # sample num_envs variable-length bodies (one per env), seeded
+
+params:
+  seed: 42                   # seeds morphology sampling for reproducible runs
+
+  algo:
+    name: ppg_continuous     # selects PPGAgent (overrides base.yaml's a2c_continuous)
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
+    save_best_after: 200
+    save_frequency: 50
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5    # episodes between full morphology resamples (gym rebuild); 0 = off
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4          # required by rl_games base init; unused by PPGAgent (see ppg.e_pi/e_v)
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
+
+    # PPG-specific knobs (paper Appendix A defaults; non-PPG hyperparams = our tuned PPO values)
+    ppg:
+      n_pi: 32              # policy-phase iters between aux phases
+      e_pi: 1              # policy epochs per policy-phase iter
+      e_v: 1              # value epochs per policy-phase iter
+      e_aux: 6              # epochs over the aux buffer in the aux phase
+      beta_clone: 1.0       # behavioral-cloning KL weight in L_joint
+      value_lr: 1.0e-3      # value optimizer fixed lr (policy lr stays adaptive)
+      aux_minibatch_size: 32768   # aux chunk size (= minibatch_size -> known-good activation footprint)
+      aux_buffer_device: cuda     # 'cpu' streams the buffer to spare GPU memory
+    # timing: false         # opt-in cuda.synchronize phase timers (perf/*)

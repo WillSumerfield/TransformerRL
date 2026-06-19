@@ -940,6 +940,10 @@ def run_training(
     runner.algo_factory.register_builder(
         'a2c_continuous', lambda **kwargs: LoggingA2CAgent(**kwargs)
     )
+    from .ppg_agent import PPGAgent
+    runner.algo_factory.register_builder(
+        'ppg_continuous', lambda **kwargs: PPGAgent(**kwargs)
+    )
     runner.load(config)
 
     # test mode owns its rollout loop (ADR-0007): reuse the player only to restore the
