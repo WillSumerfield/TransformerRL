@@ -56,6 +56,11 @@ class PPGAgent(LoggingA2CAgent):
         self._aux_device = ppg.get('aux_buffer_device', 'cuda')
         self.value_lr = float(ppg.get('value_lr', self.config['learning_rate']))
 
+        # opt-in phase timing (config.timing); needs cuda.synchronize -> off by default
+        self._timing = self.config.get('timing', False)
+        self._timings = {}
+        self._tics = {}
+
         # policy: adaptive KL-LR (self.optimizer, retuned via update_lr). value: fixed lr.
         self.optimizer = optim.Adam(self.model.parameters(), self.last_lr,
                                     eps=1e-08, weight_decay=self.weight_decay, fused=True)
@@ -125,8 +130,10 @@ class PPGAgent(LoggingA2CAgent):
 
         self.set_eval()
         play_time_start = time.perf_counter()
+        self._tic('perf/t_rollout')
         with torch.no_grad():
             batch_dict = self.play_steps()
+        self._toc('perf/t_rollout')
         play_time_end = time.perf_counter()
         update_time_start = time.perf_counter()
 
@@ -136,6 +143,7 @@ class PPGAgent(LoggingA2CAgent):
         self.algo_observer.after_steps()
 
         a_losses, b_losses, entropies, kls = [], [], [], []
+        self._tic('perf/t_policy')
         for _ in range(self.ppg_e_pi):
             ep_kls = []
             for i in range(len(self.dataset)):
@@ -158,19 +166,24 @@ class PPGAgent(LoggingA2CAgent):
             kls.append(av_kls)
             if self.normalize_input:
                 self.model.running_mean_std.eval()
+        self._toc('perf/t_policy')
 
         c_losses = []
+        self._tic('perf/t_value')
         for _ in range(self.ppg_e_v):
             for i in range(len(self.dataset)):
                 c_losses.append(self.calc_value_grads(self.dataset[i]))
             if self.normalize_input:
                 self.value_model.running_mean_std.eval()
+        self._toc('perf/t_value')
 
         # accumulate this iter's (raw obs, raw V_targ); run the aux phase every N_pi
         self._aux_append(batch_dict['obses'], batch_dict['returns'])
         self._n_pi_count += 1
         if self._n_pi_count >= self.ppg_n_pi:
+            self._tic('perf/t_aux')
             self._aux_phase()
+            self._toc('perf/t_aux')
             self._n_pi_count = 0
             self._aux_ptr = 0
 
@@ -283,22 +296,25 @@ class PPGAgent(LoggingA2CAgent):
         # snapshot pi_old over the whole buffer, frozen through the E_aux epochs
         mu_old = torch.empty((n, self.actions_num), device=self._aux_device)
         sigma_old = torch.empty((n, self.actions_num), device=self._aux_device)
+        self._tic('perf/t_aux_piold')
         with torch.no_grad():
             for s in range(0, n, mb):
-                ob = self._aux_obs[s:s + mb].to(dev)
+                ob = self._to_dev(self._aux_obs[s:s + mb])
                 res = self.model({'is_train': True, 'prev_actions': dummy[:ob.shape[0]],
                                   'obs': ob, 'compute_value': False})
                 mu_old[s:s + mb] = res['mus'].to(self._aux_device)
                 sigma_old[s:s + mb] = res['sigmas'].to(self._aux_device)
+        self._toc('perf/t_aux_piold')
 
         aux_v, clone_kl, val_l = [], [], []
+        self._tic('perf/t_aux_epochs')
         for _ in range(self.ppg_e_aux):
             perm = torch.randperm(n, device=self._aux_device)
             for s in range(0, n, mb):
                 idx = perm[s:s + mb]
-                ob = self._aux_obs[idx].to(dev)
-                vt_norm = self.value_mean_std(self._aux_vtarg[idx].to(dev))  # frozen -> shared target
-                mo, so = mu_old[idx].to(dev), sigma_old[idx].to(dev)
+                ob = self._to_dev(self._aux_obs[idx])
+                vt_norm = self.value_mean_std(self._to_dev(self._aux_vtarg[idx]))  # frozen -> shared target
+                mo, so = self._to_dev(mu_old[idx]), self._to_dev(sigma_old[idx])
                 dum = dummy[:ob.shape[0]]
 
                 # policy net: L_joint = L_aux + beta_clone * KL[pi_old, pi]
@@ -323,6 +339,7 @@ class PPGAgent(LoggingA2CAgent):
                 self.trancate_gradients_and_step(self.value_model, self.value_optimizer, value=True)
 
                 aux_v.append(l_aux.item()); clone_kl.append(kl.item()); val_l.append(l_val.item())
+        self._toc('perf/t_aux_epochs')
 
         self._aux_stats = {
             'losses/aux_value': sum(aux_v) / len(aux_v),
@@ -340,6 +357,29 @@ class PPGAgent(LoggingA2CAgent):
         self.scaler.step(optimizer)
         self.scaler.update()
 
+    # ---- opt-in phase timing (cuda.synchronize + perf_counter) --------------------
+
+    def _tic(self, key):
+        if self._timing:
+            torch.cuda.synchronize()
+            self._tics[key] = time.perf_counter()
+
+    def _toc(self, key):
+        if self._timing:
+            torch.cuda.synchronize()
+            self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - self._tics[key])
+
+    def _to_dev(self, t):
+        if not self._timing:
+            return t.to(self.ppo_device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        r = t.to(self.ppo_device)
+        torch.cuda.synchronize()
+        self._timings['perf/t_aux_transfer'] = \
+            self._timings.get('perf/t_aux_transfer', 0.0) + (time.perf_counter() - t0)
+        return r
+
     def write_stats(self, *args, **kwargs):
         super().write_stats(*args, **kwargs)
         if self.writer is None:
@@ -353,3 +393,7 @@ class PPGAgent(LoggingA2CAgent):
             for k, v in self._aux_stats.items():
                 self.writer.add_scalar(k, v, frame)
             self._aux_stats = None
+        if self._timings:
+            for k, v in self._timings.items():
+                self.writer.add_scalar(k, v, frame)
+            self._timings = {}
