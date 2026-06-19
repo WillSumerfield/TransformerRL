@@ -52,7 +52,8 @@ class PPGAgent(LoggingA2CAgent):
         self.ppg_n_pi = ppg.get('n_pi', 32)
         self.ppg_e_aux = ppg.get('e_aux', 6)
         self.ppg_beta_clone = float(ppg.get('beta_clone', 1.0))
-        self.ppg_aux_mb = ppg.get('aux_minibatches', 16)
+        # aux chunk SIZE (not count) -> activations pinned to the known-good policy minibatch
+        self.ppg_aux_mb_size = ppg.get('aux_minibatch_size', self.minibatch_size)
         self._aux_device = ppg.get('aux_buffer_device', 'cuda')
         self.value_lr = float(ppg.get('value_lr', self.config['learning_rate']))
 
@@ -288,7 +289,7 @@ class PPGAgent(LoggingA2CAgent):
         # eval() freezes input/value running stats; params still receive grads
         n = self._aux_ptr
         dev = self.ppo_device
-        mb = max(1, n // self.ppg_aux_mb)
+        mb = min(n, self.ppg_aux_mb_size)
         self.model.eval()
         self.value_model.eval()
         dummy = torch.zeros((mb, self.actions_num), device=dev)  # prev_actions (unused logits)
