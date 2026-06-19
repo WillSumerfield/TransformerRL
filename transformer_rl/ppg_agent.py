@@ -49,6 +49,11 @@ class PPGAgent(LoggingA2CAgent):
         ppg = self.config.get('ppg', {})
         self.ppg_e_pi = ppg.get('e_pi', 1)
         self.ppg_e_v = ppg.get('e_v', 1)
+        self.ppg_n_pi = ppg.get('n_pi', 32)
+        self.ppg_e_aux = ppg.get('e_aux', 6)
+        self.ppg_beta_clone = float(ppg.get('beta_clone', 1.0))
+        self.ppg_aux_mb = ppg.get('aux_minibatches', 16)
+        self._aux_device = ppg.get('aux_buffer_device', 'cuda')
         self.value_lr = float(ppg.get('value_lr', self.config['learning_rate']))
 
         # policy: adaptive KL-LR (self.optimizer, retuned via update_lr). value: fixed lr.
@@ -73,6 +78,14 @@ class PPGAgent(LoggingA2CAgent):
         self._adv_std = None
         self._morph_meta = None
         self._steps_since_resample = 0
+
+        # PPG aux buffer: raw obs + raw V_targ across N_pi policy-phase iters
+        n_total = self.ppg_n_pi * self.batch_size
+        self._aux_obs = torch.empty((n_total, self.obs_shape[0]), device=self._aux_device)
+        self._aux_vtarg = torch.empty((n_total, self.value_size), device=self._aux_device)
+        self._aux_ptr = 0
+        self._n_pi_count = 0
+        self._aux_stats = None
 
         self.algo_observer.after_init(self)
 
@@ -152,6 +165,14 @@ class PPGAgent(LoggingA2CAgent):
                 c_losses.append(self.calc_value_grads(self.dataset[i]))
             if self.normalize_input:
                 self.value_model.running_mean_std.eval()
+
+        # accumulate this iter's (raw obs, raw V_targ); run the aux phase every N_pi
+        self._aux_append(batch_dict['obses'], batch_dict['returns'])
+        self._n_pi_count += 1
+        if self._n_pi_count >= self.ppg_n_pi:
+            self._aux_phase()
+            self._n_pi_count = 0
+            self._aux_ptr = 0
 
         self._maybe_resample()
 
@@ -241,6 +262,74 @@ class PPGAgent(LoggingA2CAgent):
         self.trancate_gradients_and_step(self.value_model, self.value_optimizer, value=True)
         return c_loss
 
+    # ---- PPG auxiliary phase (every N_pi iters) -----------------------------------
+
+    def _aux_append(self, obses, returns):
+        n = obses.shape[0]
+        s = self._aux_ptr
+        self._aux_obs[s:s + n] = obses.to(self._aux_device)
+        self._aux_vtarg[s:s + n] = returns.to(self._aux_device)
+        self._aux_ptr += n
+
+    def _aux_phase(self):
+        # eval() freezes input/value running stats; params still receive grads
+        n = self._aux_ptr
+        dev = self.ppo_device
+        mb = max(1, n // self.ppg_aux_mb)
+        self.model.eval()
+        self.value_model.eval()
+        dummy = torch.zeros((mb, self.actions_num), device=dev)  # prev_actions (unused logits)
+
+        # snapshot pi_old over the whole buffer, frozen through the E_aux epochs
+        mu_old = torch.empty((n, self.actions_num), device=self._aux_device)
+        sigma_old = torch.empty((n, self.actions_num), device=self._aux_device)
+        with torch.no_grad():
+            for s in range(0, n, mb):
+                ob = self._aux_obs[s:s + mb].to(dev)
+                res = self.model({'is_train': True, 'prev_actions': dummy[:ob.shape[0]],
+                                  'obs': ob, 'compute_value': False})
+                mu_old[s:s + mb] = res['mus'].to(self._aux_device)
+                sigma_old[s:s + mb] = res['sigmas'].to(self._aux_device)
+
+        aux_v, clone_kl, val_l = [], [], []
+        for _ in range(self.ppg_e_aux):
+            perm = torch.randperm(n, device=self._aux_device)
+            for s in range(0, n, mb):
+                idx = perm[s:s + mb]
+                ob = self._aux_obs[idx].to(dev)
+                vt_norm = self.value_mean_std(self._aux_vtarg[idx].to(dev))  # frozen -> shared target
+                mo, so = mu_old[idx].to(dev), sigma_old[idx].to(dev)
+                dum = dummy[:ob.shape[0]]
+
+                # policy net: L_joint = L_aux + beta_clone * KL[pi_old, pi]
+                with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=torch.bfloat16):
+                    res = self.model({'is_train': True, 'prev_actions': dum,
+                                      'obs': ob, 'compute_value': True})
+                    l_aux = 0.5 * ((res['values'] - vt_norm) ** 2).mean()
+                    kl = torch_ext.policy_kl(mo, so, res['mus'], res['sigmas'], True)
+                    loss_pi = l_aux + self.ppg_beta_clone * kl
+                    for p in self.model.parameters():
+                        p.grad = None
+                self.scaler.scale(loss_pi).backward()
+                self.trancate_gradients_and_step(self.model, self.optimizer)
+
+                # value net: extra L_value on the same target
+                with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=torch.bfloat16):
+                    v = self.value_model({'is_train': True, 'prev_actions': None, 'obs': ob})['values']
+                    l_val = 0.5 * ((v - vt_norm) ** 2).mean()
+                    for p in self.value_model.parameters():
+                        p.grad = None
+                self.scaler.scale(l_val).backward()
+                self.trancate_gradients_and_step(self.value_model, self.value_optimizer, value=True)
+
+                aux_v.append(l_aux.item()); clone_kl.append(kl.item()); val_l.append(l_val.item())
+
+        self._aux_stats = {
+            'losses/aux_value': sum(aux_v) / len(aux_v),
+            'losses/aux_clone_kl': sum(clone_kl) / len(clone_kl),
+            'losses/aux_value_net': sum(val_l) / len(val_l),
+        }
+
     def trancate_gradients_and_step(self, model=None, optimizer=None, value=False):
         model = model if model is not None else self.model
         optimizer = optimizer if optimizer is not None else self.optimizer
@@ -253,8 +342,14 @@ class PPGAgent(LoggingA2CAgent):
 
     def write_stats(self, *args, **kwargs):
         super().write_stats(*args, **kwargs)
-        if self.writer is not None and self._value_grad_norms:
-            frame = args[11] if len(args) > 11 else kwargs.get('frame')
+        if self.writer is None:
+            return
+        frame = args[11] if len(args) > 11 else kwargs.get('frame')
+        if self._value_grad_norms:
             self.writer.add_scalar('health/value_grad_norm',
                                    sum(self._value_grad_norms) / len(self._value_grad_norms), frame)
             self._value_grad_norms = []
+        if self._aux_stats is not None:
+            for k, v in self._aux_stats.items():
+                self.writer.add_scalar(k, v, frame)
+            self._aux_stats = None
