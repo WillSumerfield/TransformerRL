@@ -57,7 +57,7 @@ class PPGAgent(LoggingA2CAgent):
         self._aux_device = ppg.get('aux_buffer_device', 'cuda')
         self.value_lr = float(ppg.get('value_lr', self.config['learning_rate']))
 
-        # opt-in phase timing (config.timing); needs cuda.synchronize -> off by default
+        # timing state (helpers inherited from LoggingA2CAgent, whose __init__ we bypass)
         self._timing = self.config.get('timing', False)
         self._timings = {}
         self._tics = {}
@@ -378,31 +378,8 @@ class PPGAgent(LoggingA2CAgent):
         self.scaler.step(optimizer)
         self.scaler.update()
 
-    # ---- opt-in phase timing (cuda.synchronize + perf_counter) --------------------
-
-    def _tic(self, key):
-        if self._timing:
-            torch.cuda.synchronize()
-            self._tics[key] = time.perf_counter()
-
-    def _toc(self, key):
-        if self._timing:
-            torch.cuda.synchronize()
-            self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - self._tics[key])
-
-    def _to_dev(self, t):
-        if not self._timing:
-            return t.to(self.ppo_device)
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        r = t.to(self.ppo_device)
-        torch.cuda.synchronize()
-        self._timings['perf/t_aux_transfer'] = \
-            self._timings.get('perf/t_aux_transfer', 0.0) + (time.perf_counter() - t0)
-        return r
-
     def write_stats(self, *args, **kwargs):
-        super().write_stats(*args, **kwargs)
+        super().write_stats(*args, **kwargs)  # also flushes self._timings (LoggingA2CAgent)
         if self.writer is None:
             return
         frame = args[11] if len(args) > 11 else kwargs.get('frame')
@@ -414,7 +391,3 @@ class PPGAgent(LoggingA2CAgent):
             for k, v in self._aux_stats.items():
                 self.writer.add_scalar(k, v, frame)
             self._aux_stats = None
-        if self._timings:
-            for k, v in self._timings.items():
-                self.writer.add_scalar(k, v, frame)
-            self._timings = {}

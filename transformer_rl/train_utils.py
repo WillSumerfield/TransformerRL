@@ -710,6 +710,8 @@ def run_training(
     parser.add_argument("--name", type=str, default=None,
                         help="Run name: leaf output dir (runs/env/model/<name>) instead of timestamp.")
     parser.add_argument("--video", action="store_true")
+    parser.add_argument("--timing", action="store_true", default=False,
+                        help="Enable synced cuda phase timers (perf/*); adds cuda.synchronize overhead.")
     parser.add_argument("--train-pct", type=float, default=None, dest="train_pct",
                         help="Fraction of morphologies for training (rest = test set).")
     parser.add_argument("--test-set", action="store_true", default=None, dest="test_set",
@@ -793,6 +795,8 @@ def run_training(
         torch.cuda.set_per_process_memory_fraction(1.0)
 
     # --- CLI overrides ---
+    if args.timing:
+        config["params"]["config"]["timing"] = True
     if args.num_envs is not None:
         config["params"]["config"]["num_actors"] = args.num_envs
     if args.max_epochs is not None:

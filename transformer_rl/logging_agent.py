@@ -11,9 +11,13 @@ which gives diagnostics/exp_var, diagnostics/clip_frac/*, diagnostics/rms_value/
 Registered globally over 'a2c_continuous' in train_utils, so every continuous PPO
 run (transformer or MLP) gets these. Metrics are generic; nothing transformer-specific.
 """
+import time
+
 import torch
 from torch.nn.utils import clip_grad_norm_
 
+from rl_games.common import a2c_common
+from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 
 # Leg slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
@@ -37,11 +41,97 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
         self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
+        # opt-in synced phase timing (config.timing); shared with PPGAgent. Off -> stock path.
+        self._timing = self.config.get('timing', False)
+        self._timings = {}
+        self._tics = {}
+
+    # ---- opt-in phase timing (cuda.synchronize + perf_counter); shared w/ PPGAgent ----
+
+    def _tic(self, key):
+        if self._timing:
+            torch.cuda.synchronize()
+            self._tics[key] = time.perf_counter()
+
+    def _toc(self, key):
+        if self._timing:
+            torch.cuda.synchronize()
+            self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - self._tics[key])
+
+    def _to_dev(self, t):
+        """to(device) with optional transfer timing (perf/t_aux_transfer)."""
+        if not self._timing:
+            return t.to(self.ppo_device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        r = t.to(self.ppo_device)
+        torch.cuda.synchronize()
+        self._timings['perf/t_aux_transfer'] = \
+            self._timings.get('perf/t_aux_transfer', 0.0) + (time.perf_counter() - t0)
+        return r
 
     def train_epoch(self):
-        out = super().train_epoch()
+        if not self._timing:
+            out = super().train_epoch()       # stock PPO path, untouched (baseline fidelity)
+            self._maybe_resample()
+            return out
+        return self._train_epoch_timed()
+
+    def _train_epoch_timed(self):
+        # faithful copy of ContinuousA2CBase.train_epoch + synced t_rollout/t_update timers.
+        a2c_common.A2CBase.train_epoch(self)
+        self.set_eval()
+        play_time_start = time.perf_counter()
+        self._tic('perf/t_rollout')
+        with torch.no_grad():
+            batch_dict = self.play_steps_rnn() if self.is_rnn else self.play_steps()
+        self._toc('perf/t_rollout')
+        play_time_end = time.perf_counter()
+        update_time_start = time.perf_counter()
+        rnn_masks = batch_dict.get('rnn_masks', None)
+
+        self.set_train()
+        self.curr_frames = batch_dict.pop('played_frames')
+        self.prepare_dataset(batch_dict)
+        self.algo_observer.after_steps()
+
+        a_losses, c_losses, b_losses, entropies, kls = [], [], [], [], []
+        self._tic('perf/t_update')
+        for mini_ep in range(0, self.mini_epochs_num):
+            ep_kls = []
+            for i in range(len(self.dataset)):
+                a_loss, c_loss, entropy, kl, last_lr, lr_mul, cmu, csigma, b_loss = \
+                    self.train_actor_critic(self.dataset[i])
+                a_losses.append(a_loss)
+                c_losses.append(c_loss)
+                ep_kls.append(kl)
+                entropies.append(entropy)
+                if self.bounds_loss_coef is not None:
+                    b_losses.append(b_loss)
+                self.dataset.update_mu_sigma(cmu, csigma)
+                if self.schedule_type == 'legacy':
+                    self.last_lr, self.entropy_coef = self.scheduler.update(
+                        self.last_lr, self.entropy_coef, self.epoch_num, 0, kl.item())
+                    self.update_lr(self.last_lr)
+            av_kls = torch_ext.mean_list(ep_kls)
+            if self.schedule_type == 'standard':
+                self.last_lr, self.entropy_coef = self.scheduler.update(
+                    self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
+                self.update_lr(self.last_lr)
+            kls.append(av_kls)
+            self.diagnostics.mini_epoch(self, mini_ep)
+            if self.normalize_input:
+                self.model.running_mean_std.eval()
+        self._toc('perf/t_update')
+
         self._maybe_resample()
-        return out
+
+        update_time_end = time.perf_counter()
+        play_time = play_time_end - play_time_start
+        update_time = update_time_end - update_time_start
+        total_time = update_time_end - play_time_start
+        return (batch_dict['step_time'], play_time, update_time, total_time,
+                a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul)
 
     def _maybe_resample(self):
         """Every resample_interval episodes, draw a fresh morphology set (full gym rebuild) and
@@ -122,6 +212,11 @@ class LoggingA2CAgent(A2CAgent):
             w.add_scalar('health/adv_mean', self._adv_mean, frame)
             w.add_scalar('health/adv_std', self._adv_std, frame)
             self._adv_mean = self._adv_std = None
+
+        if self._timings:
+            for k, v in self._timings.items():
+                w.add_scalar(k, v, frame)
+            self._timings = {}
 
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
