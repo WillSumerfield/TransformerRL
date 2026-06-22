@@ -106,11 +106,13 @@ class PPGAgent(LoggingA2CAgent):
         processed_obs = self._preproc_obs(obs['obs'])
         self.model.eval()
         self.value_model.eval()
-        input_dict = {'is_train': False, 'prev_actions': None,
-                      'obs': processed_obs, 'rnn_states': self.rnn_states}
+        # SEPARATE dicts per model: model.forward normalizes obs in place (mutates the dict),
+        # so a shared dict would double-normalize the value net's obs -> corrupt rollout values.
         with torch.no_grad():
-            res_dict = self.model(input_dict)
-            res_dict['values'] = self.value_model(input_dict)['values']
+            res_dict = self.model({'is_train': False, 'prev_actions': None,
+                                   'obs': processed_obs, 'rnn_states': self.rnn_states})
+            res_dict['values'] = self.value_model({'is_train': False, 'prev_actions': None,
+                                                   'obs': processed_obs, 'rnn_states': self.rnn_states})['values']
         return res_dict
 
     def get_values(self, obs):
