@@ -41,8 +41,11 @@ params:
     # PPG-specific knobs (paper Appendix A defaults; non-PPG hyperparams = our tuned PPO values)
     ppg:
       n_pi: 32              # policy-phase iters between aux phases
-      e_pi: 1              # policy epochs per policy-phase iter
-      e_v: 1              # value epochs per policy-phase iter
+      # e_pi/e_v are PPG's analog of PPO mini_epochs(=4); matched so parity isolates the
+      # disjoint-net+aux structure, not a 4x optimization deficit (our rollout = 2 minibatches,
+      # so e_pi=1 gave only 2 policy updates/rollout vs PPO's 8). Paper used E_pi=1 with 8 mb.
+      e_pi: 4              # policy epochs per policy-phase iter
+      e_v: 4              # value epochs per policy-phase iter
       e_aux: 6              # epochs over the aux buffer in the aux phase
       beta_clone: 1.0       # behavioral-cloning KL weight in L_joint
       policy_lr: 1.0e-3     # FIXED policy lr (no adaptive KL-LR: incompatible with e_pi=1)
