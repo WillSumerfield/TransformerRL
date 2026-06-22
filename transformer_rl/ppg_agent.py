@@ -56,6 +56,11 @@ class PPGAgent(LoggingA2CAgent):
         self.ppg_aux_mb_size = ppg.get('aux_minibatch_size', self.minibatch_size)
         self._aux_device = ppg.get('aux_buffer_device', 'cuda')
         self.value_lr = float(ppg.get('value_lr', self.config['learning_rate']))
+        # PPG uses a FIXED policy LR. Adaptive KL-LR is incompatible with e_pi=1: KL is
+        # measured pre-step on a near-unchanged policy -> ~0 -> scheduler ramps LR to its
+        # ceiling -> entropy bonus blows up log_std. The paper uses fixed LR for this reason.
+        self.policy_lr = float(ppg.get('policy_lr', self.config['learning_rate']))
+        self.last_lr = self.policy_lr
 
         # timing state (helpers inherited from LoggingA2CAgent, whose __init__ we bypass)
         self._timing = self.config.get('timing', False)
@@ -175,16 +180,9 @@ class PPGAgent(LoggingA2CAgent):
                     b_losses.append(b_loss)
                 ep_kls.append(kl)
                 self.dataset.update_mu_sigma(cmu, csigma)
-                if self.schedule_type == 'legacy':
-                    self.last_lr, self.entropy_coef = self.scheduler.update(
-                        self.last_lr, self.entropy_coef, self.epoch_num, 0, kl.item())
-                    self.update_lr(self.last_lr)
-            av_kls = torch_ext.mean_list(ep_kls)
-            if self.schedule_type == 'standard':
-                self.last_lr, self.entropy_coef = self.scheduler.update(
-                    self.last_lr, self.entropy_coef, self.epoch_num, 0, av_kls.item())
-                self.update_lr(self.last_lr)
-            kls.append(av_kls)
+                # fixed policy LR: optimizer is NOT driven by the adaptive scheduler (see __init__).
+                # KL is kept as a diagnostic only.
+            kls.append(torch_ext.mean_list(ep_kls))
             if self.normalize_input:
                 self.model.running_mean_std.eval()
         self._toc('perf/t_policy')

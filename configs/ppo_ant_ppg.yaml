@@ -45,7 +45,8 @@ params:
       e_v: 1              # value epochs per policy-phase iter
       e_aux: 6              # epochs over the aux buffer in the aux phase
       beta_clone: 1.0       # behavioral-cloning KL weight in L_joint
-      value_lr: 1.0e-3      # value optimizer fixed lr (policy lr stays adaptive)
+      policy_lr: 1.0e-3     # FIXED policy lr (no adaptive KL-LR: incompatible with e_pi=1)
+      value_lr: 1.0e-3      # value optimizer fixed lr
       aux_minibatch_size: 32768   # aux chunk size (= minibatch_size -> known-good activation footprint)
       aux_buffer_device: cuda     # 'cpu' streams the buffer to spare GPU memory
     # timing: false         # opt-in cuda.synchronize phase timers (perf/*)
