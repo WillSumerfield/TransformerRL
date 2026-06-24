@@ -41,8 +41,8 @@ ENVS_PER   = 128                                  # eval envs per body (averaged
 EVAL_SEED  = 123
 
 ALGOS = {
-    "ppo": dict(script="scripts/train_ant_full.py", config="configs/ppo_ant_full.yaml",
-                run="runs/ant_full/full_transformer/{name}", ckpt="ant_full_transformer.pth"),
+    #"ppo": dict(script="scripts/train_ant_full.py", config="configs/ppo_ant_full.yaml",
+    #            run="runs/ant_full/full_transformer/{name}", ckpt="ant_full_transformer.pth"),
     "ppg": dict(script="scripts/train_ant_ppg.py",  config="configs/ppo_ant_ppg.yaml",
                 run="runs/ant_ppg/ppg_transformer/{name}",  ckpt="ant_ppg_transformer.pth"),
 }
