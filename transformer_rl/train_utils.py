@@ -5,6 +5,7 @@ import math
 import os
 import random
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -410,8 +411,157 @@ class _VideoRecorder:
         return callback
 
 
+class _MouseInput:
+    """Out-of-band X11 mouse reader for the follow camera.
+
+    vlearn exposes no mouse API and ships as binary wheels, so we read the pointer
+    directly via Xlib. In follow mode we warp the cursor back to the render
+    window's centre every frame: VSim still sees the motion but it nets to zero
+    (its pan self-cancels = "eaten") while we read the pre-warp delta to drive
+    orbit. Scroll (transient X buttons 4/5) is monitored read-only via the RECORD
+    extension on a daemon thread (no grab, so VSim still gets the events). Active
+    only while the VSim window holds input focus, so alt-tab never traps the
+    desktop cursor. Degrades to a no-op if there's no X display / window.
+    """
+
+    def __init__(self, window_titles):
+        self._titles = window_titles
+        self._disp = None
+        self._win = None
+        self._warped = False          # suppress the jump on the first active frame
+        self._scroll = 0
+        self._lock = threading.Lock()
+        self._xfixes = False          # cursor hide/show available
+        self._cursor_hidden = False
+        try:
+            from Xlib import display as xdisplay
+            self._disp = xdisplay.Display()
+            self._win = _find_xwindow(self._disp, window_titles)
+        except Exception as e:
+            print(f"[camera] mouse disabled (no X display: {e})")
+            return
+        try:
+            from Xlib.ext import xfixes  # noqa: F401  (registers xfixes_* methods)
+            self._disp.xfixes_query_version()
+            self._xfixes = True
+        except Exception:
+            pass                       # cursor stays visible; orbit still works
+        threading.Thread(target=self._scroll_loop, daemon=True).start()
+
+    # --- scroll: read-only global RECORD tap on a daemon thread ---
+    def _scroll_loop(self):
+        try:
+            from Xlib import X, display as xdisplay
+            from Xlib.ext import record
+            from Xlib.protocol import rq
+        except Exception:
+            return
+        d = xdisplay.Display()
+        if not d.has_extension("RECORD"):
+            print("[camera] RECORD ext missing — scroll-zoom disabled")
+            return
+        ctx = d.record_create_context(0, [record.AllClients], [{
+            "core_requests": (0, 0), "core_replies": (0, 0),
+            "ext_requests": (0, 0, 0, 0), "ext_replies": (0, 0, 0, 0),
+            "delivered_events": (0, 0),
+            "device_events": (X.ButtonPress, X.ButtonPress),
+            "errors": (0, 0), "client_started": False, "client_died": False,
+        }])
+
+        def handler(reply):
+            if reply.category != record.FromServer or not reply.data:
+                return
+            data = reply.data
+            while data:
+                ev, data = rq.EventField(None).parse_binary_value(data, d.display, None, None)
+                if ev.type == X.ButtonPress:
+                    if ev.detail == 4:      # wheel up
+                        self._add_scroll(1)
+                    elif ev.detail == 5:    # wheel down
+                        self._add_scroll(-1)
+
+        d.record_enable_context(ctx, handler)  # blocks for the session
+
+    def _add_scroll(self, n):
+        with self._lock:
+            self._scroll += n
+
+    def _drain_scroll(self):
+        with self._lock:
+            s, self._scroll = self._scroll, 0
+        return s
+
+    def _focused(self):
+        """True iff the VSim window (or a descendant) holds input focus."""
+        try:
+            w = self._disp.get_input_focus().focus
+        except Exception:
+            return False
+        for _ in range(8):
+            if not hasattr(w, "id"):
+                return False
+            if self._win is not None and w.id == self._win.id:
+                return True
+            try:
+                w = w.query_tree().parent
+            except Exception:
+                return False
+            if w is None:
+                return False
+        return False
+
+    def _hide_cursor(self, hidden):
+        """Hide/show the cursor (XFixes, reference-counted per client), only on a
+        state change so the ref-count stays balanced."""
+        if not self._xfixes or hidden == self._cursor_hidden:
+            return
+        try:
+            target = self._win or self._disp.screen().root
+            if hidden:
+                target.xfixes_hide_cursor()
+            else:
+                target.xfixes_show_cursor()
+            self._disp.sync()
+            self._cursor_hidden = hidden
+        except Exception:
+            pass
+
+    def poll(self, active):
+        """Return (dx, dy, scroll_ticks). dx/dy are pixels since last frame (0 on
+        the first active frame). Warps the cursor to window-centre and hides it
+        while active; a no-op (zeros, cursor shown) when inactive, window-less, or
+        VSim isn't focused."""
+        if self._disp is None:
+            return 0, 0, 0
+        if self._win is None:
+            self._win = _find_xwindow(self._disp, self._titles)
+        if not active or self._win is None or not self._focused():
+            self._warped = False
+            self._hide_cursor(False)
+            self._drain_scroll()        # discard so it doesn't pile up while idle
+            return 0, 0, 0
+        try:
+            geom = self._win.get_geometry()
+            root = self._disp.screen().root
+            c = self._win.translate_coords(root, geom.width // 2, geom.height // 2)
+            p = root.query_pointer()
+            root.warp_pointer(c.x, c.y)
+            self._disp.sync()
+        except Exception:
+            self._win = None            # window moved/closed — re-find next frame
+            self._warped = False
+            self._hide_cursor(False)
+            return 0, 0, 0
+        self._hide_cursor(True)
+        ticks = self._drain_scroll()
+        if not self._warped:            # first active frame: seed centre, no delta
+            self._warped = True
+            return 0, 0, ticks
+        return p.root_x - c.x, p.root_y - c.y, ticks
+
+
 class FollowCamera:
-    """Drives the viewer camera, with operator override via keys + GUI panel.
+    """Drives the viewer camera, with operator override via mouse + keys + GUI panel.
 
     Three viewing states (see scripts/CONTEXT.md "Follow camera"):
       - auto-cycle : hops to a random ant each episode (the unattended default).
@@ -420,25 +570,27 @@ class FollowCamera:
     auto/manual are mutually exclusive; free-cam is an orthogonal overlay that
     leaves the underlying mode untouched (toggling it off resumes that mode).
 
+    Orbit/zoom is mouse-driven in the two fixed states: the cursor is pinned to
+    the window (warped back to centre each frame, see _MouseInput) and its motion
+    orbits the focused ant while the scroll wheel zooms. Because the cursor is
+    pinned, the GUI widgets aren't clickable while following — press F (free-cam)
+    to release the cursor and use the panel. In free-cam the mouse hands back to
+    the renderer's built-in WASD/drag.
+
     Discrete keys (single-step, rising-edge; vsim is_key_down is alphanumeric-only
     so the arrow/Tab analogues are remapped to the IJKL inverted-T + two mode keys):
       J / L  prev / next group        I / K  prev / next env
       F      toggle free-cam          C      back to auto-cycle
-    Continuous keys (level-polled while held), active in both fixed states (no
-    effect in free-cam, where the built-in controls own the camera):
-      Q / E  orbit azimuth            T / G  orbit elevation     Z / X  zoom in / out
     The viewpoint in fixed states is a spherical offset (azimuth, elevation,
-    radius) around the focused ant; orbit/zoom mutate it and it persists as the
+    radius) around the focused ant; mouse/scroll mutate it and it persists as the
     focus hops between ants. The GUI panel mirrors and also drives the discrete
-    state plus the focus distance (bidirectional); keys win over a same-frame
-    widget click.
+    state (bidirectional); keys win over a same-frame widget click.
     """
 
     MAX_FRAMES_PER_MORPH = 250
     _KEYS = ("j", "l", "i", "k", "f", "c")          # discrete (rising-edge)
-    _ORBIT_KEYS = ("q", "e", "t", "g", "z", "x")    # continuous (level-polled)
-    ORBIT_SPEED = math.radians(1.5)                 # per frame while held
-    ZOOM_FACTOR = 1.03                              # radius multiply per frame
+    MOUSE_SENS_BASE = math.radians(0.15)            # radians per pixel at sens=1.0
+    SCROLL_ZOOM = 1.1                               # radius multiply per wheel tick
     ELEV_MIN = math.radians(0.0)                  # don't look up from below the ant
     ELEV_MAX = math.radians(85.0)                   # clamp near top to avoid pole flip
     RADIUS_MIN, RADIUS_MAX = 1.0, 30.0
@@ -468,8 +620,9 @@ class FollowCamera:
         self._prev_keys = {k: False for k in self._KEYS}
         self._pick_new_auto()
 
+        self._mouse = _MouseInput(_VSIM_WINDOW_TITLES)
         self._build_panel()
-        print("[camera] J/L group  I/K env  Q/E+T/G orbit  Z/X zoom  F free-cam  C auto-cycle")
+        print("[camera] mouse orbit + scroll zoom (follow)  J/L group  I/K env  F free-cam  C auto-cycle")
 
     def _offset_look(self):
         """Camera offset (focus->eye) and look direction from the spherical state."""
@@ -481,17 +634,22 @@ class FollowCamera:
         look = v.Vec3(-ox / self.radius, -oy / self.radius, -oz / self.radius)
         return v.Vec3(ox, oy, oz), look
 
-    # --- GUI panel (bidirectional). Keys are embedded in the labels as the
-    # in-window legend (vsim has no text/label widget). ---
+    # --- GUI panel (bidirectional). A real legend now lives in UserText rows;
+    # widgets are only clickable in free-cam (the cursor is pinned while following). ---
     def _build_panel(self) -> None:
         v, r = self._v, self.env.gym_render
-        self.w_group = v.UserCombo("Group (J/L)", [str(i) for i in range(self.n_groups)], self.gi)
-        self.w_env = v.UserCombo("Env (I/K)", [str(i) for i in range(self.epm)], self.ei)
-        self.w_free = v.UserCheckbox("Free cam (F)", self.free)
-        self.w_auto = v.UserCheckbox("Auto-cycle (C)", True)
-        self.w_dist = v.UserSlider("Distance — Z/X zoom, Q/E/T/G orbit",
-                                   self.RADIUS_MIN, self.RADIUS_MAX, self.radius)
-        for w in (self.w_group, self.w_env, self.w_free, self.w_auto, self.w_dist):
+        legend = (
+            v.UserText("controls", "Follow:  mouse = orbit    scroll = zoom"),
+            v.UserText("keys_sel", "J / L  group       I / K  env"),
+            v.UserText("keys_mode", "F  free-cam (frees cursor + GUI)    C  auto-cycle"),
+            v.UserSeparator("sep"),
+        )
+        self.w_group = v.UserCombo("Group", [str(i) for i in range(self.n_groups)], self.gi)
+        self.w_env = v.UserCombo("Env", [str(i) for i in range(self.epm)], self.ei)
+        self.w_free = v.UserCheckbox("Free cam", self.free)
+        self.w_auto = v.UserCheckbox("Auto-cycle", True)
+        self.w_sens = v.UserSlider("Mouse sens", 0.05, 2.0, 1.0)
+        for w in (*legend, self.w_group, self.w_env, self.w_free, self.w_auto, self.w_sens):
             r.register_menu_item(w)
         self._sync_panel()
 
@@ -500,8 +658,7 @@ class FollowCamera:
         self.w_env.set_current_index(self.ei)
         self.w_free.set_value(self.free)
         self.w_auto.set_value(self.mode == "auto")
-        self.w_dist.set_value(self.radius)
-        self._synced = (self.gi, self.ei, self.free, self.mode == "auto", self.radius)
+        self._synced = (self.gi, self.ei, self.free, self.mode == "auto")
 
     # --- auto-cycle selection ---
     def _next_set(self) -> int:
@@ -536,7 +693,7 @@ class FollowCamera:
         self._prev_keys = cur
 
         # Widget user-changes since last sync (only meaningful if no key overrides).
-        sg, se, sfree, sauto, sradius = self._synced
+        sg, se, sfree, sauto = self._synced
         u_group = self.w_group.get_current_index() != sg
         u_env = self.w_env.get_current_index() != se
         u_free = self.w_free.get_value() != sfree
@@ -568,17 +725,17 @@ class FollowCamera:
         elif u_free:
             self.free = self.w_free.get_value()
 
-        # Orbit/zoom: continuous (level-polled) and inert in free-cam. Keys win;
-        # otherwise adopt a dragged Distance slider.
+        # Orbit/zoom: mouse-driven, inert in free-cam (built-in controls own it
+        # there). Cursor is pinned to window-centre while following; dx/dy are the
+        # pre-warp pixel deltas, scroll ticks zoom.
+        dx, dy, ticks = self._mouse.poll(not self.free)
         if not self.free:
-            o = {k: r.is_key_down(k) for k in self._ORBIT_KEYS}
-            self.azimuth += self.ORBIT_SPEED * ((1 if o["e"] else 0) - (1 if o["q"] else 0))
-            self.elevation += self.ORBIT_SPEED * ((1 if o["t"] else 0) - (1 if o["g"] else 0))
+            sens = self.MOUSE_SENS_BASE * self.w_sens.get_value()
+            self.azimuth += dx * sens
+            self.elevation -= dy * sens          # natural Y: mouse up -> over the top
             self.elevation = max(self.ELEV_MIN, min(self.ELEV_MAX, self.elevation))
-            if o["z"] or o["x"]:
-                self.radius *= self.ZOOM_FACTOR ** ((1 if o["x"] else 0) - (1 if o["z"] else 0))
-            elif abs(self.w_dist.get_value() - sradius) > 1e-4:
-                self.radius = self.w_dist.get_value()
+            if ticks:
+                self.radius *= self.SCROLL_ZOOM ** (-ticks)   # wheel up -> zoom in
             self.radius = max(self.RADIUS_MIN, min(self.RADIUS_MAX, self.radius))
 
         # Auto-cycle hops to a new ant when the followed episode ends or times out.
@@ -600,6 +757,8 @@ class FollowCamera:
 def _attach_render_callback(env, recorder=None) -> None:
     """Compose follow-camera (if env supports it and is rendering) + video capture."""
     hooks = []
+    if getattr(env, "rendering", False):
+        env.gym_render.capped_step = True   # start real-time-capped, not free-running
     if getattr(env, "rendering", False) and hasattr(env, "follow_sets"):
         hooks.append(FollowCamera(env).update)
     if recorder is not None:
@@ -948,6 +1107,19 @@ def run_training(
     runner.algo_factory.register_builder(
         'ppg_continuous', lambda **kwargs: PPGAgent(**kwargs)
     )
+    from .codesign_agent import CodesignAgent
+    runner.algo_factory.register_builder(
+        'codesign_continuous', lambda **kwargs: CodesignAgent(**kwargs)
+    )
+    # Play/test use rl_games' Player, not the agent. PPG shares the standard continuous net so the
+    # stock player runs it; codesign uses a custom player that samples bodies from the trained
+    # generator distribution each episode (else it would just show the fixed base morph).
+    from rl_games.algos_torch.players import PpoPlayerContinuous
+    runner.player_factory.register_builder(
+        'ppg_continuous', lambda **kwargs: PpoPlayerContinuous(**kwargs))
+    from .codesign_player import CodesignPlayer
+    runner.player_factory.register_builder(
+        'codesign_continuous', lambda **kwargs: CodesignPlayer(**kwargs))
     runner.load(config)
 
     # test mode owns its rollout loop (ADR-0007): reuse the player only to restore the
