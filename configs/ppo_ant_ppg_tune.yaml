@@ -1,0 +1,54 @@
+# PPG hyperparameter-tuning base config (used by configs/tune_config_ppg.yaml).
+# Identical to ppo_ant_ppg.yaml EXCEPT the proxy-run knobs below (short run, no
+# checkpoint writes). The ppg block is now FROZEN at the machinery-search winner;
+# this sweep tunes the 6 shared PPO/GAE loss knobs (e_clip, entropy_coef,
+# bounds_loss_coef, grad_norm, gamma, tau) overridden per-trial by the tuner.
+# critic_coef/scale_value are NOT tuned: dead under Adam + adv/value normalization.
+env:
+  sample_morphs: true
+
+params:
+  seed: 42                   # single fixed seed across trials (tuning is single-seed)
+
+  algo:
+    name: ppg_continuous
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98              # tuned: {0.95, 0.97, 0.98, 0.99, 0.995}
+    tau: 0.95               # tuned: {0.90, 0.95, 0.97, 0.99}
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 500          # PROXY: ~14 min/trial (vs 1500 deployment). Short-horizon signal.
+    save_best_after: 999999  # PROXY: disable checkpoint writes during tuning
+    save_frequency: 999999
+    grad_norm: 1.45          # tuned: [0.5, 5.0] log
+    entropy_coef: 0.0055     # tuned: [1e-3, 2e-2] log
+    e_clip: 0.15             # tuned: [0.10, 0.30]
+    resample_interval: 5
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4
+    critic_coef: 3.25        # NOT tuned (dead: Adam-invariant + grad-clip renorm)
+    bounds_loss_coef: 0.0005 # tuned: [1e-4, 5e-3] log
+
+    # FROZEN at the PPG-machinery search winner (ppg_ant_tune, best trial).
+    ppg:
+      n_pi: 16
+      e_pi: 4
+      e_v: 3
+      e_aux: 8
+      beta_clone: 2.6844469101442217
+      policy_lr: 6.621442628777082e-4
+      value_lr: 8.058754876711778e-4
+      aux_minibatch_size: 32768
+      aux_buffer_device: cuda
