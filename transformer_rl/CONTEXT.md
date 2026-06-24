@@ -40,11 +40,17 @@ The rl_games model wrapper that runs the stock input normalizer but restores the
 
 ## Generation (morphology generator)
 
-The control-side realization of the planned generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **classic policy-gradient (PPG)** on the same reward the controller earns. Architecture/wiring details (PPG phases, training schedule, sampling cadence) live in `docs/morphology_generator.md`, not here.
+The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in the Phase-2 plan + [ADR-0010](../docs/adr/0010-codesign-generator-unconditional-bandit.md), not here.
 
 **Morphology generator** (generator):
-A **state-conditioned policy** that reads the observation and emits the ant's designed morphology as per-leg **attribute** actions, trained by **classic PPG** (policy-gradient, not value-ascent) on the **control reward** — a body is good if the controller earns high return on it. A separate instance of the **leg transformer** (same architecture, fully separate weights) with a **morphology policy head** plus a PPG **auxiliary value head**. Acts **once per resample window** (a body→body transition policy conditioned on the window-start state); its body never enters the control's per-step action stream — it is applied to the env at resample. Emits morphology, not per-DOF actions.
-_Avoid_: conflating with the control **actor** (emits per-DOF actions) or with the **critic** (the disjoint value net whose advantages it uses).
+An **unconditional** policy (no observation input) that emits the ant's designed morphology, trained by **policy-gradient** (not value-ascent) on the **control reward** — a body is good if the controller earns high return on it. v1 is a per-leg-**presence** bandit: **8 learnable Bernoulli logits + 1 scalar return baseline**, no trunk, no input. Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
+_Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _avoid_ the retired framings: a **state-conditioned transformer** generator, a **PPG aux value head**, or a shared **V1.0 critic head** — the unconditional bandit self-baselines with its own scalar (see ADR-0010). The state-conditioned ("next-best-token") generator is the deferred future design.
+
+**Resample window** (window):
+The span of control episodes a single generated body set is held fixed (`resample_interval` episodes), bracketed by full gym rebuilds. One generator decision + one generator update per window.
+
+**Base morph**:
+The deterministic body the generator is warmed up around (`[1,4,6]` — a 3-leg ant). The pretrain phase centers the generated distribution on base ± small per-leg flip noise, then hands over to return-driven generation that climbs toward the optimum.
 
 **Full token / Attribute token / Designed token** (nested views of a part-token):
 - **Full token** — every feature the control policy consumes: physical state (pos, vel, sensors, last action) + leg encoding + morphology lengths. What the **leg transformer** reads.

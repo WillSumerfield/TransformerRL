@@ -2,6 +2,12 @@
 status: accepted
 ---
 
+> **Revision (Phase 2):** the **generator** half of this ADR is superseded by
+> [ADR-0010](0010-codesign-generator-unconditional-bandit.md) — the generator is now an
+> unconditional Bernoulli bandit (no transformer, no aux head, no V1.0 critic head). The
+> **control** half (PPG, disjoint nets) stands and was validated in Phase 1, but Phase-2 v1
+> runs **combined PPO control only** (the PPG-vs-combined A/B is deferred).
+
 # Codesign trains the morphology generator with classic PPG over three separate nets
 
 ## Context & Decision
