@@ -577,9 +577,9 @@ class FollowCamera:
     to release the cursor and use the panel. In free-cam the mouse hands back to
     the renderer's built-in WASD/drag.
 
-    Discrete keys (single-step, rising-edge; vsim is_key_down is alphanumeric-only
-    so the arrow/Tab analogues are remapped to the IJKL inverted-T + two mode keys):
-      J / L  prev / next group        I / K  prev / next env
+    Discrete keys (single-step, rising-edge), all left-hand and clear of vsim's
+    built-in WASD/P/O (camera move / pause / single-step), which we can't poll:
+      Q / E  prev / next group        Z / X  prev / next env
       F      toggle free-cam          C      back to auto-cycle
     The viewpoint in fixed states is a spherical offset (azimuth, elevation,
     radius) around the focused ant; mouse/scroll mutate it and it persists as the
@@ -588,7 +588,7 @@ class FollowCamera:
     """
 
     MAX_FRAMES_PER_MORPH = 250
-    _KEYS = ("j", "l", "i", "k", "f", "c")          # discrete (rising-edge)
+    _KEYS = ("q", "e", "z", "x", "f", "c")          # discrete (rising-edge), left-hand
     MOUSE_SENS_BASE = math.radians(0.15)            # radians per pixel at sens=1.0
     SCROLL_ZOOM = 1.1                               # radius multiply per wheel tick
     ELEV_MIN = math.radians(0.0)                  # don't look up from below the ant
@@ -622,7 +622,7 @@ class FollowCamera:
 
         self._mouse = _MouseInput(_VSIM_WINDOW_TITLES)
         self._build_panel()
-        print("[camera] mouse orbit + scroll zoom (follow)  J/L group  I/K env  F free-cam  C auto-cycle")
+        print("[camera] mouse orbit + scroll zoom (follow)  Q/E group  Z/X env  F free-cam  C auto-cycle")
 
     def _offset_look(self):
         """Camera offset (focus->eye) and look direction from the spherical state."""
@@ -634,23 +634,23 @@ class FollowCamera:
         look = v.Vec3(-ox / self.radius, -oy / self.radius, -oz / self.radius)
         return v.Vec3(ox, oy, oz), look
 
-    # --- GUI panel (bidirectional). A real legend now lives in UserText rows;
-    # widgets are only clickable in free-cam (the cursor is pinned while following). ---
+    # --- GUI panel (bidirectional). The control legend is embedded in the widget
+    # labels: UserText/UserSeparator exist in the bindings but this vlearn build's
+    # renderer doesn't draw them (registering one blanks the whole menu), so keys
+    # live in the labels. Widgets are only clickable in free-cam (the cursor is
+    # pinned while following). Re-run by update() whenever the gym is rebuilt (the
+    # codesign env resamples bodies each episode -> new gym_render). ---
     def _build_panel(self) -> None:
         v, r = self._v, self.env.gym_render
-        legend = (
-            v.UserText("controls", "Follow:  mouse = orbit    scroll = zoom"),
-            v.UserText("keys_sel", "J / L  group       I / K  env"),
-            v.UserText("keys_mode", "F  free-cam (frees cursor + GUI)    C  auto-cycle"),
-            v.UserSeparator("sep"),
-        )
-        self.w_group = v.UserCombo("Group", [str(i) for i in range(self.n_groups)], self.gi)
-        self.w_env = v.UserCombo("Env", [str(i) for i in range(self.epm)], self.ei)
-        self.w_free = v.UserCheckbox("Free cam", self.free)
-        self.w_auto = v.UserCheckbox("Auto-cycle", True)
-        self.w_sens = v.UserSlider("Mouse sens", 0.05, 2.0, 1.0)
-        for w in (*legend, self.w_group, self.w_env, self.w_free, self.w_auto, self.w_sens):
+        prev_sens = self.w_sens.get_value() if hasattr(self, "w_sens") else 1.0
+        self.w_group = v.UserCombo("Group (Q/E)", [str(i) for i in range(self.n_groups)], self.gi)
+        self.w_env = v.UserCombo("Env (Z/X)", [str(i) for i in range(self.epm)], self.ei)
+        self.w_free = v.UserCheckbox("Free cam (F) - frees mouse for GUI", self.free)
+        self.w_auto = v.UserCheckbox("Auto-cycle (C)", self.mode == "auto")
+        self.w_sens = v.UserSlider("Mouse sens - move=orbit, scroll=zoom", 0.05, 2.0, prev_sens)
+        for w in (self.w_group, self.w_env, self.w_free, self.w_auto, self.w_sens):
             r.register_menu_item(w)
+        self._panel_render = r          # the gym_render these widgets are registered on
         self._sync_panel()
 
     def _sync_panel(self) -> None:
@@ -687,6 +687,11 @@ class FollowCamera:
     def update(self) -> None:
         r = self.env.gym_render
 
+        # A gym rebuild (codesign resamples bodies each episode) swaps gym_render,
+        # orphaning our menu on the dead one — re-register on the live render.
+        if r is not self._panel_render:
+            self._build_panel()
+
         # Rising-edge key events.
         cur = {k: r.is_key_down(k) for k in self._KEYS}
         ev = {k: cur[k] and not self._prev_keys[k] for k in self._KEYS}
@@ -699,8 +704,8 @@ class FollowCamera:
         u_free = self.w_free.get_value() != sfree
         u_auto = self.w_auto.get_value() != sauto
 
-        dg = (1 if ev["l"] else 0) - (1 if ev["j"] else 0)
-        de = (1 if ev["k"] else 0) - (1 if ev["i"] else 0)
+        dg = (1 if ev["e"] else 0) - (1 if ev["q"] else 0)   # group: Q prev / E next
+        de = (1 if ev["x"] else 0) - (1 if ev["z"] else 0)   # env:   Z prev / X next
 
         # Keys win over widget clicks. Selection > auto-toggle > free-toggle.
         if dg or de:
