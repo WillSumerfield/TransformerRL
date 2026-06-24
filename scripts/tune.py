@@ -63,14 +63,32 @@ def _fmt_t(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
-def _read_tb(log_dir: Path, metric: str) -> float:
+def _tb_series(log_dir: Path, metric: str) -> list[float]:
+    """The scalar series for `metric` in logging order (one point per epoch). Re-reads the
+    whole (small) event file each call — safe to poll while the trainer still writes it.
+    Returns [] until the trainer has created the log dir / first event (early polls)."""
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    if not log_dir.exists():
+        return []
     ea = EventAccumulator(str(log_dir))
-    ea.Reload()
+    try:
+        ea.Reload()
+    except Exception:
+        return []   # dir/event file mid-creation or partially written this poll
     if metric not in ea.Tags().get("scalars", []):
+        return []
+    return [s.value for s in ea.Scalars(metric)]
+
+
+def _final_score(series: list[float], mode: str, window: int) -> float:
+    """Completed-trial objective: recovered-level (mean of last `window` epochs) when pruning
+    is on, else max-over-training. Empty series (no metric logged) -> _NEGINF (failure)."""
+    if not series:
         return _NEGINF
-    scalars = ea.Scalars(metric)
-    return max(s.value for s in scalars) if scalars else _NEGINF
+    if mode == "max":
+        return max(series)
+    tail = series[-window:]
+    return sum(tail) / len(tail)
 
 
 # ── state ─────────────────────────────────────────────────────────────
@@ -118,6 +136,17 @@ class _State:
         self.current = None
         self._t0 = None
 
+    def prune(self, num: int):
+        elapsed = time.time() - self._t0 if self._t0 else 0.0
+        for t in self.trials:
+            if t.num == num:
+                t.status  = "pruned"
+                t.score   = None   # killed early -> no recovered-level score; excluded from best/worst
+                t.elapsed = elapsed
+        self._done_times.append(elapsed)
+        self.current = None
+        self._t0 = None
+
     def elapsed_now(self) -> float:
         return time.time() - self._t0 if self._t0 else 0.0
 
@@ -136,7 +165,7 @@ class _State:
         return [t.score for t in self.trials if t.score is not None]
 
     def n_done(self) -> int:
-        return sum(1 for t in self.trials if t.status in ("done", "failed"))
+        return sum(1 for t in self.trials if t.status in ("done", "failed", "pruned"))
 
     def seed(self, study) -> None:
         """Pre-populate from an existing study so the TUI shows prior trials on resume."""
@@ -147,6 +176,8 @@ class _State:
             tr = _Trial(t.number, dict(t.params))
             if t.state == TS.COMPLETE and t.value is not None and t.value > _NEGINF:
                 tr.score, tr.status = t.value, "done"
+            elif t.state == TS.PRUNED:
+                tr.score, tr.status = None, "pruned"
             else:
                 tr.score, tr.status = _NEGINF, "failed"
             if t.datetime_complete and t.datetime_start:
@@ -209,13 +240,16 @@ def _build(state: _State, tick: int) -> Layout:
             sc_str = f"{t.score:.1f}"
         elif t.status in ("running", "retrying"):
             sc_str = sp if t.status == "running" else "↺"
+        elif t.status == "pruned":
+            sc_str = "⊘"
         else:
             sc_str = "—"
 
-        if   t.status in ("running", "retrying"): row_style, icon = "yellow",    ""
-        elif t.status == "failed":                row_style, icon = "dim red",   "✗"
-        elif best and t.num == best.num:          row_style, icon = "bold green", "★"
-        else:                                     row_style, icon = "",           "✓"
+        if   t.status in ("running", "retrying"): row_style, icon = "yellow",       ""
+        elif t.status == "pruned":                row_style, icon = "dim magenta",  "⊘"
+        elif t.status == "failed":                row_style, icon = "dim red",      "✗"
+        elif best and t.num == best.num:          row_style, icon = "bold green",   "★"
+        else:                                     row_style, icon = "",             "✓"
 
         tbl.add_row(
             str(t.num), sc_str,
@@ -424,8 +458,25 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
 
 # ── trial runner ──────────────────────────────────────────────────────
 
-def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Path, attempt: int = 0) -> float:
+def _kill(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Path,
+         trial, attempt: int = 0) -> float:
     sc = tune_cfg["study"]
+    pc = tune_cfg.get("pruner", {})
+    pruning   = pc.get("enabled", False)
+    alpha     = pc.get("ema_alpha", 0.3)
+    poll_secs = pc.get("poll_seconds", 20)
+    warmup    = pc.get("n_warmup_steps", 0)
+    window    = pc.get("score_window", 50)
+    score_mode = "recovered" if pruning else "max"  # ADR-0009: max objective when timing is tuned
+
     trial_cfg = deepcopy(base_cfg)
     for path, value in params.items():
         _set(trial_cfg, path.split("."), value)
@@ -440,46 +491,66 @@ def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Pat
     _set(trial_cfg, exp_name_path, f"tune_trial_{num}")
     _set(trial_cfg, train_dir_path, str(output_dir / "runs"))
 
+    metric = sc.get("metric_key", "Reward / Total reward (mean)")
+    summaries_subdir = sc.get("summaries_subdir", "")
+    log_dir = output_dir / "runs" / f"tune_trial_{num}"
+    if summaries_subdir:
+        log_dir = log_dir / summaries_subdir
+
     log_path = output_dir / "logs" / f"trial_{num}_attempt{attempt}.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
 
     tmp = Path(tempfile.mktemp(suffix=".yaml", prefix=f"tune_{num}_"))
+    timeout = sc.get("trial_timeout_seconds", 300)
     try:
         with open(tmp, "w") as f:
             yaml.dump(trial_cfg, f)
-        timed_out = False
-        try:
-            r = subprocess.run(
-                [sys.executable, sc["script"], "--config", str(tmp)],
-                timeout=sc.get("trial_timeout_seconds", 300),
-                capture_output=True, text=True,
-            )
-            ok = r.returncode == 0
-        except subprocess.TimeoutExpired as e:
-            timed_out = True
-            ok = False
-            r = e
 
-        with open(log_path, "w") as f:
-            f.write(f"# trial {num}  attempt {attempt}  params: {params}\n")
-            f.write(f"# {'TIMED OUT' if timed_out else f'exit {r.returncode}'}\n\n")
-            f.write("=== stdout ===\n")
-            f.write((r.stdout or "") if not timed_out else "(timed out)\n")
-            f.write("\n=== stderr ===\n")
-            f.write((r.stderr or "") if not timed_out else "(timed out)\n")
+        # stdout+stderr stream straight to the log file: with PIPE the 64KB OS buffer would
+        # fill over a long run and deadlock the unread trainer.
+        logf = open(log_path, "w")
+        logf.write(f"# trial {num}  attempt {attempt}  params: {params}\n\n")
+        logf.flush()
+        proc = subprocess.Popen(
+            [sys.executable, sc["script"], "--config", str(tmp)],
+            stdout=logf, stderr=subprocess.STDOUT, text=True,
+        )
+
+        ema = None
+        next_epoch = 0      # first not-yet-reported epoch index (== position in the TB series)
+        timed_out = False
+        t0 = time.time()
+        while True:
+            ret = proc.poll()
+            if pruning:
+                series = _tb_series(log_dir, metric)
+                for e in range(next_epoch, len(series)):
+                    x = series[e]
+                    ema = x if ema is None else alpha * x + (1 - alpha) * ema
+                    trial.report(ema, e)
+                    if e >= warmup and trial.should_prune():
+                        _kill(proc)
+                        logf.write(f"\n# PRUNED at epoch {e} (ema={ema:.4g})\n")
+                        logf.close()
+                        raise optuna.TrialPruned()
+                next_epoch = len(series)
+            if ret is not None:
+                break
+            if time.time() - t0 > timeout:
+                timed_out = True
+                _kill(proc)
+                break
+            time.sleep(poll_secs)
+
+        ok = (proc.returncode == 0) and not timed_out
+        logf.write(f"\n# {'TIMED OUT' if timed_out else f'exit {proc.returncode}'}\n")
+        logf.close()
 
         if not ok and not timed_out:
             return _NEGINF  # real failure/crash: worst score, eligible for one retry
-        # Success OR soft-capped timeout: score on the TB log. A timed-out trial is
-        # scored on the partial run (its best metric so far), not discarded — the
-        # timeout is a wall-clock safety net, not a death sentence. (At a 30-min cap
-        # the run has logged many epochs, so _read_tb returns a real value, not
-        # _NEGINF, and the no-retry intent for timeouts holds in practice.)
-        summaries_subdir = sc.get("summaries_subdir", "")
-        log_dir = output_dir / "runs" / f"tune_trial_{num}"
-        if summaries_subdir:
-            log_dir = log_dir / summaries_subdir
-        return _read_tb(log_dir, sc.get("metric_key", "Reward / Total reward (mean)"))
+        # Success OR soft-capped timeout: score on the TB log. A timed-out trial is scored on
+        # the partial run, not discarded — the timeout is a wall-clock safety net.
+        return _final_score(_tb_series(log_dir, metric), score_mode, window)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -523,11 +594,23 @@ def main():
     param_names = [p["path"] for p in tune_cfg["params"]]
     state = _State(sc["n_trials"], param_names)
 
+    pc = tune_cfg.get("pruner", {})
+    if pc.get("enabled", False) and pc.get("type", "median") == "median":
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=pc.get("n_startup_trials", 4),
+            n_warmup_steps=pc.get("n_warmup_steps", 200),
+            interval_steps=pc.get("interval_steps", 25),
+        )
+    else:
+        pruner = optuna.pruners.NopPruner()
+
     study = optuna.create_study(
         study_name=sc["name"],
         storage=f"sqlite:///{output_dir}/study.db",
         direction="maximize",
         load_if_exists=True,
+        sampler=optuna.samplers.TPESampler(seed=sc.get("sampler_seed", 42)),
+        pruner=pruner,
     )
 
     if not args.reset and len(study.trials) >= sc["n_trials"]:
@@ -579,10 +662,16 @@ def main():
                         params[path] = trial.suggest_categorical(path, p["choices"])
 
             state.begin(trial.number, params)
-            score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, attempt=0)
-            if score is not None and score <= _NEGINF:
-                state.retry(trial.number)
-                score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, attempt=1)
+            try:
+                score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, trial, attempt=0)
+                if score is not None and score <= _NEGINF:
+                    state.retry(trial.number)
+                    score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, trial, attempt=1)
+            except optuna.TrialPruned:
+                state.prune(trial.number)
+                log_file.write(json.dumps({"trial": trial.number, "params": params, "score": "pruned"}) + "\n")
+                log_file.flush()
+                raise  # let Optuna mark the trial PRUNED (not a crash -> no retry)
             if score is None:
                 score = _NEGINF
             state.end(trial.number, score)

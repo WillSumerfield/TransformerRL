@@ -28,7 +28,7 @@ Optional parameter to `run_training`. When provided, enables `--train-pct`/`--te
 
 **Follow camera**:
 The viewer's camera controller in `play`/`random`. Has three viewing states: **auto-cycle** (default — hops to a random ant each episode), **manual-follow** (locked to one operator-chosen group+env, persists across episode resets), and **free-cam** (camera detached, driven by the renderer's built-in WASD/drag). Group = morphology (`EnvironmentGroup`), env = one ant instance within it. Auto-cycle and manual-follow are mutually exclusive; free-cam is an orthogonal overlay that restores the prior state on exit.
-In both fixed states (auto-cycle and manual-follow) the operator can **orbit** (rotate the viewpoint around the focused ant) and **zoom** (the focus distance); the chosen angle and distance persist as the focus hops between ants. Orbit/zoom have no effect in free-cam (the built-in controls own the camera there).
+In both fixed states (auto-cycle and manual-follow) the operator can **orbit** (mouse motion rotates the viewpoint around the focused ant) and **zoom** (scroll wheel sets the focus distance); the chosen angle and distance persist as the focus hops between ants. Orbit/zoom have no effect in free-cam (the built-in controls own the camera there). While following, the cursor is pinned to the window (so the mouse can orbit), which makes the GUI panel unclickable — switch to free-cam to use it.
 _Avoid_: calling free-cam "manual" — manual-follow still tracks an ant; free-cam tracks nothing. Orbit is not free-cam: orbit keeps the ant centred, free-cam does not.
 
 **Episode score**:
@@ -36,6 +36,16 @@ Cumulative raw reward over one episode (sum of `_rew_buf` across steps until ter
 
 **`resample_interval`**:
 Config knob (full ant only): episodes between morphology resamples. The training agent rebuilds the sim with a fresh sampled body set every `resample_interval` episodes; `0` (default elsewhere) disables it. The mechanism and cost live in the Morphology context — [Morphology resampling](../envs/CONTEXT.md) and [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
+
+**Proxy run** (tuning):
+The short run each Optuna trial executes — `max_epochs=500`, checkpoint writes off (`configs/ppo_ant_ppg_tune.yaml`) — standing in for the 1500-epoch deployment run. A short-horizon signal: at 500 epochs the morphology [resample](../envs/CONTEXT.md) fires only once (~epoch 313, period ≈ `resample_interval × max_episode_length ÷ horizon_length`), versus ~4 resamples at deployment length. The tuned winner is meant to transfer to `ppo_ant_ppg.yaml`.
+
+**Recovered-level score** (tuning objective):
+What a completed trial is scored on: the mean of `morph_reward/mean` over the final ~50 epochs of the [proxy run](#) — performance *after* the resample dip has recovered, not a transient peak. Chosen over max-over-training because the deployment run resamples repeatedly: a hyperparameter set that spikes then collapses post-resample scores well on a max but transfers badly, so the objective rewards stable recovered reward instead.
+_Avoid_: calling the tuning objective "max reward" — that was the old metric and rewards transient peaks the resampling punishes.
+
+**Prune signal** (tuning):
+The mid-run health value the tuner reports to Optuna for [MedianPruner](https://optuna.readthedocs.io). An EMA of current `morph_reward/mean`, collapse-sensitive by design (a stalled/collapsing trial's EMA falls, so it can be killed), as opposed to the recovered-level *score* it is later judged on. Distinct from the score but coherent with it — both reward current/recovered performance rather than peaks. The dip from a resample is common-mode (every trial dips at the same epoch, since resample timing is fixed across trials), so it cancels in the same-epoch median comparison. This holds only while resample timing is fixed, so pruning (and the recovered-level objective) is disabled for any sweep that tunes `resample_interval` — see [ADR-0009](../docs/adr/0009-tuning-pruning-and-recovered-level-objective.md).
 
 **Base config** (`configs/defaults/base.yaml`):
 Shared rl_games boilerplate deep-merged *under* every `ppo_*.yaml` at load (per-config values win on conflict). Holds the keys every config shares and nobody tunes per-experiment — `algo.name`, the continuous action space block, `separate`, and the always-on rl_games flags (`ppo`, `multi_gpu`, the normalization/precision toggles, `lr_schedule`/`schedule_type`, `score_to_win`, …). The run's *identity* fields are not in any yaml: `env_name`, `model.name`, `network.name`, and `config.name` (the experiment-family label, which drives the `train_dir` subfolder) are all injected by `run_training` from the training script's own args (`env_name=`, `model=`, `network=(name, builder)`, `name=`), so they can't drift from what's registered. A runnable config therefore lists only what it actually varies: the `env` block, `seed`, architecture dims, and PPO hyperparameters. See [ADR-0006](../docs/adr/0006-shared-base-config-for-rl_games-boilerplate.md).

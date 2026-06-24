@@ -11,6 +11,12 @@ study:
   train_dir_path: params.config.train_dir
   summaries_subdir: summaries
 
+# Pruning OFF: this sweep tunes resample_interval, so resample dips fall at different epochs
+# per trial — same-epoch median comparison (and the recovered-level window) would be unfair.
+# Disabled -> objective falls back to max-over-training, no early kills. See ADR-0009.
+pruner:
+  enabled: false
+
 params:
   # ── PPO ──
   - path: params.config.learning_rate
