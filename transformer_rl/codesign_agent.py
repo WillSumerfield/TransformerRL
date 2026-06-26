@@ -9,6 +9,9 @@ the generator updates (pretrain BC -> RL PPO-clip marginal-value) on (trace, R_i
 builds the next window. Requires value_size==2 (the V1.0 head). Supersedes the ADR-0010 bandit
 (transformer_rl/generator.py + the prior CodesignAgent, preserved in git history). See ADR-0012 /
 temp/ppg_phase3_plan.md."""
+import os
+
+import numpy as np
 import torch
 
 from .logging_agent import LoggingA2CAgent, _LEG_CODE
@@ -40,7 +43,7 @@ class CodesignAgent(LoggingA2CAgent):
             lr=cd.get('lr', 1e-3), clip=cd.get('clip', 0.2),
             entropy_coef=cd.get('entropy_coef', 0.01), critic_coef=cd.get('critic_coef', 0.5),
             epochs=cd.get('epochs', 4), minibatches=cd.get('minibatches', 4),
-            n_pretrain=cd.get('n_pretrain', 8), device=dev)
+            n_pretrain=cd.get('n_pretrain', 8), grad_norm=cd.get('grad_norm', 1.0), device=dev)
 
         # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
         self._cur_presence = self._base_row.expand(N, _N_LEGS).clone()
@@ -112,6 +115,13 @@ class CodesignAgent(LoggingA2CAgent):
         self._window += 1
         self._last_R = R
 
+        # final-scatter data: the just-updated trace's v(full) vs its R (per env), overwritten each
+        # window so the last one survives for the notebook (notebooks/ant_codesign.ipynb panel 4).
+        if self._cur_trace is not None:
+            np.savez(os.path.join(self.experiment_dir, 'gen_scatter.npz'),
+                     v_full=self._cur_trace['v_states'][:, -1].cpu().numpy(),
+                     R=R.cpu().numpy())
+
         trace = self.gen.sample(N)
         presence = self._apply_ramp(trace['presence'])
         self._cur_trace, self._cur_presence = trace, presence
@@ -142,11 +152,22 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('gen/vloss', self._gen_log['vloss'], frame)
         w.add_scalar('gen/loss_a', self._gen_log['loss_a'], frame)
         w.add_scalar('gen/entropy', self._gen_log['ent'], frame)
+        if 'grad_norm' in self._gen_log:                   # pre-clip norm: > grad_norm => step capped
+            w.add_scalar('gen/grad_norm', self._gen_log['grad_norm'], frame)
         w.add_scalar('gen/fraction', self.gen.gen_fraction(), frame)
         w.add_scalar('built/mean_legcount', self._cur_presence.sum(1).mean().item(), frame)
         if 'adv_mean' in self._gen_log:
             w.add_scalar('gen/adv_mean', self._gen_log['adv_mean'], frame)
             w.add_scalar('gen/adv_std', self._gen_log['adv_std'], frame)
+        if 'marg' in self._gen_log:                        # per-leg marginal value (RL phase only)
+            marg = self._gen_log['marg']
+            for i in range(_N_LEGS):
+                m = marg[i].item()
+                if m == m:                                 # skip NaN slots (no `on` this window)
+                    w.add_scalar(f'gen_marg/{_LEG_CODE[i + 1]}', m, frame)
+            c = self._gen_log['value_R_corr']
+            if c == c:
+                w.add_scalar('gen/value_R_corr', c, frame)
         if self._last_R is not None:
             w.add_scalar('gen/R_mean', self._last_R.mean().item(), frame)
         self._gen_log = None

@@ -51,8 +51,9 @@ params:
       n_heads: 8
       n_layers: 1            # 1-layer keeps KV caching exact (deferred)
       ffn: 512
-      lr: 1.0e-3
+      lr: 3.0e-4             # lowered from 1e-3: at 1e-3 one Adam step overshot the PPO clip band
       clip: 0.2
+      grad_norm: 1.0        # step-size cap (gen had none; PPO clip can't undo an oversized step)
       entropy_coef: 0.01
       critic_coef: 0.5
       epochs: 4

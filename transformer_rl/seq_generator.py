@@ -19,11 +19,13 @@ _T_START, _T_ON, _T_STOP, _T_CLS = 0, 1, 2, 3     # token type-embedding ids
 class SeqGenerator(nn.Module):
     def __init__(self, n_legs=8, d_model=128, n_heads=8, n_layers=1, ffn=512,
                  lr=1e-3, clip=0.2, entropy_coef=0.01, critic_coef=0.5,
-                 epochs=4, minibatches=4, n_pretrain=8, device="cuda:0"):
+                 epochs=4, minibatches=4, n_pretrain=8, grad_norm=1.0, device="cuda:0"):
         super().__init__()
         self.n_legs, self.device = n_legs, device
         self.clip, self.entropy_coef, self.critic_coef = clip, entropy_coef, critic_coef
         self.epochs, self.minibatches, self.n_pretrain = epochs, minibatches, n_pretrain
+        self.grad_norm = grad_norm                            # step-size cap (PPO clip can't undo a
+                                                              # single oversized Adam step otherwise)
         self.window = 0
 
         self.type_emb = nn.Embedding(4, d_model)              # START / ON / STOP / CLS
@@ -144,9 +146,10 @@ class SeqGenerator(nn.Module):
         R = returns.to(self.device).float()
         slots, actions = trace['slots'], trace['actions']
         old_logp, v_snap = trace['old_logp'], trace['v_states']       # (n,L), (n,L+1)
-        adv = v_snap[:, 1:] - v_snap[:, :-1]                          # (n,L) telescoping
-        adv = (adv - adv.mean()) / (adv.std() + 1e-8)                 # joint-normalize over n*L
+        raw_adv = v_snap[:, 1:] - v_snap[:, :-1]                      # (n,L) telescoping (R units)
+        adv = (raw_adv - raw_adv.mean()) / (raw_adv.std() + 1e-8)     # joint-normalize over n*L
         n = slots.shape[0]
+        gns = []
         for _ in range(self.epochs):
             for mb in self._mb(n):
                 logits, v = self._replay(slots[mb], actions[mb])
@@ -160,9 +163,33 @@ class SeqGenerator(nn.Module):
                 ent = dist.entropy().mean()
                 self.opt.zero_grad()
                 (pg + self.critic_coef * vloss - self.entropy_coef * ent).backward()
+                gns.append(torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_norm))
                 self.opt.step()
         self.window += 1
-        return self._log(pg, vloss, ent, adv)
+        d = self._log(pg, vloss, ent, adv)
+        d["grad_norm"] = torch.stack(gns).mean().item()              # pre-clip norm (is the step capped?)
+        d["marg"] = self._slot_marginal(raw_adv, slots, actions)      # (L,) per-leg on-marginal
+        d["value_R_corr"] = self._value_R_corr(v_snap[:, -1], R)      # fit of v(full) vs R
+        return d
+
+    @torch.no_grad()
+    def _slot_marginal(self, raw_adv, slots, actions):
+        """Per-leg marginal value of turning leg k on = mean raw telescoping adv at the step that
+        decided slot k with action ON (NaN if no env turned k on this window)."""
+        on = actions == ON
+        marg = torch.full((self.n_legs,), float('nan'), device=self.device)
+        for k in range(self.n_legs):
+            m = on & (slots == k)
+            if m.any():
+                marg[k] = raw_adv[m].mean()
+        return marg
+
+    @staticmethod
+    @torch.no_grad()
+    def _value_R_corr(v_full, R):
+        if v_full.std() < 1e-8 or R.std() < 1e-8:
+            return float('nan')
+        return torch.corrcoef(torch.stack([v_full, R]))[0, 1].item()
 
     def pretrain_update(self, target_presence, returns):
         """Teacher-forced per-step BC toward supplied bodies (CE = -logp) + value distillation."""
@@ -172,6 +199,7 @@ class SeqGenerator(nn.Module):
         order = torch.argsort(torch.rand(n, self.n_legs, device=self.device), dim=1)
         act = torch.where(tgt > 0, torch.full_like(tgt, ON), torch.full_like(tgt, STOP)).long()
         act_steps = torch.gather(act, 1, order)                      # target action at each step
+        gns = []
         for _ in range(self.epochs):
             for mb in self._mb(n):
                 logits, v = self._replay(order[mb], act_steps[mb])
@@ -181,9 +209,12 @@ class SeqGenerator(nn.Module):
                 ent = dist.entropy().mean()
                 self.opt.zero_grad()
                 (bc + self.critic_coef * vloss - self.entropy_coef * ent).backward()
+                gns.append(torch.nn.utils.clip_grad_norm_(self.parameters(), self.grad_norm))
                 self.opt.step()
         self.window += 1
-        return self._log(bc, vloss, ent, None)
+        d = self._log(bc, vloss, ent, None)
+        d["grad_norm"] = torch.stack(gns).mean().item()
+        return d
 
     def in_pretrain(self):  return self.window < self.n_pretrain
 
