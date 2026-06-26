@@ -105,14 +105,16 @@ def aggregate_curves(seeds):
 
 # ---- 3. final-inference return (controlled clean bodies) -------------------------
 
-def _load_policy(ckpt: Path, net_params: dict, device):
+def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1):
+    obs_total = _OBS_TOTAL + (1 if value_size == 2 else 0)   # +progress dim for the V1.0 head
     net = MultiMorphLegTransformerBuilder.Network(
-        params=net_params, actions_num=_N_ACT, input_shape=(_OBS_TOTAL,), num_seqs=1)
+        params=net_params, actions_num=_N_ACT, input_shape=(obs_total,), num_seqs=1,
+        value_size=value_size)
     raw = torch.load(ckpt, map_location=device, weights_only=False)["model"]
     state = {k.removeprefix("_orig_mod."): v for k, v in raw.items()}
     sub = lambda p: {k.removeprefix(p): v for k, v in state.items() if k.startswith(p)}
     net.load_state_dict(sub("a2c_network."))
-    obs_norm = RunningMeanStd(_OBS_TOTAL).to(device)
+    obs_norm = RunningMeanStd(obs_total).to(device)
     obs_norm.load_state_dict(sub("running_mean_std."))
     net.to(device).eval(); obs_norm.eval()
     return net, obs_norm
@@ -125,7 +127,8 @@ def _rollout_return(net, obs_norm, env, device):
     obs, _ = env.reset()
     for _ in range(L):
         normed = obs_norm(obs).clone()
-        normed[..., -_MASK_DIM:] = obs[..., -_MASK_DIM:]   # mask tail raw (TransformerMaskedNorm)
+        _m0 = _OBS_TOTAL - _MASK_DIM                        # mask = [123:139]; front-offset works at
+        normed[..., _m0:_OBS_TOTAL] = obs[..., _m0:_OBS_TOTAL]   # value_size 1 (139) AND 2 (progress@139)
         mu, _, _, _ = net({"obs": normed})
         obs, rew, term, trunc, _ = env.step(mu.clamp(-1.0, 1.0))
         rew = rew.squeeze(-1) if rew.ndim > 1 else rew
