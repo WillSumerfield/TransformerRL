@@ -26,12 +26,14 @@ class LegTransformer(nn.Module):
         ankle_dim: int = ANKLE_DIM,
         policy_head: bool = True,
         value_head: bool = True,
+        value_size: int = 1,
     ):
         super().__init__()
         self.n_tokens = 1 + 2 * n_legs
         self.tokenize_fn = _TOKENIZE[n_legs]
         self.has_policy_head = policy_head
         self.has_value_head = value_head
+        self.value_size = value_size
 
         self.embed_torso = nn.Linear(torso_dim, d_model)
         self.embed_hip   = nn.Linear(hip_dim,   d_model)
@@ -58,7 +60,11 @@ class LegTransformer(nn.Module):
             nn.init.zeros_(self.joint_head.weight)
             nn.init.zeros_(self.joint_head.bias)
         if value_head:
-            self.value_head = nn.Linear(d_model, 1)
+            self.value_head = nn.Linear(d_model, 1)        # V0.98 (sole head when value_size==1)
+            if value_size == 2:
+                # V1.0 body-quality head: reads the torso feature + the raw progress obs dim.
+                # Backprops into the shared trunk (decided: richer features over strict isolation).
+                self.value_head_v1 = nn.Linear(d_model + 1, 1)
         self._xavier_init()
 
     def _xavier_init(self) -> None:
@@ -103,7 +109,14 @@ class LegTransformer(nn.Module):
             a_nat  = a_nat * active_mask
             out['mu'] = a_nat.index_select(-1, self.nat_to_dof)
         if compute_value and self.has_value_head:
-            out['value'] = self.value_head(x[:, 0, :])
+            torso_feat = x[:, 0, :]
+            v0 = self.value_head(torso_feat)               # V0.98
+            if self.value_size == 2:
+                progress = obs[:, -1:]                      # raw normalized progress (last obs dim)
+                v1 = self.value_head_v1(torch.cat([torso_feat, progress], dim=-1))  # V1.0
+                out['value'] = torch.cat([v0, v1], dim=-1)
+            else:
+                out['value'] = v0
         return out
 
 

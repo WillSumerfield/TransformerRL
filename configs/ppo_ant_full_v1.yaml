@@ -1,0 +1,43 @@
+# Stage-1 (ADR-0012): control V1.0 body-quality head on the full multimorph ant, NO generator.
+# Mirrors ppo_ant_full.yaml; adds value_size=2 (V1.0 head: gamma=1, trunc->0, time-aware) so we
+# can verify the head calibrates (V1.0(s0) ~= episode return), fits (explained var), is time-aware,
+# and doesn't wreck the actor (compare vs ppo_ant_full.yaml). Shared boilerplate: defaults/base.yaml.
+env:
+  sample_morphs: true       # variable-length bodies (one per env), seeded -> body/s0 variety
+  value_size: 2             # enables the V1.0 head + trailing normalized-progress obs dim
+
+params:
+  seed: 42
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+
+  config:
+    # stock rl_games diagnostics log value_mean_std.running_mean as a scalar; with value_size==2
+    # it is (2,) and tensorboard rejects it. Our v1/* + health/* metrics cover this per-dim.
+    use_diagnostics: False
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    gamma_v1: 1.0           # V1.0 head discount (full episode return)
+    v1_coef: 1.625          # V1.0 critic-loss weight (~0.5 * critic_coef); shapes the shared trunk
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
+    save_best_after: 200
+    save_frequency: 50
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5    # episodes between full morphology resamples (gym rebuild); 0 = off
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005

@@ -151,6 +151,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         sample_morphs: bool = False,
         train_pct: float = 1.0,
         test_set: bool = False,
+        value_size: int = 1,
         **kwargs,
     ):
         # Full ant: sample `num_envs` variable-length bodies (one per env). Otherwise use the given
@@ -178,6 +179,10 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self.healthy_reward_val = healthy_reward
         self.healthy_y_range = healthy_y_range
         self.reset_noise_scale = reset_noise_scale
+        # value_size==2 enables the codesign control V1.0 body-quality head: appends a trailing
+        # normalized-progress obs dim (ADR-0012). value_size==1 keeps the legacy 139-dim obs.
+        self.value_size = value_size
+        self._obs_total = _OBS_TOTAL + (1 if value_size == 2 else 0)
 
         super().__init__(
             num_envs=total_envs,
@@ -197,8 +202,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         )
 
         self.observation_space = Box(
-            low=np.full(_OBS_TOTAL, np.finfo("f").min, dtype=np.float32),
-            high=np.full(_OBS_TOTAL, np.finfo("f").max, dtype=np.float32),
+            low=np.full(self._obs_total, np.finfo("f").min, dtype=np.float32),
+            high=np.full(self._obs_total, np.finfo("f").max, dtype=np.float32),
             dtype=np.float32,
         )
         self.action_space = Box(
@@ -479,6 +484,10 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             obs[:, 59:107].zero_()
 
         # [107:123] = lengths, [123:139] = dof_mask — set once at allocate time, preserved here
+        if self.value_size == 2:
+            # [139] = normalized progress for the V1.0 head (raw; restored past input norm). Runs
+            # after the progress increment + reset-zeroing, so a fresh reset reads 0.
+            obs[:, _OBS_TOTAL] = self._progress_buf.to(obs.dtype) / self.max_episode_length
 
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         # Reward needs only root pose plus the already-global act/old-root/progress buffers, so it

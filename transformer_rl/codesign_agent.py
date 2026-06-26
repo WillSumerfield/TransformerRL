@@ -50,7 +50,9 @@ class CodesignAgent(LoggingA2CAgent):
     # ---- raw episode-return accumulation (the generator's reward) -------------------
     def env_step(self, actions):
         obs, rewards, dones, infos = super().env_step(actions)
-        r, d = rewards.view(-1), dones.float()             # (N,) raw reward; (N,) done
+        # value_size==2 duplicates reward into (N,2); col 0 = the single env reward.
+        r_src = rewards[:, 0] if rewards.dim() > 1 else rewards
+        r, d = r_src.reshape(-1), dones.float()            # (N,) raw reward; (N,) done
         self._run_ret += r
         self._win_sum += d * self._run_ret
         self._win_cnt += d

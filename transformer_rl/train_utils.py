@@ -855,6 +855,7 @@ def run_training(
             env_info = {
                 "observation_space": convert_space(self.envs.observation_space),
                 "action_space": convert_space(self.envs.action_space),
+                "value_size": getattr(getattr(self.envs, "env", self.envs), "value_size", 1),
             }
             if hasattr(self.envs, "state_space"):
                 env_info["state_space"] = convert_space(self.envs.state_space)
