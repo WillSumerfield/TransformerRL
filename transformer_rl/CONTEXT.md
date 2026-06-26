@@ -40,14 +40,30 @@ The rl_games model wrapper that runs the stock input normalizer but restores the
 
 ## Generation (morphology generator)
 
-The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in the Phase-2 plan + [ADR-0010](../docs/adr/0010-codesign-generator-unconditional-bandit.md), not here.
+The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in the Phase-3 plan + [ADR-0012](../docs/adr/0012-codesign-generator-sequential-token-ppg.md), not here.
 
 **Morphology generator** (generator):
-An **unconditional** policy (no observation input) that emits the ant's designed morphology, trained by **policy-gradient** (not value-ascent) on the **control reward** — a body is good if the controller earns high return on it. v1 is a per-leg-**presence** bandit: **8 learnable Bernoulli logits + 1 scalar return baseline**, no trunk, no input. Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
-_Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _avoid_ the retired framings: a **state-conditioned transformer** generator, a **PPG aux value head**, or a shared **V1.0 critic head** — the unconditional bandit self-baselines with its own scalar (see ADR-0010). The state-conditioned ("next-best-token") generator is the deferred future design.
+A **sequential, token-at-a-time** policy that emits the ant's designed morphology one slot at a time, trained by **policy-gradient** on the **control reward** — a body is good if the controller earns high return on it. It reuses `MultiMorphLegTransformer`; each leg slot is decided in **randomized order**, conditioned on the already-committed tokens. It is a **PPG** (policy head + aux value head on a shared trunk; the aux value is distilled per **phase** toward the real critic). Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
+_Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _avoid_ the retired framings: the **unconditional Bernoulli bandit** (ADR-0010, superseded) and the value-ascent generator.
+
+**Generation MDP**:
+The small MDP the generator solves: **state** = the committed token prefix, **action** = the next token, **reward** = the scalar body quality `R` paid **only at the terminal token**, γ=1. Slots are decided in random order. The generator is an actor-critic on this MDP.
+
+**Token** (generator) — **limb token** / **stop token**:
+The per-slot decision the generator emits: **limb** (the slot's leg exists) or **stop** (the slot is off). The body's **presence** is the set of limb decisions.
+
+**Marginal-value advantage**:
+A committed token's advantage = `v(prefix+token) − v(prefix)`, the token's marginal contribution to body quality. Because order is randomized and every prefix regresses to the same `R`, it is a Shapley-style estimate; being a **difference** of body-conditioned values, it avoids the body-agnostic-baseline trap (see ADR-0012).
+
+**Control V1.0 head** (body-quality critic):
+A second value head on the combined-PPO control net: γ=1, **truncation→0**, **time-aware** (reads a normalized time-remaining feature, V1.0-head-only). Trained on real returns and **isolated from the actor's advantages** (the actor uses V0.98). Produces the per-env body quality `R_i = V1.0(s0_i)` that the generator's aux value head distills.
+_Avoid_: feeding the time feature into the shared obs (that would make the actor time-aware).
+
+**Phase**:
+One **resample window**, viewed as a PPG phase: the boundary at which the generator's aux value head is distilled toward the control V1.0 critic and the generator policy is updated.
 
 **Resample window** (window):
-The span of control episodes a single generated body set is held fixed (`resample_interval` episodes), bracketed by full gym rebuilds. One generator decision + one generator update per window.
+The span of control episodes a single generated body set is held fixed (`resample_interval` episodes), bracketed by full gym rebuilds. One generator decision + one generator update per window (one **phase**).
 
 **Base morph**:
 The deterministic body the generator is warmed up around (`[1,4,6]` — a 3-leg ant). The pretrain phase centers the generated distribution on base ± small per-leg flip noise, then hands over to return-driven generation that climbs toward the optimum.
@@ -58,4 +74,4 @@ The deterministic body the generator is warmed up around (`[1,4,6]` — a 3-leg 
 - **Designed token** — the attributes a given codesign run actually generates and optimizes. The v1 ant designs **presence only**; segment lengths and angle stay fixed (deferred), so `Designed ⊊ Attribute` for v1. The framework permits any subset. `Designed ⊆ Attribute ⊆ Full`.
 
 **Presence** (p):
-A leg's existence, emitted by the generator as a per-leg **Bernoulli action** (presence logits → sampled `{0,1}` body). The sampled body is **built** for the resample window and its **discrete** presence is fed into obs (no continuous/differentiable signal — the value-ascent design that needed continuous `p` is retired). The generator's policy-gradient log-prob is the sum of per-leg Bernoulli log-probs.
+A leg's existence, emitted by the generator as a per-slot **limb/stop token** decided in random order. The completed body is **built** for the resample window and its **discrete** presence is fed into obs. A **≥1-leg guard** masks the stop token on the forced last slot. (Retired: the per-leg Bernoulli-bandit and the continuous-`p` value-ascent framings.)

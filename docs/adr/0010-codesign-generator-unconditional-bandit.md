@@ -1,6 +1,12 @@
 ---
-status: accepted
+status: superseded by ADR-0012
 ---
+
+> **Revision:** the generator design here (unconditional Bernoulli bandit) is superseded by
+> [ADR-0012](0012-codesign-generator-sequential-token-ppg.md) — the generator is now a sequential
+> per-token PPG with a marginal-value advantage. The **body-agnostic-baseline** analysis below
+> still stands as the reason a *baseline* must not read the body; ADR-0012 avoids the trap by using
+> a marginal-value *difference* as the advantage instead.
 
 # The codesign generator is an unconditional Bernoulli bandit (supersedes ADR-0008's generator)
 
