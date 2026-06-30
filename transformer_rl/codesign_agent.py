@@ -73,6 +73,7 @@ class CodesignAgent(LoggingA2CAgent):
         # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
         self._cur_presence = self._base_row.expand(N, _N_LEGS).clone()
         self._cur_trace = None                             # last sample() trace (RL update input)
+        self._base_draw = None                             # last base+-flip ramp draws (pretrain)
         self._gen_window = 0
         self._gen_log = None
         self._last_R = None
@@ -119,10 +120,12 @@ class CodesignAgent(LoggingA2CAgent):
     def _apply_ramp(self, presence):
         frac = self._gen_fraction()
         if frac >= 1.0:
-            return presence                                # RL phase: pure gen samples
+            self._base_draw = None                         # RL phase: pure gen samples, no base draws
+            return presence
         N = presence.shape[0]
         base = torch.bernoulli(self._base_toggle_p.expand(N, _N_LEGS))
         base[base.sum(1) == 0] = self._base_row            # >=1-leg guard for base draws
+        self._base_draw = base                             # the around-base samples (build/limbcount_base)
         use_gen = (torch.rand(N, device=presence.device) < frac).unsqueeze(1)
         return torch.where(use_gen, presence, base)
 
@@ -202,9 +205,14 @@ class CodesignAgent(LoggingA2CAgent):
                     logs[k].append(val.detach())
 
         self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
+        # body-quality outcome (the optimization target); R aligns with the current window's
+        # realized bodies (_cur_presence), before _maybe_resample samples the next window.
+        self._gen_log['R_var'] = R.var(unbiased=False).item()    # scale for the GenCrit vloss norm
+        self._gen_log['R_mean'] = R.mean().item()
+        self._gen_log['R_std'] = R.std().item()
+        self._gen_log['by_limbcount'] = self._by_limbcount(R, self._cur_presence)
         if not pretrain:                                   # RL: built body == generated (ramp off)
             self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions)
-            self._gen_log['value_R_corr'] = self._value_R_corr(self._cur_trace['v_states'][:, -1], R)
             rank, ev, K = self._body_value_metrics(self._cur_trace['presence'],
                                                    self._cur_trace['v_states'][:, -1], R)
             self._gen_log['value_rank_corr'] = rank       # denoised Spearman (NaN if <5 bodies)
@@ -223,10 +231,11 @@ class CodesignAgent(LoggingA2CAgent):
 
     @staticmethod
     @torch.no_grad()
-    def _value_R_corr(v_full, R):
-        if v_full.std() < 1e-8 or R.std() < 1e-8:
-            return float('nan')
-        return torch.corrcoef(torch.stack([v_full, R]))[0, 1].item()
+    def _by_limbcount(R, presence):
+        """Mean body-return R grouped by LIMB count (start tokens with >=1 committed content
+        token == presence.sum(1)). Answers the codesign hypothesis: do more limbs earn more R?"""
+        lc = presence.sum(1).long()
+        return {int(k): R[lc == k].mean().item() for k in lc.unique()}
 
     @staticmethod
     @torch.no_grad()
@@ -301,51 +310,68 @@ class CodesignAgent(LoggingA2CAgent):
         self._morph_meta = None
         self._steps_since_resample = 0
 
+    def _log_morph_stats(self, w, frame, epoch_num):
+        return  # codesign reports body quality via quality/* (true R), not the base per-step morph_reward
+
     # ---- generator logging (sparse: only at window boundaries) ----------------------
+    # Metrics are grouped by subsystem (see docs/codesign_metrics.md):
+    #   build/    the body the generator produces      gen/     GenAct (generator actor) learning
+    #   gencrit/  GenCrit/V1.0 value-head fit          quality/ body-quality outcome (the target)
+    #   clone/    control preservation at resample
+    # Note the half-step: build/* describe the NEXT window's bodies (just sampled), while the
+    # learning + quality metrics describe the window that just ended (aligned with R).
     def write_stats(self, *args, **kwargs):
         super().write_stats(*args, **kwargs)
         w = self.writer
         if w is None or self._gen_log is None:
             return
         frame = args[11] if len(args) > 11 else kwargs.get('frame')
-        rate = self._cur_presence.mean(0)                  # per-slot built on-rate
+        g = self._gen_log
+
+        # --- build/: the body the generator produces ---
+        rate = self._cur_presence.mean(0)                  # per-limb realized on-rate
         for i in range(_N_LEGS):
-            w.add_scalar(f'gen_p/{_LEG_CODE[i + 1]}', rate[i].item(), frame)
-        w.add_scalar('gen/loss_a', self._gen_log['gen_pg'], frame)
-        w.add_scalar('gen/entropy', self._gen_log['ent'], frame)
-        w.add_scalar('gen/vloss_prefix', self._gen_log['v_prefix'], frame)
-        w.add_scalar('gen/vloss_rollout', self._gen_log['v_roll'], frame)
-        w.add_scalar('gen/clone_kl', self._gen_log['kl'], frame)
-        w.add_scalar('gen/clone_crit_mse', self._gen_log['crit'], frame)
-        w.add_scalar('gen/grad_norm', self._gen_log['gn'], frame)
-        w.add_scalar('gen/fraction', self._gen_fraction(), frame)
-        # generator at a glance: 'generated' = the generator's own raw sample (what it WANTS to build);
-        # 'sampled' = the bodies actually built/run this window (post-ramp). They're identical once the
-        # ramp is off (frac==1), so only log 'sampled' during pretrain where it actually differs.
-        w.add_scalar('built/mean_legcount', self._cur_presence.sum(1).mean().item(), frame)  # back-compat alias
-        if self._gen_fraction() < 1.0:
-            w.add_scalar('built/sampled', self._cur_presence.sum(1).mean().item(), frame)
+            w.add_scalar(f'build/p/{_LEG_CODE[i + 1]}', rate[i].item(), frame)
+        w.add_scalar('build/limbcount_realized', self._cur_presence.sum(1).mean().item(), frame)
+        if self._base_draw is not None:                    # pretrain only: the around-base draws
+            w.add_scalar('build/limbcount_base', self._base_draw.sum(1).mean().item(), frame)
         if self._cur_trace is not None:
-            legc = self._cur_trace['presence'].sum(1)         # per-env generated leg count
-            w.add_scalar('built/generated', legc.mean().item(), frame)
-            w.add_scalar('built/legcount_variance', legc.var().item(), frame)  # body-size diversity (collapse canary)
-        if 'marg' in self._gen_log:                        # per-leg marginal value (RL phase only)
-            marg = self._gen_log['marg']
+            legc = self._cur_trace['presence'].sum(1)      # per-env generated limb count (intent)
+            w.add_scalar('build/limbcount', legc.mean().item(), frame)
+            w.add_scalar('build/limbcount_var', legc.var().item(), frame)  # diversity / collapse canary
+        if 'n_distinct_bodies' in g:
+            w.add_scalar('build/n_distinct', g['n_distinct_bodies'], frame)
+
+        # --- gen/: GenAct (generator actor) learning ---
+        w.add_scalar('gen/actor_loss', g['gen_pg'], frame)
+        w.add_scalar('gen/entropy', g['ent'], frame)
+        w.add_scalar('gen/grad_norm', g['gn'], frame)
+        w.add_scalar('gen/fraction', self._gen_fraction(), frame)
+        if 'marg' in g:                                    # per-limb marginal value (RL phase only)
             for i in range(_N_LEGS):
-                m = marg[i].item()
+                m = g['marg'][i].item()
                 if m == m:                                 # skip NaN slots (no `on` this window)
-                    w.add_scalar(f'gen_marg/{_LEG_CODE[i + 1]}', m, frame)
-            c = self._gen_log['value_R_corr']
-            if c == c:
-                w.add_scalar('gen/value_R_corr', c, frame)
-            # denoised, diversity-robust replacements (skip NaN: rank needs >=5 bodies, ev >=2)
-            w.add_scalar('gen/n_distinct_bodies', self._gen_log['n_distinct_bodies'], frame)
-            for key, tag in (('value_rank_corr', 'gen/value_rank_corr'), ('value_ev', 'gen/value_ev')):
-                val = self._gen_log[key]
-                if val == val:
-                    w.add_scalar(tag, val, frame)
-        if self._last_R is not None:
-            w.add_scalar('gen/R_mean', self._last_R.mean().item(), frame)
+                    w.add_scalar(f'gen/marg/{_LEG_CODE[i + 1]}', m, frame)
+
+        # --- gencrit/: GenCrit/V1.0 value-head fit (scale-free: MSE / Var(R)) ---
+        rvar = max(g['R_var'], 1e-8)
+        w.add_scalar('gencrit/loss_prefix', g['v_prefix'] / rvar, frame)
+        w.add_scalar('gencrit/loss_rollout', g['v_roll'] / rvar, frame)
+        for key, tag in (('value_rank_corr', 'gencrit/value_rank_corr'),
+                         ('value_ev', 'gencrit/value_ev')):
+            if key in g and g[key] == g[key]:              # skip NaN (rank needs >=5 bodies)
+                w.add_scalar(tag, g[key], frame)
+
+        # --- quality/: body-quality outcome (the optimization target) ---
+        w.add_scalar('quality/R_mean', g['R_mean'], frame)
+        w.add_scalar('quality/R_std', g['R_std'], frame)
+        for k, v in g['by_limbcount'].items():             # does more limbs earn more R?
+            w.add_scalar(f'quality/by_limbcount/{k}', v, frame)
+
+        # --- clone/: control preservation at resample ---
+        w.add_scalar('clone/actor_kl', g['kl'], frame)
+        w.add_scalar('clone/critic_mse', g['crit'], frame)
+
         self._gen_log = None
 
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
