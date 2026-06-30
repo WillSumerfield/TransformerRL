@@ -1,0 +1,51 @@
+# Single-network PPG (Cobbe 2020, sec 3.6): ONE shared trunk + policy/value heads,
+# interference managed by detaching the value gradient at the trunk in the policy phase.
+# Identical to ppo_ant_ppg.yaml (the dual-net baseline) except ppg.shared_trunk=true, so the
+# comparison isolates the architecture. Shared boilerplate lives in configs/defaults/base.yaml.
+env:
+  sample_morphs: true       # sample num_envs variable-length bodies (one per env), seeded
+
+params:
+  seed: 42                   # seeds morphology sampling for reproducible runs
+
+  algo:
+    name: ppg_continuous     # selects PPGAgent; ppg.shared_trunk picks the single-net path
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
+    save_best_after: 200
+    save_frequency: 50
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5    # episodes between full morphology resamples (gym rebuild); 0 = off
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4          # required by rl_games base init; unused by PPGAgent
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
+
+    ppg:
+      shared_trunk: true     # single-network PPG: one trunk, value grad detached in policy phase
+      n_pi: 32               # policy-phase iters between aux phases
+      e_policy: 4            # fused policy+value epochs per policy-phase iter (= dual-net e_pi=e_v=4)
+      e_aux: 6               # epochs over the aux buffer in the aux phase
+      beta_clone: 1.0        # behavioral-cloning KL weight in the aux loss
+      policy_lr: 1.0e-3      # FIXED lr for the single shared optimizer (no adaptive KL-LR)
+      aux_minibatch_size: 32768   # aux chunk size (= minibatch_size -> known-good activation footprint)
+      aux_buffer_device: cuda     # 'cpu' streams the buffer to spare GPU memory
+    # timing: false         # opt-in cuda.synchronize phase timers (perf/*)
