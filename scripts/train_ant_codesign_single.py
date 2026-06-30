@@ -1,6 +1,7 @@
 """Single-network codesign: control + morphology generator on one shared trunk (CodesignAgent,
 codesign_tokens). See temp/codesign_single_network_plan.md."""
 import os; os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import sys
 from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent

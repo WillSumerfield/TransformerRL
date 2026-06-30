@@ -134,10 +134,16 @@ class CodesignAgent(LoggingA2CAgent):
         HN = obs_flat.shape[0]
         R_roll = R[torch.arange(HN, device=dev) % N]       # rollout-state target (env's R)
 
-        # snapshot control_old on the rollout states (current net, no grad)
+        # snapshot control_old on the rollout states (current net, no grad). Chunk the forward:
+        # H*N can be ~65k states -> a single trunk pass OOMs at scale (storing the result is cheap).
         with torch.no_grad():
-            mu_old, v098_old, _ = net.codesign_forward(self.model.norm_obs(obs_flat))
             ls_old = self._log_std(obs_flat)
+            mu_old = obs_flat.new_empty(HN, 2 * _N_LEGS)
+            v098_old = obs_flat.new_empty(HN, 1)
+            for s in range(0, HN, self.minibatch_size):
+                m, v, _ = net.codesign_forward(self.model.norm_obs(obs_flat[s:s + self.minibatch_size]))
+                mu_old[s:s + self.minibatch_size] = m
+                v098_old[s:s + self.minibatch_size] = v
 
         pretrain = self._in_pretrain()
         if pretrain:                                       # BC toward the built body, random order
