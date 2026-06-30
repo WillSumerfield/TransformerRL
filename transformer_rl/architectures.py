@@ -12,6 +12,7 @@ _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 # codesign token type / mode ids (see CONTEXT.md "Codesign tokens")
 _T_TORSO, _T_HIP, _T_ANKLE, _T_START = 0, 1, 2, 3
 _MODE_LIVE, _MODE_COMMITTED, _MODE_STOP = 0, 1, 2
+_GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action ids {on, stop}
 
 
 def _make_nat_to_dof(n_legs: int) -> torch.Tensor:
@@ -88,14 +89,26 @@ class LegTransformer(nn.Module):
         if value_head:
             self.value_head = nn.Linear(d_model, 1)        # V0.98 (sole head when value_size==1)
             if value_size == 2:
-                # V1.0 body-quality head: reads the torso feature + the raw progress obs dim.
-                # Backprops into the shared trunk (decided: richer features over strict isolation).
+                # legacy standalone-V1.0 head: torso feature + raw progress dim (kept for the
+                # standalone V1.0 experiment; the merged codesign path uses gencrit_head instead).
                 self.value_head_v1 = nn.Linear(d_model + 1, 1)
+
+        if codesign_tokens:
+            # generator heads on the shared trunk (single-network codesign):
+            #   GenAct    = on/stop logits, read from each slot's START token (design mode).
+            #   GenCrit   = V1.0 body-quality value, read from CLS; NO time feature, evaluable on
+            #               both live full-state tokens and partial designed prefixes (same weights).
+            #   cls_design = learned CLS content used in design mode (generation has no torso state).
+            self.gen_head = nn.Linear(d_model, 2)
+            nn.init.zeros_(self.gen_head.weight)
+            nn.init.zeros_(self.gen_head.bias)             # p_on = 0.5 at init
+            self.gencrit_head = nn.Linear(d_model, 1)
+            self.cls_design = nn.Parameter(torch.zeros(d_model))
         self._xavier_init()
 
     def _xavier_init(self) -> None:
         for name, p in self.named_parameters():
-            if "joint_head" in name:
+            if "joint_head" in name or "gen_head" in name:  # zero-init heads, leave them be
                 continue
             if p.dim() >= 2:
                 nn.init.xavier_uniform_(p)
@@ -139,6 +152,100 @@ class LegTransformer(nn.Module):
                                content_active.new_full((), _MODE_STOP)).long()
         mode = torch.cat([x.new_zeros(B, 1 + n, x.shape[-1]), self.mode_emb(mode_ids)], dim=1)
         return self.encoder(x + mode)                          # all 25 tokens real -> no padding
+
+    # ---- design mode: morphology-only generation pass (no physical state) -----------------------
+    def _encode_design(self, committed_on, committed_stop):
+        """Encode a designed prefix over the fixed 25-token layout. committed_on/committed_stop are
+        (M,n) bool per-slot decisions; pending slots (neither) have their content tokens MASKED.
+        CLS uses the learned design content; content tokens carry no physical state (type+pos+mode
+        only). Returns H (M, n_tokens, d): CLS at 0, start tokens 1..n, content after."""
+        M, n = committed_on.shape
+        d = self.cls_design.shape[0]
+        decided = committed_on | committed_stop                 # (M,n) present iff decided
+        cls = self.cls_design.view(1, 1, -1).expand(M, 1, -1)
+        start = self.angle_proj(self.angle_enc).unsqueeze(0).expand(M, -1, -1)   # (M,n,d) angle only
+        content = cls.new_zeros(M, 2 * n, d)                    # hip+ankle: no state in design mode
+        x = torch.cat([cls, start, content], dim=1)            # (M,1+3n,d)
+        x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids)
+
+        mode_slot = torch.where(committed_on, committed_on.new_full((), _MODE_COMMITTED),
+                                committed_on.new_full((), _MODE_STOP)).long()    # (M,n)
+        mode_ids = mode_slot.repeat(1, 2)                      # hip then ankle share slot mode (M,2n)
+        mode = torch.cat([x.new_zeros(M, 1 + n, d), self.mode_emb(mode_ids)], dim=1)
+        pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool),
+                         ~decided.repeat(1, 2)], dim=1)        # mask pending content tokens (M,1+3n)
+        return self.encoder(x + mode, src_key_padding_mask=pad)
+
+    @torch.no_grad()
+    def genvalue_live(self, obs: torch.Tensor) -> torch.Tensor:
+        """V1.0/GenCrit on live full-state tokens: encode the rollout obs, read CLS. (B,1)."""
+        torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
+        H = self._encode_codesign(torso, hip_tok, ankle_tok, active_mask, obs.shape[0])
+        return self.gencrit_head(H[:, 0])
+
+    @torch.no_grad()
+    def sample(self, n: int) -> dict[str, torch.Tensor]:
+        """Unroll the generation MDP for n envs. Per env a random slot order; each step encode the
+        current designed prefix, read v(prefix) from CLS, emit on/stop on the step's START token,
+        commit. >=1-leg guard forces ON on the final slot if nothing is on yet."""
+        dev, L = self.type_ids.device, self.n_legs
+        order = torch.argsort(torch.rand(n, L, device=dev), dim=1)   # (n,L) per-env permutation
+        on   = torch.zeros(n, L, dtype=torch.bool, device=dev)
+        stop = torch.zeros(n, L, dtype=torch.bool, device=dev)
+        actions  = torch.empty(n, L, dtype=torch.long, device=dev)
+        old_logp = torch.empty(n, L, device=dev)
+        v_states = torch.empty(n, L + 1, device=dev)                 # v(prefix) at 0..L decided
+        arange = torch.arange(n, device=dev)
+
+        for t in range(L):
+            H = self._encode_design(on, stop)
+            v_states[:, t] = self.gencrit_head(H[:, 0]).squeeze(-1)
+            slot = order[:, t]
+            logits = self.gen_head(H[arange, 1 + slot])              # (n,2) from start token
+            if t == L - 1:                                           # >=1-leg guard on forced slot
+                logits[~on.any(1), _GEN_STOP] = float('-inf')
+            dist = torch.distributions.Categorical(logits=logits)
+            a = dist.sample()
+            old_logp[:, t] = dist.log_prob(a)
+            is_on = a == _GEN_ON
+            on[arange, slot]   = is_on
+            stop[arange, slot] = ~is_on
+            actions[:, t] = a
+
+        H = self._encode_design(on, stop)                           # v at the full body
+        v_states[:, L] = self.gencrit_head(H[:, 0]).squeeze(-1)
+        return {"order": order, "slots": order, "actions": actions,
+                "old_logp": old_logp, "v_states": v_states, "presence": on.float()}
+
+    def gen_replay(self, slots: torch.Tensor, actions: torch.Tensor):
+        """Teacher-forced replay WITH grad, batched over all L+1 prefixes in one trunk forward
+        (stack B*(L+1) designed prefixes, mask pending content per row). Returns the per-step GenAct
+        logits at the chosen slot (B,L,2) and v(prefix) at every prefix (B,L+1)."""
+        B, L = slots.shape
+        n = self.n_legs
+        inv = torch.argsort(slots, dim=1)                          # (B,L) slot -> step decided
+        act_by_slot = torch.gather(actions, 1, inv)               # (B,L) slot -> action
+        steps = torch.arange(L + 1, device=slots.device).view(1, L + 1, 1)
+        decided = inv.unsqueeze(1) < steps                        # (B,L+1,n) decided by prefix t
+        on   = decided & (act_by_slot.unsqueeze(1) == _GEN_ON)
+        stop = decided & ~on
+        M = B * (L + 1)
+        H = self._encode_design(on.reshape(M, n), stop.reshape(M, n))   # (M,n_tokens,d)
+        v = self.gencrit_head(H[:, 0]).reshape(B, L + 1)          # v(prefix_t)
+
+        start_out = H[:, 1:1 + n].reshape(B, L + 1, n, -1)        # start-token outputs per prefix
+        d = start_out.shape[-1]
+        idx = slots.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, d)
+        chosen = torch.gather(start_out[:, :L], 2, idx).squeeze(2)    # (B,L,d) prefix_t's slot t
+        logits = self.gen_head(chosen)                           # (B,L,2)
+
+        on_steps = (actions == _GEN_ON).float()
+        on_before = on_steps.cumsum(1) - on_steps                # exclusive: #on strictly before t
+        last = torch.arange(L, device=slots.device) == L - 1
+        guard = last.unsqueeze(0) & (on_before == 0)             # only final step, nothing on yet
+        logits[..., _GEN_STOP] = torch.where(guard, logits.new_full((), float('-inf')),
+                                             logits[..., _GEN_STOP])
+        return logits, v
 
     def forward(self, obs: torch.Tensor, compute_value: bool = True,
                 detach_value: bool = False) -> dict[str, torch.Tensor]:

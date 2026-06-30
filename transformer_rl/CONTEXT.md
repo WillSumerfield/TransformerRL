@@ -73,7 +73,7 @@ A per-content-token field marking its mode: **live / committed / stop**. **commi
 A **persistent** per-slot anchor (one per leg slot), distinct from the content token. Two jobs: (1) in design mode it's where **GenAct** reads the on/stop decision for that slot; (2) it survives into **live** mode to tell **ContAct** which limb slots exist (the attachment point — basis for the deferred multi-segment "generate-from an on-token" extension). It is **never replaced**; the slot's *content* token is what turns committed/live/stop.
 
 **CLS token** (= the **torso** root token, reused):
-Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)` is its design-mode readout over committed tokens (pending slots are simply **absent/masked**, not tokens).
+Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)` is its design-mode readout over committed tokens (pending slots are simply **absent/masked**, not tokens). Its *content* differs by mode — torso state embed in **live** mode, a learned `cls_design` parameter in **design** mode (generation has no torso state) — but the same trunk and value heads read its output in both.
 
 ## Generation (morphology generator)
 
