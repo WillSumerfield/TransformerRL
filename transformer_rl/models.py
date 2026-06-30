@@ -87,7 +87,8 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
-            out = self.net(obs, compute_value=obs_dict.get('compute_value', True))
+            out = self.net(obs, compute_value=obs_dict.get('compute_value', True),
+                           detach_value=obs_dict.get('detach_value', False))
             mu, value = out['mu'], out.get('value')  # value None when aux head skipped
             if obs.shape[-1] >= _DYN_MASK_OFF + DYN_MASK_DIM:
                 mask_dof = (obs[..., _DYN_MASK_OFF : _DYN_MASK_OFF + DYN_MASK_DIM] > 0).float()

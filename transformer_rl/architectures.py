@@ -76,7 +76,8 @@ class LegTransformer(nn.Module):
             elif "bias" in name:
                 nn.init.zeros_(p)
 
-    def forward(self, obs: torch.Tensor, compute_value: bool = True) -> dict[str, torch.Tensor]:
+    def forward(self, obs: torch.Tensor, compute_value: bool = True,
+                detach_value: bool = False) -> dict[str, torch.Tensor]:
         torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
         B = obs.shape[0]
 
@@ -110,6 +111,8 @@ class LegTransformer(nn.Module):
             out['mu'] = a_nat.index_select(-1, self.nat_to_dof)
         if compute_value and self.has_value_head:
             torso_feat = x[:, 0, :]
+            if detach_value:                               # single-net PPG policy phase:
+                torso_feat = torso_feat.detach()           # value grad stops at the trunk
             v0 = self.value_head(torso_feat)               # V0.98
             if self.value_size == 2:
                 progress = obs[:, -1:]                      # raw normalized progress (last obs dim)
