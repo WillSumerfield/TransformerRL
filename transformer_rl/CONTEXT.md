@@ -77,14 +77,14 @@ Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)
 
 ## Generation (morphology generator)
 
-The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in the Phase-3 plan + [ADR-0012](../docs/adr/0012-codesign-generator-sequential-token-ppg.md), not here.
+The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in `temp/codesign_single_network_plan.md` and the **Codesign heads/tokens** sections above (the single-network design), not here.
 
 **Morphology generator** (generator):
-A **sequential, token-at-a-time** policy that emits the ant's designed morphology one slot at a time, trained by **policy-gradient** on the **control reward** — a body is good if the controller earns high return on it. It reuses `MultiMorphLegTransformer`; each leg slot is decided in **randomized order**, conditioned on the already-committed tokens. It is a **PPG** (policy head + aux value head on a shared trunk; the aux value is distilled per **phase** toward the real critic). Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
-_Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _avoid_ the retired framings: the **unconditional Bernoulli bandit** (ADR-0010, superseded) and the value-ascent generator.
+A **sequential, token-at-a-time** policy that emits the ant's designed morphology one slot at a time, trained by **policy-gradient** on the **control reward** — a body is good if the controller earns high return on it. It shares the **control trunk** (single network: GenAct + GenCrit heads alongside ContAct + ContCrit); each leg slot is decided in **randomized order**, conditioned on the already-committed tokens. Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
+_Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _avoid_ the retired framings: the **unconditional Bernoulli bandit** (ADR-0010), the value-ascent generator, and the **separate-net SeqGenerator** with a distill-pair aux value (ADR-0012 — superseded by the single-network merge).
 
 **Generation MDP**:
-The small MDP the generator solves: **state** = the committed token prefix, **action** = the next token, **reward** = the scalar body quality `R` paid **only at the terminal token**, γ=1. Slots are decided in random order. The generator is an actor-critic on this MDP.
+The small MDP the generator solves: **state** = the committed token prefix, **action** = the next token, **reward** = the scalar body quality `R`, γ=1. GenCrit/V1.0 regresses **every** prefix toward `R`, and a token's advantage is the marginal difference of consecutive prefix values (below). Slots are decided in random order. The generator is an actor-critic (GenAct/GenCrit) on this MDP.
 
 **Token** (generator) — **limb token** / **stop token**:
 The per-slot decision the generator emits: **limb** (the slot's leg exists) or **stop** (the slot is off). The body's **presence** is the set of limb decisions.
@@ -92,12 +92,11 @@ The per-slot decision the generator emits: **limb** (the slot's leg exists) or *
 **Marginal-value advantage**:
 A committed token's advantage = `v(prefix+token) − v(prefix)`, the token's marginal contribution to body quality. Because order is randomized and every prefix regresses to the same `R`, it is a Shapley-style estimate; being a **difference** of body-conditioned values, it avoids the body-agnostic-baseline trap (see ADR-0012).
 
-**Control V1.0 head** (body-quality critic):
-A second value head on the combined-PPO control net: γ=1, **truncation→0**, **time-aware** (reads a normalized time-remaining feature, V1.0-head-only). Trained on real returns and **isolated from the actor's advantages** (the actor uses V0.98). Produces the per-env body quality `R_i = V1.0(s0_i)` that the generator's aux value head distills.
-_Avoid_: feeding the time feature into the shared obs (that would make the actor time-aware).
+**Body quality** `R_i`:
+The generator's per-body reward: the body's **true mean completed-episode return** over the window (γ=1), accumulated in `env_step` — the *same scalar* for every state in the episode. (Retired: `R_i = V1.0(s0_i)`, the old separate time-aware V1.0-head estimate — superseded once GenCrit/V1.0 merged and the time feature was dropped; see **GenCrit** above.)
 
 **Phase**:
-One **resample window**, viewed as a PPG phase: the boundary at which the generator's aux value head is distilled toward the control V1.0 critic and the generator policy is updated.
+One **resample window**: the boundary at which GenCrit/V1.0 is fit (rollout states + designed prefixes → `R_i`), GenAct is updated (PPO, or BC in pretrain), and **control is cloned** (β·KL + λ·MSE) so the shared-trunk update holds control still. (Not a PPG distill phase — there is no separate aux head.)
 
 **Resample window** (window):
 The span of control episodes a single generated body set is held fixed (`resample_interval` episodes), bracketed by full gym rebuilds. One generator decision + one generator update per window (one **phase**).
