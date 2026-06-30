@@ -183,6 +183,17 @@ class LegTransformer(nn.Module):
         H = self._encode_codesign(torso, hip_tok, ankle_tok, active_mask, obs.shape[0])
         return self.gencrit_head(H[:, 0])
 
+    def codesign_forward(self, obs: torch.Tensor):
+        """Live pass returning ContAct mu, ContCrit V0.98, and GenCrit/V1.0 in ONE trunk encode
+        (resample-update path, grad-enabled). obs is model-normalized; the global log_std lives on
+        the builder Network and is applied by the caller."""
+        torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
+        H = self._encode_codesign(torso, hip_tok, ankle_tok, active_mask, obs.shape[0])
+        joints = H[:, self._content_start:, :]
+        mu = torch.tanh(self.joint_head(joints).squeeze(-1)) * active_mask
+        mu = mu.index_select(-1, self.nat_to_dof)
+        return mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0])
+
     @torch.no_grad()
     def sample(self, n: int) -> dict[str, torch.Tensor]:
         """Unroll the generation MDP for n envs. Per env a random slot order; each step encode the
