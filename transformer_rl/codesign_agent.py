@@ -1,29 +1,48 @@
-"""CodesignAgent: combined classic-PPO control (LoggingA2CAgent) + the sequential per-token
-morphology generator (SeqGenerator, ADR-0012), wired at the resample-window boundary.
+"""CodesignAgent: single-network codesign. Control (ContAct + ContCrit/V0.98) and the morphology
+generator (GenAct + GenCrit/V1.0) share ONE LegTransformer trunk (codesign_tokens=True) under one
+optimizer. See temp/codesign_single_network_plan.md and CONTEXT.md "Codesign heads/tokens".
 
-The generator samples per-env bodies at window start (a full random-order trace); the env builds
-them (full rebuild). The generator's reward is NOT the raw return -- it is the body quality
-R_i = V1.0(s0_i): each env's reset observations (progress=0) are captured over the window, and at the
-boundary the *updated* control V1.0 head is evaluated on them and averaged per env. At the boundary
-the generator updates (pretrain BC -> RL PPO-clip marginal-value) on (trace, R_i), then samples and
-builds the next window. Requires value_size==2 (the V1.0 head). Supersedes the ADR-0010 bandit
-(transformer_rl/generator.py + the prior CodesignAgent, preserved in git history). See ADR-0012 /
-temp/ppg_phase3_plan.md."""
+Two training regimes, both on self.optimizer:
+- per step (window, body fixed): plain combined PPO on control (ContAct + V0.98) -- the stock
+  LoggingA2CAgent path, value_size==1, trunk free. The generator heads get no gradient here.
+- at each resample (window boundary): _resample_update -- snapshot control, then jointly
+    * fit GenCrit/V1.0 on rollout states -> R AND on designed prefixes -> R,
+    * GenAct PPO-clip (marginal-Shapley advantage) [or BC toward the built body in pretrain],
+    * CLONE control so the shared-trunk update doesn't drift it:
+      beta * KL[ContAct_old, ContAct] + lam * MSE(ContCrit, ContCrit_old).
+  Then sample the next body, ramp, full gym rebuild.
+
+R_i = the body's true mean completed-episode return over the window (gamma=1), accumulated in
+env_step. Requires codesign_tokens (the gen/critic heads). Supersedes the SeqGenerator path."""
 import os
 
 import numpy as np
 import torch
+from torch.nn.utils import clip_grad_norm_
 
+from .architectures import _GEN_ON, _GEN_STOP
 from .logging_agent import LoggingA2CAgent, _LEG_CODE
-from .seq_generator import SeqGenerator
+from .tokenize import OBS_DIM_8, LEN_DIM_8
 
 _N_LEGS = 8
+_MASK_OFF = OBS_DIM_8 + LEN_DIM_8           # DOF mask at obs[123:139]
+
+
+def _gauss_kl(mu_old, ls_old, mu_new, ls_new):
+    """KL[old || new] for a diagonal Gaussian policy, summed over action dims, mean over batch.
+    Inactive dims have ls==0 (sigma=1) for both -> they contribute exactly 0 (no masking needed)."""
+    var_new = (2.0 * ls_new).exp()
+    kl = (ls_new - ls_old) + ((2.0 * ls_old).exp() + (mu_old - mu_new) ** 2) / (2.0 * var_new) - 0.5
+    return kl.sum(-1).mean()
 
 
 class CodesignAgent(LoggingA2CAgent):
     def __init__(self, base_name, params):
         super().__init__(base_name, params)
-        assert self._v1, "sequential codesign requires value_size==2 (the control V1.0 head)"
+        net = self.model.a2c_network.net
+        assert getattr(net, 'codesign_tokens', False), \
+            "single-network codesign requires transformer.codesign_tokens=true"
+        assert not self._v1, "single-network codesign uses value_size==1 (V1.0 is gencrit_head)"
         cd = self.config.get('generator', {})
         dev = self.ppo_device
         N = self.num_actors * self.num_agents
@@ -37,55 +56,65 @@ class CodesignAgent(LoggingA2CAgent):
         self._base_row = torch.tensor(
             [1.0 if (i + 1) in bset else 0.0 for i in range(_N_LEGS)], device=dev)
 
-        self.gen = SeqGenerator(
-            n_legs=_N_LEGS, d_model=cd.get('d_model', 128), n_heads=cd.get('n_heads', 8),
-            n_layers=cd.get('n_layers', 1), ffn=cd.get('ffn', 512),
-            lr=cd.get('lr', 1e-3), clip=cd.get('clip', 0.2),
-            entropy_coef=cd.get('entropy_coef', 0.01), critic_coef=cd.get('critic_coef', 0.5),
-            epochs=cd.get('epochs', 4), minibatches=cd.get('minibatches', 4),
-            n_pretrain=cd.get('n_pretrain', 8), grad_norm=cd.get('grad_norm', 1.0), device=dev)
+        # generator hyperparameters (shared optimizer; the heads live on self.model)
+        self._n_pretrain = cd.get('n_pretrain', 8)
+        self._gen_epochs = cd.get('epochs', 4)
+        self._gen_minibatches = cd.get('minibatches', 4)
+        self._gen_clip = cd.get('clip', 0.2)
+        self._gen_ent = cd.get('entropy_coef', 0.01)
+        self._gencrit_coef = cd.get('gencrit_coef', 0.5)   # weight on the V1.0 fit (prefixes+rollout)
+        self._beta = cd.get('beta', 1.0)                   # control-actor KL clone
+        self._lam = cd.get('lam', 1.0)                     # control-critic MSE clone
 
         # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
         self._cur_presence = self._base_row.expand(N, _N_LEGS).clone()
         self._cur_trace = None                             # last sample() trace (RL update input)
-        self._window = 0
+        self._gen_window = 0
         self._gen_log = None
         self._last_R = None
 
-        # R_i accumulator: reset observations (s0, progress=0) captured over the window, per env.
-        self._s0_obs: list = []                            # list of (b_i, obs_dim) chunks
-        self._s0_idx: list = []                            # list of (b_i,) env indices
+        # R_i accumulator: true completed-episode return per env over the window (gamma=1).
+        self._ep_ret = torch.zeros(N, device=dev)
+        self._win_ret_sum = torch.zeros(N, device=dev)
+        self._win_ret_cnt = torch.zeros(N, device=dev)
 
     def _env(self):
         return getattr(getattr(self.vec_env, 'envs', None), 'env', None)
 
-    # ---- capture reset obs (s0) for the R_i = V1.0(s0) average ----------------------
+    def _net(self):
+        return self.model.a2c_network.net
+
+    def _log_std(self, obs):
+        mask = (obs[..., _MASK_OFF:_MASK_OFF + 2 * _N_LEGS] > 0).float()
+        return mask * self.model.a2c_network.log_std_param
+
+    # ---- accumulate true episode returns (R_i, gamma=1) over the window ----------------
     def env_step(self, actions):
-        obs, rewards, dones, infos = super().env_step(actions)  # rewards already (N,2) via LoggingA2CAgent
+        obs, rewards, dones, infos = super().env_step(actions)
+        r = rewards if rewards.dim() == 1 else rewards[:, 0]   # raw per-env reward (value_size==1)
+        self._ep_ret += r
         d = dones.bool()
         if d.any():
-            o = obs['obs'] if isinstance(obs, dict) else obs   # done envs' returned obs == reset s0
-            self._s0_obs.append(o[d].clone())
-            self._s0_idx.append(d.nonzero(as_tuple=False).squeeze(-1))
+            idx = d.nonzero(as_tuple=False).squeeze(-1)
+            self._win_ret_sum.index_add_(0, idx, self._ep_ret[d])
+            self._win_ret_cnt.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
+            self._ep_ret[d] = 0.0
         return obs, rewards, dones, infos
 
     @torch.no_grad()
-    def _window_Ri(self, N):
-        """R_i = mean over the window's reset states of the UPDATED V1.0 head (col 1). Every env has
-        the window-start seed, so cnt>=1."""
-        if not self._s0_obs:                               # safety: no resets captured -> current obs
-            return self.get_values(self.obs)[:, 1]
-        obs = torch.cat(self._s0_obs, dim=0)
-        idx = torch.cat(self._s0_idx, dim=0)
-        v1 = self.get_values({'obs': obs})[:, 1]           # updated V1.0, denorm (shaped-reward units)
-        sums = torch.zeros(N, device=self.ppo_device).index_add_(0, idx, v1)
-        cnts = torch.zeros(N, device=self.ppo_device).index_add_(0, idx, torch.ones_like(v1))
-        return sums / cnts.clamp(min=1.0)
+    def _window_Ri(self):
+        return self._win_ret_sum / self._win_ret_cnt.clamp(min=1.0)   # (N,) true mean return
+
+    def _in_pretrain(self):
+        return self._gen_window < self._n_pretrain
+
+    def _gen_fraction(self):
+        return 1.0 if self._gen_window >= self._n_pretrain else self._gen_window / max(1, self._n_pretrain)
 
     # ---- ramp: replace (1 - gen_fraction) of envs with base+-flip bodies -----------
     @torch.no_grad()
     def _apply_ramp(self, presence):
-        frac = self.gen.gen_fraction()
+        frac = self._gen_fraction()
         if frac >= 1.0:
             return presence                                # RL phase: pure gen samples
         N = presence.shape[0]
@@ -94,7 +123,98 @@ class CodesignAgent(LoggingA2CAgent):
         use_gen = (torch.rand(N, device=presence.device) < frac).unsqueeze(1)
         return torch.where(use_gen, presence, base)
 
-    # ---- window boundary: R_i -> update generator, then sample + build next window ---
+    # ---- the resample-boundary joint update (one optimizer) -------------------------
+    def _resample_update(self, R, obses):
+        """R: (N,) body returns. obses: (H,N,obs) the window's last rollout (rollout-state sample).
+        Jointly: GenCrit fit (prefixes->R + rollout states->R), GenAct PPO/BC, control clone."""
+        net = self._net()
+        dev = R.device
+        N = obses.shape[1]
+        obs_flat = obses.reshape(-1, obses.shape[-1])      # (H*N, obs)
+        HN = obs_flat.shape[0]
+        R_roll = R[torch.arange(HN, device=dev) % N]       # rollout-state target (env's R)
+
+        # snapshot control_old on the rollout states (current net, no grad)
+        with torch.no_grad():
+            mu_old, v098_old, _ = net.codesign_forward(self.model.norm_obs(obs_flat))
+            ls_old = self._log_std(obs_flat)
+
+        pretrain = self._in_pretrain()
+        if pretrain:                                       # BC toward the built body, random order
+            order = torch.argsort(torch.rand(N, _N_LEGS, device=dev), dim=1)
+            pres = self._cur_presence
+            act = torch.where(pres > 0, pres.new_full((), _GEN_ON),
+                              pres.new_full((), _GEN_STOP)).long()
+            slots, actions = order, torch.gather(act, 1, order)
+            old_logp, adv, raw_adv = None, None, None
+        else:                                              # RL: PPO over the sampled trace
+            tr = self._cur_trace
+            slots, actions, old_logp = tr['slots'], tr['actions'], tr['old_logp']
+            raw_adv = tr['v_states'][:, 1:] - tr['v_states'][:, :-1]      # telescoping (Shapley)
+            adv = (raw_adv - raw_adv.mean()) / (raw_adv.std() + 1e-8)
+
+        G = self._gen_minibatches
+        mb_size = max(1, N // G)
+        logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn')}
+        for _ in range(self._gen_epochs):
+            perm = torch.randperm(N, device=dev)
+            for s in range(0, N, mb_size):
+                mb = perm[s:s + mb_size]
+                # --- generator: GenAct (PPO or BC) + GenCrit prefix fit ---
+                logits, v = net.gen_replay(slots[mb], actions[mb])       # (m,L,2), (m,L+1)
+                dist = torch.distributions.Categorical(logits=logits)
+                if pretrain:
+                    gen_pg = -dist.log_prob(actions[mb]).mean()
+                else:
+                    ratio = (dist.log_prob(actions[mb]) - old_logp[mb]).exp()
+                    a = adv[mb]
+                    gen_pg = -torch.min(ratio * a, ratio.clamp(1 - self._gen_clip,
+                                                               1 + self._gen_clip) * a).mean()
+                ent = dist.entropy().mean()
+                v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
+
+                # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
+                ridx = torch.randint(0, HN, (N,), device=dev)
+                ob = obs_flat[ridx]
+                mu_n, v098_n, v1_n = net.codesign_forward(self.model.norm_obs(ob))
+                kl = _gauss_kl(mu_old[ridx], ls_old[ridx], mu_n, self._log_std(ob))
+                crit = (v098_n - v098_old[ridx]).pow(2).mean()
+                v_roll = (v1_n.squeeze(-1) - R_roll[ridx]).pow(2).mean()
+
+                loss = (gen_pg - self._gen_ent * ent
+                        + self._gencrit_coef * (v_prefix + v_roll)
+                        + self._beta * kl + self._lam * crit)
+                self.optimizer.zero_grad()
+                loss.backward()
+                logs['gn'].append(clip_grad_norm_(self.model.parameters(), self.grad_norm))
+                self.optimizer.step()
+                for k, val in (('gen_pg', gen_pg), ('ent', ent), ('v_prefix', v_prefix),
+                               ('v_roll', v_roll), ('kl', kl), ('crit', crit)):
+                    logs[k].append(val.detach())
+
+        self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
+        if not pretrain:
+            self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions)
+            self._gen_log['value_R_corr'] = self._value_R_corr(self._cur_trace['v_states'][:, -1], R)
+
+    @torch.no_grad()
+    def _slot_marginal(self, raw_adv, slots, actions):
+        on = actions == _GEN_ON
+        marg = torch.full((_N_LEGS,), float('nan'), device=raw_adv.device)
+        for k in range(_N_LEGS):
+            m = on & (slots == k)
+            if m.any():
+                marg[k] = raw_adv[m].mean()
+        return marg
+
+    @staticmethod
+    @torch.no_grad()
+    def _value_R_corr(v_full, R):
+        if v_full.std() < 1e-8 or R.std() < 1e-8:
+            return float('nan')
+        return torch.corrcoef(torch.stack([v_full, R]))[0, 1].item()
+
+    # ---- window boundary: update generator, then sample + build next window ----------
     def _maybe_resample(self):
         interval = self.config.get('resample_interval', 0)
         if not interval:
@@ -107,35 +227,31 @@ class CodesignAgent(LoggingA2CAgent):
             return
 
         N = env.total_num_envs
-        R = self._window_Ri(N)                              # body quality from the updated V1.0 head
-        if self.gen.in_pretrain():
-            self._gen_log = self.gen.pretrain_update(self._cur_presence, R)   # BC toward built bodies
-        else:
-            self._gen_log = self.gen.rl_update(self._cur_trace, R)            # marginal-value PPO
-        self._window += 1
+        R = self._window_Ri()                               # true body return over the window
+        obses = self.experience_buffer.tensor_dict['obses']  # (H,N,obs) rollout-state sample
+        phase = 'pretrain' if self._in_pretrain() else 'rl'  # regime of the update just performed
+        self._resample_update(R, obses)
+        self._gen_window += 1
         self._last_R = R
 
-        # final-scatter data: the just-updated trace's v(full) vs its R (per env), overwritten each
-        # window so the last one survives for the notebook (notebooks/ant_codesign.ipynb panel 4).
+        # final-scatter data: trace v(full) vs R (per env) for notebooks/ant_codesign.ipynb panel 4.
         if self._cur_trace is not None:
             np.savez(os.path.join(self.experiment_dir, 'gen_scatter.npz'),
                      v_full=self._cur_trace['v_states'][:, -1].cpu().numpy(),
                      R=R.cpu().numpy())
 
-        trace = self.gen.sample(N)
+        trace = self._net().sample(N)
         presence = self._apply_ramp(trace['presence'])
         self._cur_trace, self._cur_presence = trace, presence
         env.set_next(presence)
-        phase = 'pretrain' if self.gen.in_pretrain() else 'rl'
-        print(f"[resample #{self._window} | {phase} | gen_frac={self.gen.gen_fraction():.2f} | "
+        print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
               f"legcount={presence.sum(1).mean().item():.2f}", flush=True)
         env.resample()
         self.obs = self.env_reset()
         self.current_rewards.zero_(); self.current_lengths.zero_()
-        # reset + seed the s0 accumulator with the post-rebuild reset (every env, progress=0)
-        self._s0_obs = [self.obs['obs'].clone()]
-        self._s0_idx = [torch.arange(N, device=self.ppo_device)]
+        # reset R_i accumulators for the new window
+        self._ep_ret.zero_(); self._win_ret_sum.zero_(); self._win_ret_cnt.zero_()
         self._morph_meta = None
         self._steps_since_resample = 0
 
@@ -149,16 +265,15 @@ class CodesignAgent(LoggingA2CAgent):
         rate = self._cur_presence.mean(0)                  # per-slot built on-rate
         for i in range(_N_LEGS):
             w.add_scalar(f'gen_p/{_LEG_CODE[i + 1]}', rate[i].item(), frame)
-        w.add_scalar('gen/vloss', self._gen_log['vloss'], frame)
-        w.add_scalar('gen/loss_a', self._gen_log['loss_a'], frame)
+        w.add_scalar('gen/loss_a', self._gen_log['gen_pg'], frame)
         w.add_scalar('gen/entropy', self._gen_log['ent'], frame)
-        if 'grad_norm' in self._gen_log:                   # pre-clip norm: > grad_norm => step capped
-            w.add_scalar('gen/grad_norm', self._gen_log['grad_norm'], frame)
-        w.add_scalar('gen/fraction', self.gen.gen_fraction(), frame)
+        w.add_scalar('gen/vloss_prefix', self._gen_log['v_prefix'], frame)
+        w.add_scalar('gen/vloss_rollout', self._gen_log['v_roll'], frame)
+        w.add_scalar('gen/clone_kl', self._gen_log['kl'], frame)
+        w.add_scalar('gen/clone_crit_mse', self._gen_log['crit'], frame)
+        w.add_scalar('gen/grad_norm', self._gen_log['gn'], frame)
+        w.add_scalar('gen/fraction', self._gen_fraction(), frame)
         w.add_scalar('built/mean_legcount', self._cur_presence.sum(1).mean().item(), frame)
-        if 'adv_mean' in self._gen_log:
-            w.add_scalar('gen/adv_mean', self._gen_log['adv_mean'], frame)
-            w.add_scalar('gen/adv_std', self._gen_log['adv_std'], frame)
         if 'marg' in self._gen_log:                        # per-leg marginal value (RL phase only)
             marg = self._gen_log['marg']
             for i in range(_N_LEGS):
@@ -172,26 +287,19 @@ class CodesignAgent(LoggingA2CAgent):
             w.add_scalar('gen/R_mean', self._last_R.mean().item(), frame)
         self._gen_log = None
 
-    # ---- checkpointing --------------------------------------------------------------
+    # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):
         s = super().get_full_state_weights()
-        s.update(gen=self.gen.state_dict(), gen_opt=self.gen.opt.state_dict(),
-                 gen_window=self.gen.window, cs_window=self._window,
-                 cur_presence=self._cur_presence, cur_trace=self._cur_trace,
-                 steps_since_resample=self._steps_since_resample)
+        s.update(gen_window=self._gen_window, cur_presence=self._cur_presence,
+                 cur_trace=self._cur_trace, steps_since_resample=self._steps_since_resample)
         return s
 
     def set_full_state_weights(self, weights, set_epoch=True):
         super().set_full_state_weights(weights, set_epoch=set_epoch)
-        if 'gen' not in weights:
+        if 'gen_window' not in weights:
             return
-        self.gen.load_state_dict(weights['gen'])
-        self.gen.opt.load_state_dict(weights['gen_opt'])
-        self.gen.window = int(weights['gen_window'])
-        self._window = int(weights['cs_window'])
+        self._gen_window = int(weights['gen_window'])
         self._cur_presence = weights['cur_presence'].to(self.ppo_device)
         tr = weights.get('cur_trace')
         self._cur_trace = {k: v.to(self.ppo_device) for k, v in tr.items()} if tr else None
         self._steps_since_resample = int(weights.get('steps_since_resample', 0))
-        # s0 accumulator is not persisted -> the resumed partial window seeds fresh on next boundary.
-        self._s0_obs, self._s0_idx = [], []
