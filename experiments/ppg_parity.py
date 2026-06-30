@@ -40,17 +40,23 @@ _N_ACT     = 16
 ENVS_PER   = 128                                  # eval envs per body (averaged)
 EVAL_SEED  = 123
 
+# train=False -> reuse the existing run dirs (not retrained this pass), still aggregated + inferred.
 ALGOS = {
     #"ppo": dict(script="scripts/train_ant_full.py", config="configs/ppo_ant_full.yaml",
-    #            run="runs/ant_full/full_transformer/{name}", ckpt="ant_full_transformer.pth"),
+    #            run="runs/ant_full/full_transformer/{name}", ckpt="ant_full_transformer.pth", train=True),
     "ppg": dict(script="scripts/train_ant_ppg.py",  config="configs/ppo_ant_ppg.yaml",
-                run="runs/ant_ppg/ppg_transformer/{name}",  ckpt="ant_ppg_transformer.pth"),
+                run="runs/ant_ppg/ppg_transformer/{name}",  ckpt="ant_ppg_transformer.pth",
+                train=False),
+    "ppg_single": dict(script="scripts/train_ant_ppg_single.py", config="configs/ppo_ant_ppg_single.yaml",
+                       run="runs/ant_ppg_single/ppg_single_transformer/{name}",
+                       ckpt="ant_ppg_single_transformer.pth", train=True),
 }
 # tags pulled from TB if present (PPG-only ones simply absent for PPO)
 CURVE_TAGS = [
     "morph_reward/mean", "losses/a_loss", "losses/c_loss",
     "losses/aux_value", "losses/aux_clone_kl", "losses/aux_value_net",
     "perf/t_rollout", "perf/t_update", "perf/t_policy", "perf/t_value", "perf/t_aux",
+    "perf/peak_mem_mib",
 ]
 DATA_DIR = _ROOT / "data" / "ppg_parity"
 
@@ -61,6 +67,9 @@ def train_all(seeds, max_epochs, num_envs):
     for seed in seeds:
         name = f"s{seed}"
         for algo, spec in ALGOS.items():
+            if not spec.get("train", True):
+                print(f"[parity] REUSE {algo} {name}: existing run (train=False)", flush=True)
+                continue
             run_dir = _ROOT / spec["run"].format(name=name)
             if run_dir.exists():
                 shutil.rmtree(run_dir)        # always retrain (only this exact named dir)
