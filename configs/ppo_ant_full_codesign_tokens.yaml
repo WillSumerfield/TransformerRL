@@ -1,0 +1,38 @@
+# Phase-1 codesign-token test: combined-PPO control (no generator) on the new fixed 25-token
+# scheme (persistent start tokens + live/stop content modes, off-legs as stop tokens). Mirrors
+# ppo_ant_full.yaml exactly + transformer.codesign_tokens, to check control parity vs the old
+# masked-token scheme. See CONTEXT.md "Codesign tokens".
+env:
+  sample_morphs: true
+
+params:
+  seed: 42
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+      codesign_tokens: true
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1500
+    save_best_after: 200
+    save_frequency: 50
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 5
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
