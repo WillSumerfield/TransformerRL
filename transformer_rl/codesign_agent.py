@@ -284,9 +284,11 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('gen/grad_norm', self._gen_log['gn'], frame)
         w.add_scalar('gen/fraction', self._gen_fraction(), frame)
         # generator at a glance: 'generated' = the generator's own raw sample (what it WANTS to build);
-        # 'sampled' = the bodies actually built/run this window (post-ramp; == generated once frac=1).
-        w.add_scalar('built/sampled', self._cur_presence.sum(1).mean().item(), frame)
+        # 'sampled' = the bodies actually built/run this window (post-ramp). They're identical once the
+        # ramp is off (frac==1), so only log 'sampled' during pretrain where it actually differs.
         w.add_scalar('built/mean_legcount', self._cur_presence.sum(1).mean().item(), frame)  # back-compat alias
+        if self._gen_fraction() < 1.0:
+            w.add_scalar('built/sampled', self._cur_presence.sum(1).mean().item(), frame)
         if self._cur_trace is not None:
             w.add_scalar('built/generated', self._cur_trace['presence'].sum(1).mean().item(), frame)
         if 'marg' in self._gen_log:                        # per-leg marginal value (RL phase only)
