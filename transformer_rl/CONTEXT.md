@@ -12,8 +12,8 @@ One transformer input vector per body part. The general pattern: one **root toke
 **Root token** (generic) / **torso token** (ant instance):
 The single non-repeating body token. Always active, never masked, attends to all parts; its encoder output feeds the value head (CLS-style whole-body aggregator).
 
-**Structural unit** (generic) / **leg** (ant instance):
-The repeating body element that tokens are grouped by. One unit contributes one part-token per actuated segment (ant: a leg → hip + ankle). Adding/removing a unit adds/removes tokens — the source of the architecture's count-invariance.
+**Structural unit** (generic) / **limb** (generator & metrics name) / **leg** (ant instance):
+The repeating body element that tokens are grouped by. One unit contributes one part-token per actuated segment (ant: a leg → hip + ankle). Adding/removing a unit adds/removes tokens — the source of the architecture's count-invariance. The generator and its metrics call a structural unit a **limb** (one start token + its content tokens); a limb is *present* iff its start token has ≥1 committed content token, independent of segment count — so a limb count never double-counts hip+ankle. The ant instance of a limb is a leg; the env/morphology **build** API stays "leg" (it builds the ant's physical legs), while the generator/metric layer says "limb".
 
 **Leg transformer**:
 The architecture: a transformer encoder over body-part tokens, shared across morphologies because legs are tokens rather than fixed input slots. `LegTransformer(n_legs)`. The 8-leg / 3-layer instance is its multi-morphology config.
@@ -77,7 +77,7 @@ Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)
 
 ## Generation (morphology generator)
 
-The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in `temp/codesign_single_network_plan.md` and the **Codesign heads/tokens** sections above (the single-network design), not here.
+The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in `temp/codesign_single_network_plan.md` and the **Codesign heads/tokens** sections above (the single-network design), not here. How to read the run's TensorBoard metrics + debug the algorithm from them: [`docs/codesign_metrics.md`](../docs/codesign_metrics.md).
 
 **Morphology generator** (generator):
 A **sequential, token-at-a-time** policy that emits the ant's designed morphology one slot at a time, trained by **policy-gradient** on the **control reward** — a body is good if the controller earns high return on it. It shares the **control trunk** (single network: GenAct + GenCrit heads alongside ContAct + ContCrit); each leg slot is decided in **randomized order**, conditioned on the already-committed tokens. Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.
