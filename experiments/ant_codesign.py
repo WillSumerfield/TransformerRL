@@ -27,19 +27,20 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-SCRIPT = "scripts/train_ant_codesign.py"
-RUN = "runs/ant_codesign/codesign_transformer/{name}"   # name = report_s{seed}
+SCRIPT = "scripts/train_ant_codesign_single.py"
+RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = report_s{seed}
 _LEGS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]    # leg slots 1..8 (compass codes)
 CURVE_TAGS = (
     [f"gen_p/{l}" for l in _LEGS]                          # per-leg built rate (gate)
     + [f"gen_marg/{l}" for l in _LEGS]                     # per-leg marginal value (headline)
     + ["built/mean_legcount", "gen/entropy", "gen/fraction",
-       "gen/R_mean", "gen/value_R_corr", "gen/vloss",      # body quality R + v-vs-R fit
-       "rewards/step",                                     # control skill (mean reward, all bodies)
-       "v1/v1_s0", "v1/episode_return", "v1/calibration_gap"]   # R-unbiasedness calibration
+       "gen/R_mean", "gen/value_R_corr",                   # body quality R + v-vs-R fit
+       "gen/vloss_prefix", "gen/vloss_rollout",            # GenCrit/V1.0 fit (designed + rollout)
+       "gen/clone_kl", "gen/clone_crit_mse",               # control-preservation clone terms
+       "rewards/step"]                                     # control skill (mean reward, all bodies)
 )
 DATA_DIR = _ROOT / "data" / "ant_codesign"
-CONFIG = "configs/ppo_ant_codesign.yaml"
+CONFIG = "configs/ppo_ant_codesign_single.yaml"
 BASE_ENVS = 128             # eval envs for the base-morph rollout (averaged; reset-noise spread)
 EVAL_SEED = 123
 
