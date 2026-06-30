@@ -168,8 +168,9 @@ class LegTransformer(nn.Module):
         x = torch.cat([cls, start, content], dim=1)            # (M,1+3n,d)
         x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids)
 
-        mode_slot = torch.where(committed_on, committed_on.new_full((), _MODE_COMMITTED),
-                                committed_on.new_full((), _MODE_STOP)).long()    # (M,n)
+        # NB: build the long mode ids by arithmetic, NOT new_full(committed_on) -- committed_on is
+        # bool, so new_full would cast both _MODE_* (1 and 2) to True and erase committed-vs-stop.
+        mode_slot = committed_on.long() * _MODE_COMMITTED + committed_stop.long() * _MODE_STOP
         mode_ids = mode_slot.repeat(1, 2)                      # hip then ankle share slot mode (M,2n)
         mode = torch.cat([x.new_zeros(M, 1 + n, d), self.mode_emb(mode_ids)], dim=1)
         pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool),
