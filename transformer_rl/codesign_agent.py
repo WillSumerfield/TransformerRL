@@ -65,6 +65,11 @@ class CodesignAgent(LoggingA2CAgent):
         self._gencrit_coef = cd.get('gencrit_coef', 0.5)   # weight on the V1.0 fit (prefixes+rollout)
         self._beta = cd.get('beta', 1.0)                   # control-actor KL clone
         self._lam = cd.get('lam', 1.0)                     # control-critic MSE clone
+        # GenCrit/V1.0 regresses to R; scale R by the reward shaper (same O(1) scale the control
+        # critic fits) so the value fit + marginal advantage aren't swamped by raw-return magnitude.
+        _shaper = self.config.get('reward_shaper', None)    # rl_games swaps the dict for the shaper obj
+        self._r_scale = float(_shaper['scale_value'] if isinstance(_shaper, dict)
+                              else getattr(_shaper, 'scale_value', 1.0))
 
         # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
         self._cur_presence = self._base_row.expand(N, _N_LEGS).clone()
@@ -232,7 +237,7 @@ class CodesignAgent(LoggingA2CAgent):
             return
 
         N = env.total_num_envs
-        R = self._window_Ri()                               # true body return over the window
+        R = self._window_Ri() * self._r_scale               # true body return, scaled to control units
         obses = self.experience_buffer.tensor_dict['obses']  # (H,N,obs) rollout-state sample
         phase = 'pretrain' if self._in_pretrain() else 'rl'  # regime of the update just performed
         self._resample_update(R, obses)
