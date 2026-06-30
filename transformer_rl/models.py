@@ -15,17 +15,11 @@ _DYN_OBS_TOTAL = DYN_OBS_DIM + DYN_LEN_DIM + DYN_MASK_DIM  # 139
 
 
 def _restore_mask_tail(normed, observation, normalize_input):
-    """Re-insert the raw {0,1} DOF mask (and the raw progress dim, if present) after normalization.
-
-    Uses fixed front offsets, not negative indexing, so it is robust to the optional trailing
-    progress dim appended for the V1.0 head (value_size==2): mask is [123:139], progress is [139].
-    """
+    """Re-insert the raw {0,1} DOF mask after normalization (fixed front offset [123:139])."""
     if normalize_input:
         normed = normed.clone()
         normed[..., _DYN_MASK_OFF:_DYN_MASK_OFF + DYN_MASK_DIM] = \
             observation[..., _DYN_MASK_OFF:_DYN_MASK_OFF + DYN_MASK_DIM]
-        if observation.shape[-1] > _DYN_OBS_TOTAL:   # progress dim present (V1.0 head)
-            normed[..., _DYN_OBS_TOTAL:] = observation[..., _DYN_OBS_TOTAL:]
     return normed
 
 
@@ -80,9 +74,9 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
             kwargs.pop('actions_num', None)
             kwargs.pop('input_shape', None)
             kwargs.pop('num_seqs', None)
-            value_size = kwargs.pop('value_size', 1)
+            kwargs.pop('value_size', None)               # single-net codesign: V1.0 is gencrit_head
             tc = params.get('transformer', {})
-            self.net = MultiMorphLegTransformer(value_size=value_size, **tc)
+            self.net = MultiMorphLegTransformer(**tc)
             self.log_std_param = nn.Parameter(torch.zeros(16))
 
         def forward(self, obs_dict):
@@ -121,10 +115,10 @@ class TransformerMaskedNorm(ModelA2CContinuousLogStd):
         def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
             obs_total = self.obs_shape[0] if isinstance(self.obs_shape, (tuple, list)) else self.obs_shape
-            assert obs_total in (_DYN_OBS_TOTAL, _DYN_OBS_TOTAL + 1), (
+            assert obs_total == _DYN_OBS_TOTAL, (
                 f"transformer_masked_a2c_logstd expects obs of {_DYN_OBS_TOTAL} "
                 f"(= {DYN_OBS_DIM} physical + {DYN_LEN_DIM} lengths + {DYN_MASK_DIM} mask), "
-                f"or {_DYN_OBS_TOTAL + 1} with the trailing V1.0 progress dim, got {obs_total}"
+                f"got {obs_total}"
             )
 
         def norm_obs(self, observation):

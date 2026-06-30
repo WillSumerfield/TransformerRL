@@ -42,7 +42,6 @@ class CodesignAgent(LoggingA2CAgent):
         net = self.model.a2c_network.net
         assert getattr(net, 'codesign_tokens', False), \
             "single-network codesign requires transformer.codesign_tokens=true"
-        assert not self._v1, "single-network codesign uses value_size==1 (V1.0 is gencrit_head)"
         cd = self.config.get('generator', {})
         dev = self.ppo_device
         N = self.num_actors * self.num_agents

@@ -33,7 +33,6 @@ class LegTransformer(nn.Module):
         ankle_dim: int = ANKLE_DIM,
         policy_head: bool = True,
         value_head: bool = True,
-        value_size: int = 1,
         codesign_tokens: bool = False,
     ):
         super().__init__()
@@ -41,7 +40,6 @@ class LegTransformer(nn.Module):
         self.tokenize_fn = _TOKENIZE[n_legs]
         self.has_policy_head = policy_head
         self.has_value_head = value_head
-        self.value_size = value_size
         self.codesign_tokens = codesign_tokens
 
         self.embed_torso = nn.Linear(torso_dim, d_model)
@@ -87,11 +85,7 @@ class LegTransformer(nn.Module):
             nn.init.zeros_(self.joint_head.weight)
             nn.init.zeros_(self.joint_head.bias)
         if value_head:
-            self.value_head = nn.Linear(d_model, 1)        # V0.98 (sole head when value_size==1)
-            if value_size == 2:
-                # legacy standalone-V1.0 head: torso feature + raw progress dim (kept for the
-                # standalone V1.0 experiment; the merged codesign path uses gencrit_head instead).
-                self.value_head_v1 = nn.Linear(d_model + 1, 1)
+            self.value_head = nn.Linear(d_model, 1)        # V0.98 (sole control critic)
 
         if codesign_tokens:
             # generator heads on the shared trunk (single-network codesign):
@@ -176,13 +170,6 @@ class LegTransformer(nn.Module):
         pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool),
                          ~decided.repeat(1, 2)], dim=1)        # mask pending content tokens (M,1+3n)
         return self.encoder(x + mode, src_key_padding_mask=pad)
-
-    @torch.no_grad()
-    def genvalue_live(self, obs: torch.Tensor) -> torch.Tensor:
-        """V1.0/GenCrit on live full-state tokens: encode the rollout obs, read CLS. (B,1)."""
-        torso, hip_tok, ankle_tok, active_mask = self.tokenize_fn(obs)
-        H = self._encode_codesign(torso, hip_tok, ankle_tok, active_mask, obs.shape[0])
-        return self.gencrit_head(H[:, 0])
 
     def codesign_forward(self, obs: torch.Tensor):
         """Live pass returning ContAct mu, ContCrit V0.98, and GenCrit/V1.0 in ONE trunk encode
@@ -278,13 +265,7 @@ class LegTransformer(nn.Module):
             torso_feat = x[:, 0, :]
             if detach_value:                               # single-net PPG policy phase:
                 torso_feat = torso_feat.detach()           # value grad stops at the trunk
-            v0 = self.value_head(torso_feat)               # V0.98
-            if self.value_size == 2:
-                progress = obs[:, -1:]                      # raw normalized progress (last obs dim)
-                v1 = self.value_head_v1(torch.cat([torso_feat, progress], dim=-1))  # V1.0
-                out['value'] = torch.cat([v0, v1], dim=-1)
-            else:
-                out['value'] = v0
+            out['value'] = self.value_head(torso_feat)     # V0.98
         return out
 
 

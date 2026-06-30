@@ -98,16 +98,6 @@ class PPGAgent(LoggingA2CAgent):
         self._adv_std = None
         self._morph_meta = None
         self._steps_since_resample = 0
-        # V1.0 body-quality head state (mirrors LoggingA2CAgent.__init__; _v1=False for parity)
-        self._v1 = self.value_size == 2
-        if self._v1:
-            self.gamma_v1 = self.config.get('gamma_v1', 1.0)
-            self.v1_coef = self.config.get('v1_coef', 0.5 * self.critic_coef)
-            self._gamma_vec = torch.tensor([self.gamma, self.gamma_v1], device=self.ppo_device)
-        self._c_loss_v098: list = []
-        self._c_loss_v1: list = []
-        self._ev_v098 = None
-        self._ev_v1 = None
 
         # PPG aux buffer: raw obs + raw V_targ across N_pi policy-phase iters
         n_total = self.ppg_n_pi * self.batch_size

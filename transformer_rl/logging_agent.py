@@ -17,14 +17,9 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from rl_games.common import a2c_common
-from rl_games.common.common_losses import default_critic_loss
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 
-
-def _explained_var(values, returns):
-    """1 - Var(returns - values)/Var(returns); ->1 = critic explains the return variance."""
-    return float(1.0 - (returns - values).var() / (returns.var() + 1e-8))
 
 # Leg slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
 # right = -Z, slot number increasing clockwise toward the right. See architectures/build_vsim.
@@ -47,18 +42,6 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
         self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
-        # --- codesign control V1.0 body-quality head (value_size==2, ADR-0012) ---------
-        # value_size==2 => col0 = V0.98 (actor's critic, today's path), col1 = V1.0 (gamma=1,
-        # trunc->0, time-aware). Per-dim gamma, dim-0-only actor advantage, split critic loss.
-        self._v1 = self.value_size == 2
-        if self._v1:
-            self.gamma_v1 = self.config.get('gamma_v1', 1.0)
-            self.v1_coef = self.config.get('v1_coef', 0.5 * self.critic_coef)
-            self._gamma_vec = torch.tensor([self.gamma, self.gamma_v1], device=self.ppo_device)
-        self._c_loss_v098: list = []  # per-minibatch, flushed per epoch
-        self._c_loss_v1: list = []
-        self._ev_v098 = None          # per-epoch (set in prepare_dataset)
-        self._ev_v1 = None
         # opt-in synced phase timing (config.timing); shared with PPGAgent. Off -> stock path.
         self._timing = self.config.get('timing', False)
         self._timings = {}
@@ -172,112 +155,15 @@ class LoggingA2CAgent(A2CAgent):
         self._morph_meta = None                 # morphs changed -> re-detect per-morph logging labels
         self._steps_since_resample = 0
 
-    # ---- V1.0 head: per-dim gamma returns, reward duplication, split critic loss ------
-
-    def env_step(self, actions):
-        obs, rewards, dones, infos = super().env_step(actions)
-        if self._v1:
-            # rl_games unsqueezes scalar rewards only for value_size==1; for value_size==2 we
-            # duplicate the single env reward into both value columns (both heads model the same R).
-            if rewards.dim() == 1:
-                rewards = rewards.unsqueeze(1)
-            if rewards.shape[1] == 1:
-                rewards = rewards.expand(-1, self.value_size)
-        return obs, rewards, dones, infos
-
-    def discount_values(self, fdones, last_extrinsic_values, mb_fdones, mb_extrinsic_values, mb_rewards):
-        if not self._v1:
-            return super().discount_values(fdones, last_extrinsic_values, mb_fdones,
-                                           mb_extrinsic_values, mb_rewards)
-        # Per-dim gamma: col0=V0.98 (self.gamma), col1=V1.0 (gamma_v1=1). tau shared; trunc->0 via
-        # the done mask (time_outs not exposed). gamma broadcasts over the value dim.
-        gamma = self._gamma_vec
-        lastgaelam = 0
-        mb_advs = torch.zeros_like(mb_rewards)
-        for t in reversed(range(self.horizon_length)):
-            if t == self.horizon_length - 1:
-                nextnonterminal = 1.0 - fdones
-                nextvalues = last_extrinsic_values
-            else:
-                nextnonterminal = 1.0 - mb_fdones[t + 1]
-                nextvalues = mb_extrinsic_values[t + 1]
-            nextnonterminal = nextnonterminal.unsqueeze(1)
-            delta = mb_rewards[t] + gamma * nextvalues * nextnonterminal - mb_extrinsic_values[t]
-            mb_advs[t] = lastgaelam = delta + gamma * self.tau * nextnonterminal * lastgaelam
-        return mb_advs
+    # ---- raw advantage scale logging (health/adv_*) ---------------------------------
 
     def prepare_dataset(self, batch_dict):
-        if not self._v1:
-            # Raw advantage scale, before rl_games normalizes it (mirrors a2c_common:1030,1038).
-            with torch.no_grad():
-                adv = (batch_dict['returns'] - batch_dict['values']).sum(dim=1)
-                self._adv_mean = adv.mean().item()
-                self._adv_std = adv.std().item()
-            return super().prepare_dataset(batch_dict)
-
-        # value_size==2: actor advantage from dim 0 (V0.98) ONLY; both return cols kept for the
-        # value loss (V1.0 isolated from the actor's policy gradient). Mirrors a2c_common.prepare_dataset
-        # (no rnn / central-value branches here) but slices the advantage to dim 0.
-        returns, values = batch_dict['returns'], batch_dict['values']
-        rnn_masks = batch_dict.get('rnn_masks', None)
-        raw_adv = returns - values                                   # (B, 2), raw-return units
+        # Raw advantage scale, before rl_games normalizes it (mirrors a2c_common:1030,1038).
         with torch.no_grad():
-            a0 = raw_adv[:, 0]
-            self._adv_mean, self._adv_std = a0.mean().item(), a0.std().item()
-            self._ev_v098 = _explained_var(values[:, 0], returns[:, 0])
-            self._ev_v1 = _explained_var(values[:, 1], returns[:, 1])
-        if self.normalize_value:
-            self.value_mean_std.train()
-            values = self.value_mean_std(values)
-            returns = self.value_mean_std(returns)
-            self.value_mean_std.eval()
-        advantages = raw_adv[:, 0]                                   # dim-0 only
-        if self.normalize_advantage:
-            if self.normalize_rms_advantage:
-                advantages = self.advantage_mean_std(advantages)
-            else:
-                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        dataset_dict = {
-            'old_values': values, 'old_logp_actions': batch_dict['neglogpacs'],
-            'advantages': advantages, 'returns': returns, 'actions': batch_dict['actions'],
-            'obs': batch_dict['obses'], 'dones': batch_dict['dones'],
-            'rnn_states': batch_dict.get('rnn_states', None), 'rnn_masks': rnn_masks,
-            'mu': batch_dict['mus'], 'sigma': batch_dict['sigmas'],
-        }
-        if self.use_action_masks:
-            dataset_dict['action_masks'] = batch_dict['action_masks']
-        self.dataset.update_values_dict(dataset_dict)
-
-    def calc_losses(self, actor_loss_func, old_action_log_probs_batch, action_log_probs, advantage,
-                    curr_e_clip, value_preds_batch, values, return_batch, mu, entropy, rnn_masks):
-        if not self._v1:
-            return super().calc_losses(actor_loss_func, old_action_log_probs_batch, action_log_probs,
-                                       advantage, curr_e_clip, value_preds_batch, values, return_batch,
-                                       mu, entropy, rnn_masks)
-        # Split the critic loss per value dim so V1.0 gets its own (smaller) coef while shaping the
-        # shared trunk. Mirrors a2c_continuous.calc_losses but with two weighted value terms.
-        a_loss = actor_loss_func(old_action_log_probs_batch, action_log_probs, advantage,
-                                 self.ppo, curr_e_clip)
-        cl = default_critic_loss(value_preds_batch, values, curr_e_clip, return_batch, self.clip_value)
-        cl0, cl1 = cl[:, 0:1], cl[:, 1:2]                           # (B,1) each
-        if self.bound_loss_type == 'regularisation':
-            b_loss = self.reg_loss(mu)
-        elif self.bound_loss_type == 'bound':
-            b_loss = self.bound_loss(mu)
-        else:
-            b_loss = torch.zeros(1, device=self.ppo_device)
-        losses, sum_mask = torch_ext.apply_masks(
-            [a_loss.unsqueeze(1), cl0, cl1, entropy.unsqueeze(1), b_loss.unsqueeze(1)], rnn_masks)
-        a_loss, cl0, cl1, entropy, b_loss = losses[0], losses[1], losses[2], losses[3], losses[4]
-        loss = (a_loss
-                + 0.5 * self.critic_coef * cl0
-                + 0.5 * self.v1_coef * cl1
-                - entropy * self.entropy_coef
-                + b_loss * self.bounds_loss_coef)
-        self._c_loss_v098.append(cl0.detach())
-        self._c_loss_v1.append(cl1.detach())
-        c_loss = cl0 + cl1                                          # combined, for stock c_loss logging
-        return loss, a_loss, c_loss, entropy, b_loss, sum_mask
+            adv = (batch_dict['returns'] - batch_dict['values']).sum(dim=1)
+            self._adv_mean = adv.mean().item()
+            self._adv_std = adv.std().item()
+        return super().prepare_dataset(batch_dict)
 
     def calc_gradients(self, input_dict):
         super().calc_gradients(input_dict)
@@ -335,52 +221,8 @@ class LoggingA2CAgent(A2CAgent):
                 w.add_scalar(k, v, frame)
             self._timings = {}
 
-        if self._v1:
-            self._log_v1_stats(w, frame)
-
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
-
-    # ---- V1.0 body-quality head diagnostics (value_size==2) -------------------------
-
-    @torch.no_grad()
-    def _log_v1_stats(self, w, frame):
-        """Stage-1 metrics 1-4: R trustworthiness, per-dim critic fit, gamma sanity, time-awareness.
-        Values are buffered denorm (shaped-reward units); compared to shaped episode return."""
-        eb = self.experience_buffer.tensor_dict
-        obses, vals = eb['obses'], eb['values']        # (H,B,obs), (H,B,2)
-        prog = obses[..., -1]                            # raw progress in [0,1)
-        v098, v1 = vals[..., 0], vals[..., 1]
-
-        # (3) gamma sanity: V1.0 (gamma=1) should sit above V0.98 (gamma=0.98) in magnitude.
-        w.add_scalar('v1/v098_mean', v098.mean().item(), frame)
-        w.add_scalar('v1/v1_mean', v1.mean().item(), frame)
-
-        # (1) R trustworthiness: V1.0(s0) vs mean (shaped) episode return + calibration gap.
-        s0 = prog == 0
-        if s0.any():
-            v1s0 = v1[s0].mean().item()
-            ret = self.game_shaped_rewards.get_mean()
-            ret = float(ret.mean()) if hasattr(ret, 'mean') else float(ret)
-            w.add_scalar('v1/v1_s0', v1s0, frame)
-            w.add_scalar('v1/episode_return', ret, frame)
-            w.add_scalar('v1/calibration_gap', v1s0 - ret, frame)  # persistent +gap = trunc-bootstrap leak
-
-        # (4) time-awareness: V1.0 should fall from early to late in the episode.
-        first, last = v1[prog < 1.0 / 3], v1[prog > 2.0 / 3]
-        if first.numel() and last.numel():
-            w.add_scalar('v1/by_progress_first', first.mean().item(), frame)
-            w.add_scalar('v1/by_progress_last', last.mean().item(), frame)
-
-        # (2) per-dim critic fit: loss + explained variance.
-        if self._c_loss_v098:
-            w.add_scalar('v1/c_loss_v098', torch.stack(self._c_loss_v098).mean().item(), frame)
-            w.add_scalar('v1/c_loss_v1', torch.stack(self._c_loss_v1).mean().item(), frame)
-            self._c_loss_v098, self._c_loss_v1 = [], []
-        if self._ev_v098 is not None:
-            w.add_scalar('v1/explained_var_v098', self._ev_v098, frame)
-            w.add_scalar('v1/explained_var_v1', self._ev_v1, frame)
-            self._ev_v098 = self._ev_v1 = None
 
     # ---- per-morphology performance (multi-morph AntMultiMorphEnv only) -------------
 
