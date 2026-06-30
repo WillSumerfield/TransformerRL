@@ -33,7 +33,8 @@ _LEGS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]    # leg slots 1..8 (compas
 CURVE_TAGS = (
     [f"gen_p/{l}" for l in _LEGS]                          # per-leg built rate (gate)
     + [f"gen_marg/{l}" for l in _LEGS]                     # per-leg marginal value (headline)
-    + ["built/mean_legcount", "built/generated", "built/sampled", "gen/entropy", "gen/fraction",
+    + ["built/mean_legcount", "built/generated", "built/sampled", "built/legcount_variance",
+       "gen/entropy", "gen/fraction",
        "gen/R_mean", "gen/value_R_corr",                   # body quality R + v-vs-R fit
        "gen/vloss_prefix", "gen/vloss_rollout",            # GenCrit/V1.0 fit (designed + rollout)
        "gen/clone_kl", "gen/clone_crit_mse",               # control-preservation clone terms

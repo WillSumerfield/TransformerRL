@@ -290,7 +290,9 @@ class CodesignAgent(LoggingA2CAgent):
         if self._gen_fraction() < 1.0:
             w.add_scalar('built/sampled', self._cur_presence.sum(1).mean().item(), frame)
         if self._cur_trace is not None:
-            w.add_scalar('built/generated', self._cur_trace['presence'].sum(1).mean().item(), frame)
+            legc = self._cur_trace['presence'].sum(1)         # per-env generated leg count
+            w.add_scalar('built/generated', legc.mean().item(), frame)
+            w.add_scalar('built/legcount_variance', legc.var().item(), frame)  # body-size diversity (collapse canary)
         if 'marg' in self._gen_log:                        # per-leg marginal value (RL phase only)
             marg = self._gen_log['marg']
             for i in range(_N_LEGS):
