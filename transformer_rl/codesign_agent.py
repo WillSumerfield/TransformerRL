@@ -93,12 +93,11 @@ class CodesignAgent(LoggingA2CAgent):
         obs, rewards, dones, infos = super().env_step(actions)
         r = rewards if rewards.dim() == 1 else rewards[:, 0]   # raw per-env reward (value_size==1)
         self._ep_ret += r
-        d = dones.bool()
-        if d.any():
-            idx = d.nonzero(as_tuple=False).squeeze(-1)
-            self._win_ret_sum.index_add_(0, idx, self._ep_ret[d])
-            self._win_ret_cnt.index_add_(0, idx, torch.ones_like(idx, dtype=torch.float32))
-            self._ep_ret[d] = 0.0
+        # flush completed episodes fully vectorized -- NO `if d.any()` host sync per rollout step.
+        df = dones.float()
+        self._win_ret_sum += self._ep_ret * df                # add ep return for done envs
+        self._win_ret_cnt += df
+        self._ep_ret = self._ep_ret * (1.0 - df)              # reset done envs
         return obs, rewards, dones, infos
 
     @torch.no_grad()
