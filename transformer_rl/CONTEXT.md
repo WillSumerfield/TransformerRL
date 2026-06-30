@@ -45,6 +45,36 @@ The default PPG control agent: a **policy net** and a separate **value net** wit
 One network with a policy head and a value head on a **shared trunk**, recovering dual-net's 2× memory. Policy/value interference is managed by **gradient detach**, not by splitting the net: in the policy phase the value gradient is detached at the trunk (value head trains, trunk doesn't move from it); in the aux phase the value gradient flows through the whole net. No aux head — the value head *is* both critic and distill target. Selected by `ppg.shared_trunk`.
 _Avoid_: "merged net" / "joint net" — say single-network or shared-trunk.
 
+## Codesign heads (single-network)
+
+Generalized roles, used when control and generator live on **one network** as four heads. _Actor_ = any head that emits **actions**; _critic_ = any head that **predicts value**. Both the control policy and the generator have an actor and a critic.
+
+**ContAct** — control **actor**: emits per-DOF **actions** for the current body. Trained per rollout (PPO).
+**ContCrit** — control **critic**: the **V0.98** value head driving ContAct's advantages (γ=0.98). Trained per rollout.
+**GenAct** — generator **actor**: emits **limb/stop** morphology tokens (sequential, random order). Trained per **resample**.
+**GenCrit** — generator **critic** = **the V1.0 body-quality head, merged**. One value head, evaluable on **live** full-state tokens *and* on **partial designed-token prefixes**. Yields the marginal-value advantage `V1.0(prefix+token) − V1.0(prefix)`. Trained per **resample** (needs true returns).
+
+The merge: GenCrit and the old separate V1.0 head are now **one function**, not a distill pair. It's fit on two data sources toward the same body-quality target — rollout states (per-step return-to-go) and generation-token prefixes (toward the body's realized `R`). At resample the trunk learns **only** the generator side (GenAct + GenCrit/V1.0); **both** control heads are held by a clone term — **KL[ContAct_old, ContAct]** for the actor, **MSE(ContCrit, ContCrit_old)** for the critic. Per-step, control trains as **plain combined PPO** (trunk moves freely).
+
+## Codesign tokens (single-network)
+
+The merged net's leg-token vocabulary, spanning both reading **modes** (the net reads a real body vs a blueprint).
+
+**Live token** / **live mode**:
+A content token (hip/ankle) carrying **physical state** (pos/vel/sensors/last-action) — what the net reads during control rollout. _Reading the net in **live mode**_ = scoring a real, running body.
+
+**Designed token** / **design mode**:
+A content token carrying **morphology only** (segment length + leg encoding), **no physical state** — what the net reads during the generation pass. _Reading the net in **design mode**_ = scoring a blueprint (possibly partial).
+
+**Mode one-hot**:
+A per-content-token field marking its mode: **live / committed / stop**. **committed** = an on (limb) slot in design mode; **stop** = a slot decided off; **live** = a real leg in rollout. Replaces overloading zeros (a zeroed token used to mean *inactive leg*, which collided with *designed* and *off*).
+
+**Start token**:
+A **persistent** per-slot anchor (one per leg slot), distinct from the content token. Two jobs: (1) in design mode it's where **GenAct** reads the on/stop decision for that slot; (2) it survives into **live** mode to tell **ContAct** which limb slots exist (the attachment point — basis for the deferred multi-segment "generate-from an on-token" extension). It is **never replaced**; the slot's *content* token is what turns committed/live/stop.
+
+**CLS token** (= the **torso** root token, reused):
+Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)` is its design-mode readout over committed tokens (pending slots are simply **absent/masked**, not tokens).
+
 ## Generation (morphology generator)
 
 The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in the Phase-3 plan + [ADR-0012](../docs/adr/0012-codesign-generator-sequential-token-ppg.md), not here.
