@@ -203,9 +203,14 @@ class CodesignAgent(LoggingA2CAgent):
                     logs[k].append(val.detach())
 
         self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
-        if not pretrain:
+        if not pretrain:                                   # RL: built body == generated (ramp off)
             self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions)
             self._gen_log['value_R_corr'] = self._value_R_corr(self._cur_trace['v_states'][:, -1], R)
+            rank, ev, K = self._body_value_metrics(self._cur_trace['presence'],
+                                                   self._cur_trace['v_states'][:, -1], R)
+            self._gen_log['value_rank_corr'] = rank       # denoised Spearman (NaN if <5 bodies)
+            self._gen_log['value_ev'] = ev                # denoised per-body explained variance
+            self._gen_log['n_distinct_bodies'] = float(K)
 
     @torch.no_grad()
     def _slot_marginal(self, raw_adv, slots, actions):
@@ -223,6 +228,38 @@ class CodesignAgent(LoggingA2CAgent):
         if v_full.std() < 1e-8 or R.std() < 1e-8:
             return float('nan')
         return torch.corrcoef(torch.stack([v_full, R]))[0, 1].item()
+
+    @staticmethod
+    @torch.no_grad()
+    def _body_value_metrics(presence, v_full, R):
+        """Denoised body-quality fit: group envs by distinct body, then compare the generator's
+        v(full) to each body's MEAN R (removes reset noise). Returns (rank_corr, ev, n_bodies):
+          rank_corr = Spearman over bodies (NaN if <5 -> unreliable); spread/scale-robust.
+          ev        = 1 - Var(meanR - v)/Var(meanR) over bodies (NaN if <2).
+        Valid only when built==generated (RL phase), where R matches the generated body."""
+        dev = R.device
+        bits = (presence > 0).long()
+        body_id = (bits * (2 ** torch.arange(_N_LEGS, device=dev))).sum(1)
+        _, inv = body_id.unique(return_inverse=True)
+        K = int(inv.max().item()) + 1
+        cnt = torch.zeros(K, device=dev).index_add_(0, inv, torch.ones_like(R))
+        meanR = torch.zeros(K, device=dev).index_add_(0, inv, R) / cnt
+        meanv = torch.zeros(K, device=dev).index_add_(0, inv, v_full) / cnt
+        ev = float('nan')
+        if K >= 2 and meanR.var(unbiased=False) > 1e-8:
+            ev = (1.0 - (meanR - meanv).var(unbiased=False) / meanR.var(unbiased=False)).item()
+        # rank needs >=5 bodies AND real spread in both (a constant v -> meaningless tie-broken ranks)
+        rank = (CodesignAgent._spearman(meanv, meanR)
+                if K >= 5 and meanv.std() > 1e-8 and meanR.std() > 1e-8 else float('nan'))
+        return rank, ev, K
+
+    @staticmethod
+    @torch.no_grad()
+    def _spearman(x, y):
+        rx = x.argsort().argsort().float(); ry = y.argsort().argsort().float()
+        rx = rx - rx.mean(); ry = ry - ry.mean()
+        denom = rx.norm() * ry.norm()
+        return float('nan') if denom < 1e-8 else float((rx * ry).sum() / denom)
 
     # ---- window boundary: update generator, then sample + build next window ----------
     def _maybe_resample(self):
@@ -302,6 +339,12 @@ class CodesignAgent(LoggingA2CAgent):
             c = self._gen_log['value_R_corr']
             if c == c:
                 w.add_scalar('gen/value_R_corr', c, frame)
+            # denoised, diversity-robust replacements (skip NaN: rank needs >=5 bodies, ev >=2)
+            w.add_scalar('gen/n_distinct_bodies', self._gen_log['n_distinct_bodies'], frame)
+            for key, tag in (('value_rank_corr', 'gen/value_rank_corr'), ('value_ev', 'gen/value_ev')):
+                val = self._gen_log[key]
+                if val == val:
+                    w.add_scalar(tag, val, frame)
         if self._last_R is not None:
             w.add_scalar('gen/R_mean', self._last_R.mean().item(), frame)
         self._gen_log = None
