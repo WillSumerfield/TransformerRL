@@ -3,10 +3,10 @@
 Adds, per epoch, on top of rl_games' built-ins (enable via use_diagnostics=True,
 which gives diagnostics/exp_var, diagnostics/clip_frac/*, diagnostics/rms_value/*):
 
-    policy/sigma_{mean,min,max}  exploration std = exp(log_std); min is the log_std-collapse canary
-    policy/action_sat            frac of *active* mean-action dims pinned at the tanh rail (|mu|>0.99)
-    health/grad_norm             total grad norm BEFORE clipping (clip_grad_norm_ return)
-    health/adv_{mean,std}        raw advantage (returns-values) BEFORE normalization -> true scale
+    control/sigma_{mean,min,max} exploration std = exp(log_std); min is the log_std-collapse canary
+    control/action_sat           frac of *active* mean-action dims pinned at the tanh rail (|mu|>0.99)
+    control/grad_norm            total grad norm BEFORE clipping (clip_grad_norm_ return)
+    control/adv_{mean,std}       raw advantage (returns-values) BEFORE normalization -> true scale
 
 Registered globally over 'a2c_continuous' in train_utils, so every continuous PPO
 run (transformer or MLP) gets these. Metrics are generic; nothing transformer-specific.
@@ -201,19 +201,19 @@ class LoggingA2CAgent(A2CAgent):
         if isinstance(logstd, torch.nn.Parameter):
             with torch.no_grad():
                 sigma = torch.exp(logstd.detach())
-            w.add_scalar('policy/sigma_mean', sigma.mean().item(), frame)
-            w.add_scalar('policy/sigma_min', sigma.min().item(), frame)
-            w.add_scalar('policy/sigma_max', sigma.max().item(), frame)
+            w.add_scalar('control/sigma_mean', sigma.mean().item(), frame)
+            w.add_scalar('control/sigma_min', sigma.min().item(), frame)
+            w.add_scalar('control/sigma_max', sigma.max().item(), frame)
 
         if self._grad_norms:
-            w.add_scalar('health/grad_norm', sum(self._grad_norms) / len(self._grad_norms), frame)
+            w.add_scalar('control/grad_norm', sum(self._grad_norms) / len(self._grad_norms), frame)
             self._grad_norms = []
         if self._action_sats:
-            w.add_scalar('policy/action_sat', sum(self._action_sats) / len(self._action_sats), frame)
+            w.add_scalar('control/action_sat', sum(self._action_sats) / len(self._action_sats), frame)
             self._action_sats = []
         if self._adv_mean is not None:
-            w.add_scalar('health/adv_mean', self._adv_mean, frame)
-            w.add_scalar('health/adv_std', self._adv_std, frame)
+            w.add_scalar('control/adv_mean', self._adv_mean, frame)
+            w.add_scalar('control/adv_std', self._adv_std, frame)
             self._adv_mean = self._adv_std = None
 
         if self._timings:
