@@ -23,14 +23,14 @@ from rl_games.algos_torch.a2c_continuous import A2CAgent
 
 # Leg slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
 # right = -Z, slot number increasing clockwise toward the right. See architectures/build_vsim.
-_LEG_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
+_LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
 _LEADERBOARD_EVERY = 50  # epochs
 _LEADERBOARD_K = 5       # top-k and bottom-k
 
 
 def _morph_label(legs) -> str:
     """frozenset/list of leg slots -> compass-coded label, e.g. {2,4,6,8} -> 'FR.BR.BL.FL'."""
-    return "·".join(_LEG_CODE[n] for n in sorted(legs))
+    return "·".join(_LIMB_CODE[n] for n in sorted(legs))
 
 
 class LoggingA2CAgent(A2CAgent):

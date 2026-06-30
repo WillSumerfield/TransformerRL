@@ -25,11 +25,11 @@ os.environ.setdefault("SDL_VIDEO_X11_WMCLASS", "vsim_render")
 # Title/class fragments used to identify the vsim render window.
 _VSIM_WINDOW_TITLES = ["vsim_render", "vsim", "vlearn"]
 
-_LEG_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
+_LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
 
 
 def _morph_label(legs) -> str:
-    return "·".join(_LEG_CODE[n] for n in sorted(legs))
+    return "·".join(_LIMB_CODE[n] for n in sorted(legs))
 
 
 class _PlayLimiter:

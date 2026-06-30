@@ -29,16 +29,18 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 SCRIPT = "scripts/train_ant_codesign_single.py"
 RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = report_s{seed}
-_LEGS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]    # leg slots 1..8 (compass codes)
+_LIMBS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]   # limb slots 1..8 (compass codes)
 CURVE_TAGS = (
-    [f"gen_p/{l}" for l in _LEGS]                          # per-leg built rate (gate)
-    + [f"gen_marg/{l}" for l in _LEGS]                     # per-leg marginal value (headline)
-    + ["built/mean_legcount", "built/generated", "built/sampled", "built/legcount_variance",
-       "gen/entropy", "gen/fraction",
-       "gen/R_mean", "gen/value_R_corr",                   # body quality R + v-vs-R fit (raw)
-       "gen/value_rank_corr", "gen/value_ev", "gen/n_distinct_bodies",  # denoised, diversity-robust
-       "gen/vloss_prefix", "gen/vloss_rollout",            # GenCrit/V1.0 fit (designed + rollout)
-       "gen/clone_kl", "gen/clone_crit_mse",               # control-preservation clone terms
+    [f"build/p/{l}" for l in _LIMBS]                       # per-limb built rate (gate)
+    + [f"gen/marg/{l}" for l in _LIMBS]                    # per-limb marginal value (headline)
+    + [f"quality/by_limbcount/{k}" for k in range(1, 9)]   # reward by limb count (the hypothesis)
+    + ["build/limbcount", "build/limbcount_realized",      # generator intent vs realized vs around-base
+       "build/limbcount_base", "build/limbcount_var", "build/n_distinct",
+       "gen/actor_loss", "gen/entropy", "gen/grad_norm", "gen/fraction",
+       "gencrit/loss_prefix", "gencrit/loss_rollout",      # GenCrit/V1.0 fit, scale-free (MSE/Var(R))
+       "gencrit/value_rank_corr", "gencrit/value_ev",      # denoised, diversity-robust calibration
+       "quality/R_mean", "quality/R_std",                  # body-quality outcome (the target)
+       "clone/actor_kl", "clone/critic_mse",               # control-preservation clone terms
        "rewards/step"]                                     # control skill (mean reward, all bodies)
 )
 DATA_DIR = _ROOT / "data" / "ant_codesign"
@@ -91,7 +93,7 @@ def aggregate_curves(seeds):
             out[key + "__val"] = np.array([s.value for s in sc], dtype=np.float32)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(DATA_DIR / "curves.npz",
-                        seeds=np.array(seeds), legs=np.array(_LEGS), **out)
+                        seeds=np.array(seeds), limbs=np.array(_LIMBS), **out)
     print(f"[codesign] curves -> {DATA_DIR / 'curves.npz'} ({len(out) // 2} series)")
 
 

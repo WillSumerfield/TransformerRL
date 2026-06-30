@@ -21,10 +21,10 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 
 from .architectures import _GEN_ON, _GEN_STOP
-from .logging_agent import LoggingA2CAgent, _LEG_CODE
+from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 from .tokenize import OBS_DIM_8, LEN_DIM_8
 
-_N_LEGS = 8
+_N_LIMBS = 8
 _MASK_OFF = OBS_DIM_8 + LEN_DIM_8           # DOF mask at obs[123:139]
 
 
@@ -51,9 +51,9 @@ class CodesignAgent(LoggingA2CAgent):
         flip = float(cd.get('desirable_flip_prob', 0.10))
         bset = set(self._base_legs)
         self._base_toggle_p = torch.tensor(
-            [(1.0 - flip) if (i + 1) in bset else flip for i in range(_N_LEGS)], device=dev)
+            [(1.0 - flip) if (i + 1) in bset else flip for i in range(_N_LIMBS)], device=dev)
         self._base_row = torch.tensor(
-            [1.0 if (i + 1) in bset else 0.0 for i in range(_N_LEGS)], device=dev)
+            [1.0 if (i + 1) in bset else 0.0 for i in range(_N_LIMBS)], device=dev)
 
         # generator hyperparameters (shared optimizer; the heads live on self.model)
         self._n_pretrain = cd.get('n_pretrain', 8)
@@ -71,7 +71,7 @@ class CodesignAgent(LoggingA2CAgent):
                               else getattr(_shaper, 'scale_value', 1.0))
 
         # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
-        self._cur_presence = self._base_row.expand(N, _N_LEGS).clone()
+        self._cur_presence = self._base_row.expand(N, _N_LIMBS).clone()
         self._cur_trace = None                             # last sample() trace (RL update input)
         self._base_draw = None                             # last base+-flip ramp draws (pretrain)
         self._gen_window = 0
@@ -90,7 +90,7 @@ class CodesignAgent(LoggingA2CAgent):
         return self.model.a2c_network.net
 
     def _log_std(self, obs):
-        mask = (obs[..., _MASK_OFF:_MASK_OFF + 2 * _N_LEGS] > 0).float()
+        mask = (obs[..., _MASK_OFF:_MASK_OFF + 2 * _N_LIMBS] > 0).float()
         return mask * self.model.a2c_network.log_std_param
 
     # ---- accumulate true episode returns (R_i, gamma=1) over the window ----------------
@@ -123,7 +123,7 @@ class CodesignAgent(LoggingA2CAgent):
             self._base_draw = None                         # RL phase: pure gen samples, no base draws
             return presence
         N = presence.shape[0]
-        base = torch.bernoulli(self._base_toggle_p.expand(N, _N_LEGS))
+        base = torch.bernoulli(self._base_toggle_p.expand(N, _N_LIMBS))
         base[base.sum(1) == 0] = self._base_row            # >=1-leg guard for base draws
         self._base_draw = base                             # the around-base samples (build/limbcount_base)
         use_gen = (torch.rand(N, device=presence.device) < frac).unsqueeze(1)
@@ -144,7 +144,7 @@ class CodesignAgent(LoggingA2CAgent):
         # H*N can be ~65k states -> a single trunk pass OOMs at scale (storing the result is cheap).
         with torch.no_grad():
             ls_old = self._log_std(obs_flat)
-            mu_old = obs_flat.new_empty(HN, 2 * _N_LEGS)
+            mu_old = obs_flat.new_empty(HN, 2 * _N_LIMBS)
             v098_old = obs_flat.new_empty(HN, 1)
             for s in range(0, HN, self.minibatch_size):
                 m, v, _ = net.codesign_forward(self.model.norm_obs(obs_flat[s:s + self.minibatch_size]))
@@ -153,7 +153,7 @@ class CodesignAgent(LoggingA2CAgent):
 
         pretrain = self._in_pretrain()
         if pretrain:                                       # BC toward the built body, random order
-            order = torch.argsort(torch.rand(N, _N_LEGS, device=dev), dim=1)
+            order = torch.argsort(torch.rand(N, _N_LIMBS, device=dev), dim=1)
             pres = self._cur_presence
             act = torch.where(pres > 0, pres.new_full((), _GEN_ON),
                               pres.new_full((), _GEN_STOP)).long()
@@ -222,8 +222,8 @@ class CodesignAgent(LoggingA2CAgent):
     @torch.no_grad()
     def _slot_marginal(self, raw_adv, slots, actions):
         on = actions == _GEN_ON
-        marg = torch.full((_N_LEGS,), float('nan'), device=raw_adv.device)
-        for k in range(_N_LEGS):
+        marg = torch.full((_N_LIMBS,), float('nan'), device=raw_adv.device)
+        for k in range(_N_LIMBS):
             m = on & (slots == k)
             if m.any():
                 marg[k] = raw_adv[m].mean()
@@ -247,7 +247,7 @@ class CodesignAgent(LoggingA2CAgent):
         Valid only when built==generated (RL phase), where R matches the generated body."""
         dev = R.device
         bits = (presence > 0).long()
-        body_id = (bits * (2 ** torch.arange(_N_LEGS, device=dev))).sum(1)
+        body_id = (bits * (2 ** torch.arange(_N_LIMBS, device=dev))).sum(1)
         _, inv = body_id.unique(return_inverse=True)
         K = int(inv.max().item()) + 1
         cnt = torch.zeros(K, device=dev).index_add_(0, inv, torch.ones_like(R))
@@ -330,8 +330,8 @@ class CodesignAgent(LoggingA2CAgent):
 
         # --- build/: the body the generator produces ---
         rate = self._cur_presence.mean(0)                  # per-limb realized on-rate
-        for i in range(_N_LEGS):
-            w.add_scalar(f'build/p/{_LEG_CODE[i + 1]}', rate[i].item(), frame)
+        for i in range(_N_LIMBS):
+            w.add_scalar(f'build/p/{_LIMB_CODE[i + 1]}', rate[i].item(), frame)
         w.add_scalar('build/limbcount_realized', self._cur_presence.sum(1).mean().item(), frame)
         if self._base_draw is not None:                    # pretrain only: the around-base draws
             w.add_scalar('build/limbcount_base', self._base_draw.sum(1).mean().item(), frame)
@@ -348,10 +348,10 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('gen/grad_norm', g['gn'], frame)
         w.add_scalar('gen/fraction', self._gen_fraction(), frame)
         if 'marg' in g:                                    # per-limb marginal value (RL phase only)
-            for i in range(_N_LEGS):
+            for i in range(_N_LIMBS):
                 m = g['marg'][i].item()
                 if m == m:                                 # skip NaN slots (no `on` this window)
-                    w.add_scalar(f'gen/marg/{_LEG_CODE[i + 1]}', m, frame)
+                    w.add_scalar(f'gen/marg/{_LIMB_CODE[i + 1]}', m, frame)
 
         # --- gencrit/: GenCrit/V1.0 value-head fit (scale-free: MSE / Var(R)) ---
         rvar = max(g['R_var'], 1e-8)
