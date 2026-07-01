@@ -58,7 +58,7 @@ The update dominates because each collected sample is pushed through the net `mi
 with forward **+ backward**, against a simulator that costs ~1.8 µs/env/step (a tuned GPU physics
 kernel; host overhead already removed — see [group_count_throughput.md](group_count_throughput.md)).
 A consequence: **PPO wall-time is independent of morphology count** — the dominant term is batched
-net compute, blind to how many distinct bodies are in the batch (the network always pads to 8 legs /
+net compute, blind to how many distinct bodies are in the batch (the network always pads to 8 limbs /
 16 DOF and masks). So resampling more bodies never makes a step slower; it only adds rebuild stalls.
 
 ## Picking a cadence

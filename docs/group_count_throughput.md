@@ -10,18 +10,18 @@ first run 2026-06-01.
 
 vlearn's `EnvironmentGroup` is one vsim physics build shared by a batch of envs. This repo uses
 **one group per morphology** (see [ADR 0001](./adr/0001-environment-group-per-morphology.md)):
-real leg removal needs a distinct vsim body, so the adaptive ant runs 46 groups, the full ant up
+real limb removal needs a distinct vsim body, so the adaptive ant runs 46 groups, the full ant up
 to 131. A natural worry follows: does having many groups (each then holding fewer envs) hurt
 throughput, independent of the bodies themselves?
 
 To answer that in isolation we hold the **body fixed** — every group runs the *same* classic
-4-leg ant — and only vary the group count. So this measures the raw cost of group *granularity*,
+4-limb ant — and only vary the group count. So this measures the raw cost of group *granularity*,
 not of morphology diversity. (This deliberately breaks the "one group per morphology" convention;
 it's a benchmark, not a model of real use.)
 
 ## What was tested
 
-Both scripts take a fixed **4096 classic-ant envs** (legs at 45/135/225/315°) and slice them into
+Both scripts take a fixed **4096 classic-ant envs** (limbs at 45/135/225/315°) and slice them into
 N groups of `4096 / N` envs each, sweeping `N ∈ [1, 4, 16, 64, 256, 1024, 4096]`. For each N they
 run 20 warmup + 200 timed steps and report **throughput = total_envs × timed_steps / wall_seconds**
 (env-steps/s), with `torch.cuda.synchronize()` bracketing the timed block (vsim is async — without
@@ -109,7 +109,7 @@ The cost lives in `for g in groups:` loops, not vsim. Remove them in this order:
 3. **Alias uniform-width state into one global tensor.** Quantities that are the same width for
    every morphology (here, root pose/vel) live in a single `(N, …)` tensor; back each group's
    command with a contiguous **row-slice** (`wrap_gpu_buffer` accepts a tensor view). The batched
-   get then writes straight into the global tensor, and everything downstream (obs torso block,
+   get then writes straight into the global tensor, and everything downstream (obs root block,
    reward, reset bookkeeping) becomes a whole-tensor op.
 4. **Flatten ragged state and precompute a gather index.** Variable-width / permuted data (DOF and
    force-sensor values) can't share a rectangular tensor. Put every group's data end-to-end in one
@@ -125,7 +125,7 @@ The cost lives in `for g in groups:` loops, not vsim. Remove them in this order:
   reset) before and after; assert the obs/reward/term trajectory is unchanged. Catches index and
   aliasing bugs while resets fire. (Vectorizing the reset noise into one flat draw reorders the RNG
   stream, so only the noise-off trajectory is bit-identical — noise-on stays statistically equal.)
-- **Ragged cross-check.** With a mixed-leg-count morphology set, reconstruct the obs DOF/sensor
+- **Ragged cross-check.** With a mixed-limb-count morphology set, reconstruct the obs DOF/sensor
   regions independently from the flat buffers and compare — varying widths exercise the gather
   indices that a single-width set does not.
 - **If you try CUDA-graph capture: confirm physics actually advanced.** vsim's `gym.step` does not
