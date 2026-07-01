@@ -474,8 +474,11 @@ def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Pat
     alpha     = pc.get("ema_alpha", 0.3)
     poll_secs = pc.get("poll_seconds", 20)
     warmup    = pc.get("n_warmup_steps", 0)
-    window    = pc.get("score_window", 50)
-    score_mode = "recovered" if pruning else "max"  # ADR-0009: max objective when timing is tuned
+    window    = sc.get("score_window", pc.get("score_window", 50))
+    # ADR-0009: default max objective when timing is tuned (pruning off). A study may force a
+    # final-level objective even with pruning off via study.score_mode (e.g. "final" -> mean of
+    # the last `score_window` logged points) — used for sparse per-window metrics like quality/R_mean.
+    score_mode = sc.get("score_mode", "recovered" if pruning else "max")
 
     trial_cfg = deepcopy(base_cfg)
     for path, value in params.items():
