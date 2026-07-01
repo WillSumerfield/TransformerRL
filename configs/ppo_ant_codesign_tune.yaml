@@ -1,0 +1,56 @@
+# Codesign tuning base (proxy for scripts/tune.py, configs/tune_config.yaml). Identical to
+# ppo_ant_codesign_single.yaml EXCEPT: max_epochs trimmed to the 1200-epoch proxy (~19 resample
+# windows; with n_pretrain<=10 that leaves >=9 RL windows so the last-5-window objective always
+# lands in the RL phase), and checkpointing pushed past the proxy (tuner reads TB summaries only,
+# not .pth). The sweep overrides the tuned knobs per trial; the values here serve as trial-0
+# defaults. The real-run config (3000 epochs) stays untouched.
+env:
+  sample_morphs: true
+  base_legs: [1, 4, 6]
+
+params:
+  seed: 42
+
+  algo:
+    name: codesign_continuous
+
+  network:
+    transformer:
+      d_model: 160
+      n_heads: 8
+      n_layers: 1
+      ffn: 640
+      codesign_tokens: true
+
+  config:
+    num_actors: 4096
+    reward_shaper:
+      scale_value: 0.01
+    gamma: 0.98
+    tau: 0.95
+    learning_rate: 1.0e-3
+    kl_threshold: 0.0083
+    max_epochs: 1200          # proxy (real run = 3000); see header
+    save_best_after: 100000   # checkpointing off within the proxy (tuner uses TB only)
+    save_frequency: 100000
+    grad_norm: 1.45
+    entropy_coef: 0.0055
+    e_clip: 0.15
+    resample_interval: 1
+    horizon_length: 16
+    minibatch_size: 32768
+    mini_epochs: 4
+    critic_coef: 3.25
+    bounds_loss_coef: 0.0005
+
+    generator:
+      base_legs: [1, 4, 6]
+      desirable_flip_prob: 0.10
+      n_pretrain: 8
+      epochs: 4
+      minibatches: 4
+      clip: 0.2
+      entropy_coef: 0.01
+      gencrit_coef: 0.5
+      beta: 1.0
+      lam: 1.0
