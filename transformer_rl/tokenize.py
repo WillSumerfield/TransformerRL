@@ -1,7 +1,7 @@
 import math
 import torch
 
-TORSO_DIM = 11   # y(1) + quat(4) + linvel(3) + angvel(3)
+ROOT_DIM = 11   # y(1) + quat(4) + linvel(3) + angvel(3)
 HIP_DIM   = 5    # pos(1) + vel(1) + last_action(1) + sin(1) + cos(1)
 ANKLE_DIM = 11   # pos(1) + vel(1) + cfrc(6) + last_action(1) + sin(1) + cos(1)
 HIP_DIM_8   = 6  # 8-limb adds hip segment length
@@ -29,7 +29,7 @@ def _tokenize(obs, n_limbs, obs_dim, mask_dim, limb_enc, len_dim=0):
     B = obs.shape[0]
 
     n_dof     = 2 * n_limbs
-    torso     = obs[:, 0:11]
+    root     = obs[:, 0:11]
     dof_pos   = obs[:, 11 : 11 + n_dof]
     dof_vel   = obs[:, 11 + n_dof : 11 + 2 * n_dof]
     acts      = obs[:, 11 + 2 * n_dof : 11 + 3 * n_dof]
@@ -62,7 +62,7 @@ def _tokenize(obs, n_limbs, obs_dim, mask_dim, limb_enc, len_dim=0):
     ], dim=1)  # (B, n_limbs, ANKLE_DIM[+1])
 
     active_mask = (torch.cat([raw_mask[:, 0::2], raw_mask[:, 1::2]], dim=-1) > 0).float()  # (B, mask_dim)
-    return torso, hip_tokens, ankle_tokens, active_mask
+    return root, hip_tokens, ankle_tokens, active_mask
 
 
 def tokenize_4(obs):
