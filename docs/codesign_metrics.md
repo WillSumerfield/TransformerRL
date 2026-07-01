@@ -51,8 +51,21 @@ Subsystem-keyed. `<slot>` ∈ {F, FR, R, BR, B, BL, L, FL} (limb compass slots);
 |---|---|---|---|
 | `control/sigma_{mean,min,max}` | action std = exp(log_std) | mean ~0.3–1.0, slowly falling | `sigma_min`→0 = log_std collapse (dead exploration) |
 | `control/action_sat` | frac of active mean-action dims pinned at the tanh rail (\|μ\|>0.99) | < ~0.3 | →1 = saturated policy, often with collapsed sigma |
-| `control/grad_norm` | control update grad norm, pre-clip | stable, O(1–10) | spikes/blowup = LR or clone too aggressive |
+| `control/grad_norm` | control update grad norm, **pre-clip** (see note below) | any magnitude OK *if losses fall*; large is common & benign | large **and** rising `c_loss`/`gencrit/loss_*` = real divergence |
 | `control/adv_{mean,std}` | raw advantage scale, pre-normalization | std O(1), mean ~0 | std→0 = critic explains nothing / no learning signal |
+
+> **Reading grad norms (`control/grad_norm`, `gen/grad_norm`).** Both log the **pre-clip** total
+> norm (the value `clip_grad_norm_` returns), while the step is clipped to the `grad_norm` config
+> (0.5–2.0). Once `‖g‖ ≫ clip` the update is just `clip · g/‖g‖` — **pure direction, magnitude pinned
+> at the clip** — so a norm of 1500 and a norm of 15 take the *same-size* step. The metric measures
+> raw signal magnitude, **not** how far the weights moved; a large value is not instability. It even
+> *correlates with better `R`*: strong trials have large, informative gradients (clipping keeps them
+> safe), while weak trials have small ones (dead GenCrit, collapsed policy — little signal). The
+> resample step is a joint shared-trunk update (GenCrit MSE→`R` + control clone + GenAct) over few
+> samples, so `gen/grad_norm` genuinely spikes at window boundaries. Two consequences: (1) when
+> you're always clipped, the **clip is your real step-size**, not `learning_rate` (they're partly
+> redundant knobs); (2) judge health by the **losses**, not the norm — large norm + *falling*
+> `c_loss`/`gencrit/loss_*` + `value_rank_corr`>0 is fine; large norm + *rising* losses is a blowup.
 
 ### `build/` — the body the generator produces (per window)
 | metric | meaning | healthy | bad → likely cause |
@@ -69,7 +82,7 @@ Subsystem-keyed. `<slot>` ∈ {F, FR, R, BR, B, BL, L, FL} (limb compass slots);
 |---|---|---|---|
 | `gen/actor_loss` | GenAct PPO loss (BC NLL during pretrain) | finite, no blowup | NaN/blowup = advantage or LR problem |
 | `gen/entropy` | on/stop policy entropy | drops gradually toward 0 | →0 *fast* = premature collapse; pinned high = no learning |
-| `gen/grad_norm` | generator update grad norm, pre-clip | stable | spikes = unstable generator update |
+| `gen/grad_norm` | generator update grad norm, **pre-clip** (see note below) | large/spiky is **expected** (joint resample step, few samples) | large **and** `gencrit/loss_*` not falling = unstable fit |
 | `gen/fraction` | ramp progress (pretrain→RL) | 0→1 over `n_pretrain`, then 1 | (schedule) |
 | `gen/marg/<slot>` | **marginal value** v(prefix+limb)−v(prefix) for that limb (RL only) | useful limbs **>0**, detrimental **<0**, consistent across windows | all ≈0 = dead GenCrit; sign-flipping = noisy value |
 
@@ -125,7 +138,8 @@ encode/mode path, not the optimizer.
 
 ### 3. Control craters at resample
 **Looks like:** `rewards/step` drops at window boundaries (saw-tooth) · `clone/actor_kl` and/or
-`clone/critic_mse` spike at those boundaries · sometimes `control/grad_norm` spikes.
+`clone/critic_mse` spike at those boundaries. (A `control/grad_norm` spike alone is *not* a symptom —
+it's clipped away; see the grad-norm note in §2. Trust the reward saw-tooth + clone spikes.)
 **Means:** the shared-trunk generator update is dragging the controller off its policy.
 **Fix:** raise β (`beta`, actor KL clone) and/or λ (`lam`, critic MSE clone); reduce generator
 `epochs`/LR so the joint step perturbs the trunk less.
