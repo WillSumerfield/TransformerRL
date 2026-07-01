@@ -1,6 +1,6 @@
 # Context Map
 
-Research repo for **codesign**: jointly optimizing ant *morphology* and a transformer *control* policy. The transformer must generalize across morphologies so the controller keeps working as the body changes during codesign. Attention is the intended future bridge between the control policy and a (planned) generative morphology policy.
+Research repo for **codesign**: jointly optimizing a robot's *morphology* (currently an ant) and a transformer *control* policy. The transformer must generalize across morphologies so the controller keeps working as the body changes during codesign. Attention is the intended future bridge between the control policy and a (planned) generative morphology policy.
 
 ## Structure
 
@@ -18,15 +18,15 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 │   ├── CONTEXT.md
 │   ├── multigroup_environment.py
 │   └── ant_envs/
-│       ├── ant.py                    (classic 4-leg ant)
+│       ├── ant.py                    (classic 4-limb ant)
 │       ├── ant_multimorph.py         (multi-morphology base; full ant = all 131 stable)
 │       ├── ant_codesign.py           (codesign env; generator-driven bodies per resample)
-│       ├── build_vsim.py             (programmatic vsim per leg subset)
+│       ├── build_vsim.py             (programmatic vsim per limb subset)
 │       └── assets/
 ├── transformer_rl/                   ← Control context
 │   ├── CONTEXT.md
-│   ├── architectures.py              (LegTransformer, MultiMorphLegTransformer)
-│   ├── tokenize.py                   (obs → torso/hip/ankle tokens)
+│   ├── architectures.py              (LimbTransformer, MultiMorphLimbTransformer)
+│   ├── tokenize.py                   (obs → root/effector tokens)
 │   ├── models.py                     (rl_games model/network builders)
 │   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
@@ -55,10 +55,10 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 
 ## Relationships
 
-- **Morphology → Control**: Morphology emits a 139-D observation (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask); Control tokenizes it and reads the DOF mask to decide which leg tokens exist.
+- **Morphology → Control**: Morphology emits a 139-D observation (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask); Control tokenizes it and reads the DOF mask to decide which limb tokens exist.
 - **Control → Training**: Control registers networks/models with rl_games under names Training selects via config `model.name` / `network.name`.
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
-- **Shared kernel** (below): Morphology, Leg, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign — defined once here, used identically across all contexts.
+- **Shared kernel** (below): Robot, Morphology, Limb, Module, Root, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign, Task — defined once here, used identically across all contexts.
 
 ## Upstream — vlearn / VSim
 
@@ -77,30 +77,43 @@ Our local [`docs/vsim_geometry_api.md`](./docs/vsim_geometry_api.md) covers the 
 
 ## Shared Language
 
+**Robot**:
+The generic body being built and controlled — a **root** plus repeating **limbs**. "Robot" is the primary word in code and docs; **"ant" is reserved for env identity only** (the `Ant*` classes, env keys, `.vsim` assets, `ppo_ant*.yaml` configs, `train_ant_*.py` scripts). The ant is the current (only) robot instance. See [ADR-0014](docs/adr/0014-generalized-construction-vocabulary.md).
+
 **Codesign**:
-Jointly optimizing the ant's morphology and its transformer controller in one loop. The repo's end goal — **not yet implemented**; a generative morphology policy is planned to pair with the control policy. Reserve this word for that future loop; the present envs only *train a controller to generalize across* a fixed morphology set, which is the prerequisite.
+Jointly optimizing the robot's morphology and its transformer controller in one loop. The repo's end goal — **not yet implemented**; a generative morphology policy is planned to pair with the control policy. Reserve this word for that future loop; the present envs only *train a controller to generalize across* a fixed morphology set, which is the prerequisite.
 _Avoid_: using "codesign" for the multi-morphology env `AntMultiMorphEnv` (it does no codesign; see Morphology context)
 
 **Morphology** (morph):
-A specific ant body — which legs exist, where, and (full ant) each leg's hip/ankle segment lengths. Either drawn from a fixed enumerated set (classic ant) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
+A specific robot body — which limbs exist, where, and (full ant) each limb's module lengths (today two modules per limb: the ant's hip- and ankle-segment lengths). Either drawn from a fixed enumerated set (classic ant) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
 
-**Leg**:
-One ant appendage. Up to 8 legs, placed at multiples of 45° around the torso. Each leg has exactly 2 DOFs (a hip and an ankle).
-_Avoid_: limb
+**Limb** (was leg):
+One repeating appendage — a chain of **modules** attached to the root. Up to 8 limbs, placed at multiples of 45° around the ant's root. Today each limb has exactly 2 actuated modules (**effectors**) → 2 DOFs. Adding/removing a limb adds/removes tokens (the source of the architecture's count-invariance).
+_Avoid_: leg (retired), "structural unit"/"part-token" (retired generic glosses)
+
+**Module**:
+The physical body-part a generator **token** realizes: an actuated segment (**effector**), a passive segment (**link**), or a terminal (**cap**). The unit the generator minimizes (Phase 3). Detailed token-type vocabulary lives in [Control](./transformer_rl/CONTEXT.md).
+_Avoid_: segment (retired for module)
+
+**Root** (was torso):
+The single non-repeating body token = the **CLS** aggregator; its encoder output feeds the value heads. The ant's root is its central torso body (the sole surviving use of "torso": a physical-build name).
 
 **DOF**:
-One actuated joint — a hip or an ankle. 2 per leg, 16 max. The unit of action and of the DOF mask.
-_Avoid_: limb, joint (informal only)
+One actuated joint. 2 per limb today (the ant's two effectors), 16 max. The unit of action and of the DOF mask.
+_Avoid_: joint (informal only)
 
 **Active / Inactive**:
-A leg or DOF is *active* if it exists in the current morphology, *inactive* if it's a padded-out slot (always padded to 8 legs / 16 DOFs). Inactive actions are zeroed; inactive DOF values are 0.
+A limb or DOF is *active* if it exists in the current morphology, *inactive* if it's a padded-out slot (always padded to 8 limbs / 16 DOFs). Inactive actions are zeroed; inactive DOF values are 0.
 
 **Stable morphology**:
-A morphology that is dynamically viable as a walker: ≥3 legs and no circular gap between adjacent legs > 135°.
+A morphology that is dynamically viable as a walker: ≥3 limbs and no circular gap between adjacent limbs > 135°.
 
 **DOF mask**:
 The 16-bit `{0,1}` vector (obs `[123:139]`) marking which DOFs are active. Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.
-_Avoid_: limb_mask (old code identifier; per-DOF not per-leg), bare "mask"
+_Avoid_: limb_mask (old code identifier; per-DOF not per-limb), bare "mask"
 
 **EnvironmentGroup** (group):
-vlearn's unit of one vsim build shared by a batch of envs. The repo uses one group per morphology, since real leg removal needs a distinct vsim per body.
+vlearn's unit of one vsim build shared by a batch of envs. The repo uses one group per morphology, since real limb removal needs a distinct vsim per body.
+
+**Task**:
+The objective/reward a robot is optimized for, independent of the robot. The current task is **Locomotion** (forward velocity); **cube-pickup** and **knob-rotation** are reserved (Phase 7). An env instantiates one Task on one robot. Env class/key renames by task are deferred to Phase 7.

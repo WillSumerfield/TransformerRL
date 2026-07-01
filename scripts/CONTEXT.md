@@ -1,6 +1,6 @@
 # Training
 
-PPO training, Optuna tuning, and play/render/test orchestration for the leg transformer over the ant envs. Owns `scripts/` and `configs/`. Each `train_ant_*.py` pairs with a `configs/ppo_*.yaml`; configs select the registered network/model by name and the env by `env_name`.
+PPO training, Optuna tuning, and play/render/test orchestration for the limb transformer over the ant envs. Owns `scripts/` and `configs/`. Each `train_ant_*.py` pairs with a `configs/ppo_*.yaml`; configs select the registered network/model by name and the env by `env_name`.
 
 ## Language
 
@@ -24,7 +24,7 @@ In `test` mode: episodes per env slot to collect (default 10). In `play` mode: s
 Optional parameter to `run_training`. When provided, enables `--train-pct`/`--test-set` CLI flags and handles morphology-count snapping of `num_actors`. Pass the full morphology list for the env; `run_training` computes the effective subset. Multi-morph scripts pass this; single-morph scripts (`mlp`, `transformer`) do not. `--test-set` works in all modes including `train`; training on the test split prints a reminder to omit `--test-set` when evaluating generalization.
 
 **`--compare`**:
-`test` mode flag. Requires `--train-pct < 1.0` and a seed. Runs the full morphology set in one env instance, then labels each morph's scores as train or test post-hoc. The Summary and By Leg Count sections of all outputs break down stats by split (train row, test row, global row). Produces a single chart with blues (train morphs, shaded by leg count) and oranges (test morphs, shaded by leg count). Incompatible with `--test-set`.
+`test` mode flag. Requires `--train-pct < 1.0` and a seed. Runs the full morphology set in one env instance, then labels each morph's scores as train or test post-hoc. The Summary and By Limb Count sections of all outputs break down stats by split (train row, test row, global row). Produces a single chart with blues (train morphs, shaded by limb count) and oranges (test morphs, shaded by limb count). Incompatible with `--test-set`.
 
 **Follow camera**:
 The viewer's camera controller in `play`/`random`. Has three viewing states: **auto-cycle** (default — hops to a random ant each episode), **manual-follow** (locked to one operator-chosen group+env, persists across episode resets), and **free-cam** (camera detached, driven by the renderer's built-in WASD/drag). Group = morphology (`EnvironmentGroup`), env = one ant instance within it. Auto-cycle and manual-follow are mutually exclusive; free-cam is an orthogonal overlay that restores the prior state on exit.
