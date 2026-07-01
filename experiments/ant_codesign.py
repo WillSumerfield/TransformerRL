@@ -1,8 +1,9 @@
-"""Codesign report: train the unconditional morphology generator + combined PPO control on the full
-ant, then aggregate the generator/control curves for the notebook (notebooks/ant_codesign.ipynb).
+"""Codesign report: train the single-network codesign model (morphology generator + combined PPO
+control on one shared trunk) on the full ant, then aggregate the generator/control curves for the
+notebook (notebooks/ant_codesign.ipynb).
 
-Gate: per-leg presence prob climbs base -> ~all-8, fast and stable (no leg/energy cost yet, so more
-legs => more return). See ADR-0010 / temp/ppg_phase2_plan.md.
+Gate: per-limb presence climbs base -> ~all-8, fast and stable (no limb/energy cost yet, so more
+limbs => more return). See docs/codesign_metrics.md and ADR-0013.
 
 Runs are namespaced `report_s{seed}` so this NEVER touches pre-existing `s{seed}` codesign dirs;
 only `report_*` dirs are (re)created.

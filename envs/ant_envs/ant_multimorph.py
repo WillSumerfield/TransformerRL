@@ -538,8 +538,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self._rebuild()
 
     def _draw_morphs(self, num: int) -> list:
-        """Draw `num` sampled bodies (full-ant config). Overridable so experiment subclasses can
-        change the sampling distribution (e.g. AntBinaryLegEnv) while reusing the build/resample
+        """Draw `num` sampled bodies (full-ant config). Overridable so subclasses (e.g.
+        AntCodesignEnv) can change the sampling distribution while reusing the build/resample
         machinery."""
         return sample_morphologies(num, rng=self._morph_rng)
 

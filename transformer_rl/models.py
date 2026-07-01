@@ -24,7 +24,7 @@ def _restore_mask_tail(normed, observation, normalize_input):
 
 
 class LegTransformerBuilder(NetworkBuilder):
-    """rl_games builder for 4-leg ant (ant / ant_adaptive)."""
+    """rl_games builder for the classic fixed 4-leg ant."""
 
     def load(self, params):
         self.params = params
