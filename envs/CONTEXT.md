@@ -8,7 +8,7 @@ The ant body design space and its physics: which ant bodies exist, how they're b
 The GPU physics simulator this repo runs on (replaces an earlier MuJoCo stack). Bodies are described by vsim XML; one build per morphology.
 
 **Morphology set**:
-The list of morphologies a single env instance spans — one EnvironmentGroup per entry. For the full ant it is *sampled*: one body per env (leg count uniform in 3–8, topology uniform within that count, per-leg hip/ankle lengths uniform in range), reproducible from the run seed. For the adaptive ant and other fixed-topology envs it is the enumerated topologies at default lengths.
+The list of morphologies a single env instance spans — one EnvironmentGroup per entry. For the full ant it is *sampled*: one body per env (leg count uniform in 3–8, topology uniform within that count, per-leg hip/ankle lengths uniform in range), reproducible from the run seed. For the classic ant and other fixed-topology envs it is the enumerated topologies at default lengths.
 
 **Morphology** (Morphology dataclass):
 Represents one specific body: `legs` (frozenset of active leg indices 1–8), `hip_lengths` (dict leg→float, hip segment length per active leg), `ankle_lengths` (dict leg→float, ankle segment length per active leg). Replaces the bare `frozenset` used when lengths were fixed.
@@ -31,9 +31,6 @@ _Avoid_: codesign ant (the env does no codesign — "codesign" is reserved for t
 **Full ant**:
 The multi-morphology ant over a sampled morphology set — one variable-length body per env (N = num_envs). The hard variant. `scripts/train_ant_full.py` + `configs/ppo_ant_full.yaml` (`env.sample_morphs`); geometry source: `ant_8leg.vsim`. Seeded sampling controls reproducibility.
 _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
-
-**Adaptive ant**:
-`AntAdaptiveEnv` — the multi-morphology ant restricted to the 46 stable 3–4-leg morphologies. The easier curriculum subset of the full ant.
 
 **Morphology resampling**:
 Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).

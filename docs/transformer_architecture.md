@@ -129,7 +129,7 @@ constants.
 
 | | dof slots | sensors | lengths | obs dim | mask |
 |---|---|---|---|---|---|
-| 4-leg (classic/adaptive base) | 8 | 4×6 | — | **59** | `[51:59]` |
+| 4-leg (classic base) | 8 | 4×6 | — | **59** | `[51:59]` |
 | 8-leg (multi-morphology) | 16 | 8×6 | 16 | **139** | `[123:139]` |
 
 The **DOF mask** is the crux of the whole design: written once at allocation, constant
@@ -375,7 +375,7 @@ Ant 8-leg instance, `B` = batch, `d` = `d_model`, `N = 1 + 2·n_legs = 17`.
 Architecture defaults live in `LegTransformer.__init__`; configs override the size knobs.
 These are **tuned** (Optuna; see `scripts/tune.py`) and will drift — treat as a snapshot.
 
-| knob | 4-leg (`ppo_ant_adaptive`) | 8-leg full (`ppo_ant_full`) |
+| knob | 4-leg (`ppo_ant`) | 8-leg full (`ppo_ant_full`) |
 |---|---|---|
 | `n_legs` | 4 | 8 |
 | `d_model` | 160 | 160 |

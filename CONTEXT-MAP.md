@@ -19,8 +19,8 @@ Research repo for **codesign**: jointly optimizing ant *morphology* and a transf
 │   ├── multigroup_environment.py
 │   └── ant_envs/
 │       ├── ant.py                    (classic 4-leg ant)
-│       ├── ant_adaptive.py           (adaptive ant: 3-4 leg stable subset)
 │       ├── ant_multimorph.py         (multi-morphology base; full ant = all 131 stable)
+│       ├── ant_codesign.py           (codesign env; generator-driven bodies per resample)
 │       ├── build_vsim.py             (programmatic vsim per leg subset)
 │       └── assets/
 ├── transformer_rl/                   ← Control context
@@ -82,7 +82,7 @@ Jointly optimizing the ant's morphology and its transformer controller in one lo
 _Avoid_: using "codesign" for the multi-morphology env `AntMultiMorphEnv` (it does no codesign; see Morphology context)
 
 **Morphology** (morph):
-A specific ant body — which legs exist, where, and (full ant) each leg's hip/ankle segment lengths. Either drawn from a fixed enumerated set (adaptive) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
+A specific ant body — which legs exist, where, and (full ant) each leg's hip/ankle segment lengths. Either drawn from a fixed enumerated set (classic ant) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
 
 **Leg**:
 One ant appendage. Up to 8 legs, placed at multiples of 45° around the torso. Each leg has exactly 2 DOFs (a hip and an ankle).
