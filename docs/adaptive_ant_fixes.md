@@ -3,11 +3,11 @@
 This document records the bugs found and fixed while making the **adaptive ant**
 (`AntAdaptiveEnv`, at the time restricted to morphology `{2,4,6,8}`) train
 equivalently to the **classic ant** (`AntEnv`), plus the masking machinery that
-makes the shared 8-leg transformer work. It is organized symptom-first: skim the
+makes the shared 8-limb transformer work. It is organized symptom-first: skim the
 quick-reference table, then read the entry for whatever you're chasing.
 
 > **Note:** the parity claims below were validated against the `{2,4,6,8}` morphology;
-> the adaptive ant has since broadened to all 46 stable 3–4-leg morphologies. The
+> the adaptive ant has since broadened to all 46 stable 3–4-limb morphologies. The
 > validation harnesses cited here (`test_ant_parity.py`, `test_mask_norm.py`,
 > `test_pos_emb_permutation.py`) live on branch `tests/adaptive-ant-fixes`, not `main`.
 
@@ -17,8 +17,8 @@ quick-reference table, then read the entry for whatever you're chasing.
 
 | Symptom | Root cause | Fix | File |
 |---|---|---|---|
-| Adaptive ≠ classic on a synced rollout | vsim emits DOFs in reverse leg order; scatter assumed ascending | Declare hip/ankle joints in reverse so DOFs come out ascending | `envs/ant_envs/build_vsim.py` |
-| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant DOF mask to 0 (fp32 rounding); every leg reads "inactive" | Mask-passthrough model: leave `obs[123:139]` (the mask tail) un-normalized | `transformer_rl/models.py`, configs |
+| Adaptive ≠ classic on a synced rollout | vsim emits DOFs in reverse limb order; scatter assumed ascending | Declare hip/ankle joints in reverse so DOFs come out ascending | `envs/ant_envs/build_vsim.py` |
+| Entropy cliffs from `-57 → -137` after ~1 min | Input normalizer collapses the constant DOF mask to 0 (fp32 rounding); every limb reads "inactive" | Mask-passthrough model: leave `obs[123:139]` (the mask tail) un-normalized | `transformer_rl/models.py`, configs |
 | Spiky `a_loss`, jerky reward; LR pinned at `0.01` | `σ=e⁻¹⁰` on inactive dims poisons `policy_kl` (−0.5/dim → ≈−4 KL), so adaptive LR cranks to max | Inactive `log_std = 0` (σ=1) instead of `-10` | `transformer_rl/models.py` |
 | Inactive `log_std_param` drifts under entropy bonus | Entropy gradient hit every dim, masked or not | Gradient-gate: `log_std = mask_dof * log_std_param` | `transformer_rl/models.py` |
 | (ruled out) Suspected pos-emb index mismatch | — | Proven to be pure relabeling; no effect | `scripts/test_pos_emb_permutation.py` |
@@ -33,28 +33,28 @@ reward, losses), and trains with a stable, KL-controlled learning rate.
 
 Understanding three layout facts makes every entry below clearer.
 
-- **Two ants, two obs sizes.** Classic `AntEnv` is a fixed 4-leg ant: **59-D obs,
-  8-D actions**, network `LegTransformer(n_legs=4)`. Adaptive `AntAdaptiveEnv`
+- **Two ants, two obs sizes.** Classic `AntEnv` is a fixed 4-limb ant: **59-D obs,
+  8-D actions**, network `LimbTransformer(n_limbs=4)`. Adaptive `AntAdaptiveEnv`
   inherits the multi-morphology stack: **139-D obs, 16-D actions** (always padded to
-  8 legs), network `MultiMorphLegTransformer(n_legs=8)`.
+  8 limbs), network `MultiMorphLimbTransformer(n_limbs=8)`.
 
-- **The 8-leg obs layout (139-D):**
+- **The 8-limb obs layout (139-D):**
   ```
   [0:11]    torso (y, quat, lin vel, ang vel)
   [11:27]   dof_pos   (16 slots, inactive = 0)
   [27:43]   dof_vel   (16 slots, inactive = 0)
   [43:59]   last_act  (16 slots, inactive = 0)
-  [59:107]  force sensors (8 legs × 6)
+  [59:107]  force sensors (8 limbs × 6)
   [107:123] segment lengths (8 hip, 8 ankle; raw, RMS-normalized; inactive = 0)
   [123:139] dof_mask (16 bits: 1 = active DOF, 0 = inactive)   ← the crux
   ```
   The DOF mask is written **once** at allocation and never touched during
   stepping. The tokenizer (`tokenize_8`) and the policy builder both read
-  `obs[123:139]` purely through a `> 0` boolean test to decide which legs exist.
+  `obs[123:139]` purely through a `> 0` boolean test to decide which limbs exist.
 
-- **`{2,4,6,8}` ≡ classic.** build_vsim places leg `n` at angle `(n-1)·45°`, so
-  legs `{2,4,6,8}` sit at `45/135/225/315°` — exactly the classic ant's four
-  legs. That physical identity is what lets us assert exact parity.
+- **`{2,4,6,8}` ≡ classic.** build_vsim places limb `n` at angle `(n-1)·45°`, so
+  limbs `{2,4,6,8}` sit at `45/135/225/315°` — exactly the classic ant's four
+  limbs. That physical identity is what lets us assert exact parity.
 
 ---
 
@@ -64,7 +64,7 @@ Understanding three layout facts makes every entry below clearer.
 
 **Observed.** We built a parity harness (`scripts/test_ant_parity.py`) that resets
 classic ant, copies its kinematic state into adaptive ant (`{2,4,6,8}`), and feeds
-both the same `MultiMorphLegTransformer` weights. Obs matched at reset, the forward
+both the same `MultiMorphLimbTransformer` weights. Obs matched at reset, the forward
 pass matched — but after **one physics step**, state diverged hugely:
 
 ```
@@ -86,8 +86,8 @@ adaptive : [hip_8, ankle_8, hip_6, ankle_6, hip_4, ankle_4, hip_2, ankle_2]  (DE
 torso's child joints in **reverse declaration order**. `build_vsim` declared hips
 ascending (`hip_2, hip_4, …`), so vsim emitted them descending. But
 `AntMultiMorphEnv.compute_observations` scatters `dof_pos[i]` into the obs slot for
-the *i-th active leg in ascending order* — so leg N's reading landed in the obs
-slot (and motor) of the diametrically opposite leg. Parity at *reset* still
+the *i-th active limb in ascending order* — so limb N's reading landed in the obs
+slot (and motor) of the diametrically opposite limb. Parity at *reset* still
 passed because both the bad sync and the bad scatter cancelled when all values are
 near zero; the error only manifests once physics moves the joints.
 
@@ -123,7 +123,7 @@ The numbers decode exactly. Entropy of a diagonal Gaussian is
 `Σ (1.4189 + log_stdᵢ)`:
 - Healthy adaptive: 8 active dims (`log_std=0`) + 8 inactive (`log_std=-10`) =
   `8·1.4189 + 8·(1.4189-10) = -57.3`.
-- `-137.3 = 16·(1.4189-10)` → **all 16 dims** at `log_std=-10`, i.e. every leg
+- `-137.3 = 16·(1.4189-10)` → **all 16 dims** at `log_std=-10`, i.e. every limb
   read as inactive.
 
 **Investigation.** The mask is constant per env, and `log_std=-10` is applied to
@@ -140,7 +140,7 @@ epoch 128:  1-mean=2.9e-8   norm_active=0.0       >0? False   ← collapse
 **Root cause.** `RunningMeanStd.forward` computes `(x - running_mean.float()) / …`.
 The mask's running mean converges toward `1.0`; once it gets within `2⁻²⁵≈3e-8`,
 the **float32 cast rounds it to exactly `1.0`**, so `(1.0 - 1.0) = 0` and every
-active mask dim normalizes to `0`. The `> 0` checks then flip all legs to inactive
+active mask dim normalizes to `0`. The `> 0` checks then flip all limbs to inactive
 → all `log_std = -10` → entropy `-137`, and the policy outputs ≈0 with no
 exploration. It's a hard threshold (hence "one straight drop"), not a slow decay.
 A 50-epoch test missed it because `1-mean` was still `~5e-6`.
@@ -243,10 +243,10 @@ one line; either way the gating property holds.
 
 ---
 
-## How the masking generalizes to multi-morphology (3- and 4-leg mixes)
+## How the masking generalizes to multi-morphology (3- and 4-limb mixes)
 
-All three masking changes are **per-env**, so a batch mixing a 3-leg morph
-(6 active DOFs) and a 4-leg morph (8 active DOFs) works without modification:
+All three masking changes are **per-env**, so a batch mixing a 3-limb morph
+(6 active DOFs) and a 4-limb morph (8 active DOFs) works without modification:
 
 - **Mask-passthrough** always restores raw `{0,1}`, so `(mask>0)` recovers each
   env's true active set. Still needed even with varied masks: any DOF active in
@@ -255,7 +255,7 @@ All three masking changes are **per-env**, so a batch mixing a 3-leg morph
   proportional to the fraction of envs whose morph uses DOF `i`; morphs without it
   don't pull on it.
 - **σ=1 inactive** is *more* important here: with the old `-10`, each morph
-  injected a different KL offset (4-leg → `-4.0`, 3-leg → `-5.0`), so the
+  injected a different KL offset (4-limb → `-4.0`, 3-limb → `-5.0`), so the
   batch-mean KL was a morph-distribution-dependent mess. With σ=1 every inactive
   dim contributes `≈0` regardless of count.
 

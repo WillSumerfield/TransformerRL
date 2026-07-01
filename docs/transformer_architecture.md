@@ -2,37 +2,42 @@
 
 This is the policy network that decides what the robot does each timestep. It's a
 **transformer that treats every body part as a token** — so instead of one fat
-observation vector going into an MLP, the torso and each joint each become their own
+observation vector going into an MLP, the root body and each joint each become their own
 little input, and the network uses attention to let them talk to each other before
 deciding how to move. Actions come out per joint; a single value estimate comes out of
-the torso token.
+the root token.
 
 ### The task we're demonstrating it on
 
-Everything here runs on **ant locomotion**: a simulated many-legged "ant" that has to
-learn to walk. The twist that motivates the whole design is that the ant's *body keeps
-changing* — it can have anywhere from 3 to 8 legs, placed at different angles around the
-torso, with different segment lengths. We want **one** controller that can walk *any* of
-these bodies, not a fresh network retrained per shape. (Down the line this feeds
-**codesign** — evolving the body and the brain together; see the [Context Map](../CONTEXT-MAP.md).)
+Everything here runs on **ant locomotion** (the **Locomotion** task): a simulated
+many-limbed "ant" that has to learn to walk. The twist that motivates the whole design is
+that the robot's *body keeps changing* — it can have anywhere from 3 to 8 limbs, placed at
+different angles around the root, with different module lengths. We want **one** controller
+that can walk *any* of these bodies, not a fresh network retrained per shape. (Down the
+line this feeds **codesign** — evolving the body and the brain together; see the
+[Context Map](../CONTEXT-MAP.md).)
 
 ### Why a transformer is the right tool here
 
-A plain MLP bakes in a fixed input size, so a 4-leg ant and a 6-leg ant would need
-different networks. Tokens sidestep that: each leg is just another token, so the *same*
-weights handle any number of legs in any arrangement. That's the core trick — the rest
+A plain MLP bakes in a fixed input size, so a 4-limb ant and a 6-limb ant would need
+different networks. Tokens sidestep that: each limb is just another token, so the *same*
+weights handle any number of limbs in any arrangement. That's the core trick — the rest
 of this doc is how we make it actually work (and §1 unpacks why this matters beyond
 convenience).
 
 The doc goes top-down: the big picture first, then data shapes, the augmentation we add,
-and finally the rl_games plumbing. It's **env-agnostic by design** — the ant is the
-running example, not the only thing this could control. Wherever you see torso/hip/ankle,
-leg, or 16 DOFs, that's the ant *instance* of a general pattern (one root token +
-repeated structural units → part-tokens → attention → per-part outputs).
+and finally the rl_games plumbing. It's **robot-agnostic by design** — the ant is the
+running example, not the only thing this could control. Wherever you see a limb's two
+**effector** tokens — **eff0** (proximal, the ant's old "hip") and **eff1** (distal, the
+old "ankle") — or 16 DOFs, that's the ant *instance* of a general pattern (one root token
++ repeated limbs → tokens → attention → per-part outputs). Today's ant limb is exactly two
+effector modules; Phase 1 makes limbs variable-length. The **physics build and the obs
+length block still spell these "hip"/"ankle"** — that data-model rename is deferred to
+Phase 1 (see [ADR-0014](adr/0014-generalized-construction-vocabulary.md)).
 
-Shared terms (leg, DOF, DOF mask, active/inactive, morphology) live in the
-[Context Map](../CONTEXT-MAP.md); architecture vocabulary (part-token, root token,
-leg encoding, token mask) lives in the [Control glossary](../transformer_rl/CONTEXT.md).
+Shared terms (robot, limb, DOF, DOF mask, active/inactive, root, morphology) live in the
+[Context Map](../CONTEXT-MAP.md); architecture vocabulary (token, root token,
+limb encoding, token mask, effector) lives in the [Control glossary](../transformer_rl/CONTEXT.md).
 
 ---
 
@@ -45,21 +50,21 @@ both speak in per-part tokens and attention, so a morphology generator can event
 attend to / be conditioned on the same token representation the controller uses. The
 architecture is built now to make that coupling natural later.
 
-**The enabling property: morphology-invariance.** Because legs are *tokens*, not fixed
-input slots, one shared policy + value function spans every morphology — any leg count,
+**The enabling property: morphology-invariance.** Because limbs are *tokens*, not fixed
+input slots, one shared policy + value function spans every morphology — any limb count,
 any placement — without ragged tensors and without retraining per body:
 
-- **Count-invariance**: a body with fewer legs simply has fewer (active) tokens. The
-  weights (`embed_hip`, `embed_ankle`, `joint_head`, attention) are shared across all
-  legs, so adding/removing a leg adds/removes a token rather than changing the network.
-- **Permutation-equivariance**: legs are interchangeable up to their geometry; identity
+- **Count-invariance**: a body with fewer limbs simply has fewer (active) tokens. The
+  weights (`embed_eff0`, `embed_eff1`, `joint_head`, attention) are shared across all
+  limbs, so adding/removing a limb adds/removes a token rather than changing the network.
+- **Permutation-equivariance**: limbs are interchangeable up to their geometry; identity
   is carried by *embeddings and a geometric encoding* (§5), not by position in a flat
   vector.
 
 This is what lets the controller keep working as the body changes during codesign — the
 prerequisite that the rest of the project is built on.
 
-> Implementation note: today the shape is **padded** to a fixed 8 legs / 16 DOFs with a
+> Implementation note: today the shape is **padded** to a fixed 8 limbs / 16 DOFs with a
 > DOF mask marking which are real (see [ADR-0002](adr/0002-fixed-8-leg-padding-and-dof-mask.md)).
 > Padding + masking is how count-invariance is realized in practice without ragged
 > batches; the transformer never attends to padded tokens (§5).
@@ -79,7 +84,7 @@ prerequisite that the rest of the project is built on.
              │  normalized obs (B, 139)
              ▼
   ┌────────────────────────────────────────────────────────┐
-  │ LegTransformer · architectures.py                      │
+  │ LimbTransformer · architectures.py                     │
   │                                                        │
   │ tokenize → embed → +type/+pos → mask → encoder         │
   └────────────────────────────────────────────────────────┘
@@ -101,36 +106,37 @@ prerequisite that the rest of the project is built on.
 ```
 
 `B` = batch (num envs). The wrapper and builder are rl_games glue (§8); the
-`LegTransformer` (§3–§7) is the pure architecture.
+`LimbTransformer` (§3–§7) is the pure architecture.
 
 ---
 
 ## 3. The input contract: the observation
 
 The transformer's input is the env observation. This doc takes the obs as a **given
-contract** — how the env assembles it (DOF scatter, segment lengths, the mask) is
+contract** — how the env assembles it (DOF scatter, module lengths, the mask) is
 Morphology's concern; see [envs/CONTEXT.md](../envs/CONTEXT.md).
 
-**Ant instance — 139-D, 8-leg padded layout:**
+**Ant instance — 139-D, 8-limb padded layout** (obs field names still spell the ant's
+physical hip/ankle build; that rename is deferred to Phase 1):
 
 ```
-[0:11]    torso        y(1) + quat(4) + lin vel(3) + ang vel(3)
-[11:27]   dof_pos      16 DOF slots (hip,ankle interleaved per leg; inactive = 0)
+[0:11]    root         y(1) + quat(4) + lin vel(3) + ang vel(3)   (root/torso body state)
+[11:27]   dof_pos      16 DOF slots (eff0,eff1 interleaved per limb; inactive = 0)
 [27:43]   dof_vel      16 DOF slots
 [43:59]   last_act     16 DOF slots (previous action)
-[59:107]  sensors      8 legs × 6 force-sensor channels (on the ankle)
-[107:123] lengths      8 hip + 8 ankle segment lengths (raw; RMS-normalized; inactive = 0)
+[59:107]  sensors      8 limbs × 6 force-sensor channels (on the distal effector eff1)
+[107:123] lengths      8 eff0 + 8 eff1 module lengths (raw; RMS-normalized; inactive = 0)
 [123:139] dof_mask     16 bits, 1 = active DOF, 0 = inactive   ← read via (>0)
 ```
 
-The 4-leg classic ant is the **smaller instance** of the same contract: 59-D obs, 8
+The 4-limb classic ant is the **smaller instance** of the same contract: 59-D obs, 8
 DOF slots, no length block, mask `[51:59]`. Same code path (`tokenize_4`), just smaller
 constants.
 
 | | dof slots | sensors | lengths | obs dim | mask |
 |---|---|---|---|---|---|
-| 4-leg (classic base) | 8 | 4×6 | — | **59** | `[51:59]` |
-| 8-leg (multi-morphology) | 16 | 8×6 | 16 | **139** | `[123:139]` |
+| 4-limb (classic base) | 8 | 4×6 | — | **59** | `[51:59]` |
+| 8-limb (multi-morphology) | 16 | 8×6 | 16 | **139** | `[123:139]` |
 
 The **DOF mask** is the crux of the whole design: written once at allocation, constant
 per env, and read *only* through a `> 0` boolean test by both the tokenizer and the
@@ -138,11 +144,11 @@ policy to decide which parts exist.
 
 ---
 
-## 4. Tokenization — obs → part-tokens
+## 4. Tokenization — obs → tokens
 
 `tokenize.py` slices the flat obs into one token per body part. **General pattern:** the
-root gets one token; each repeated structural unit (a leg) contributes one token per
-actuated segment (hip, ankle). **Ant instance:** `1 + 2·n_legs` tokens.
+root gets one token; each repeated limb contributes one token per actuated module
+(effector). **Ant instance:** `1 + 2·n_limbs` tokens (each limb = eff0 + eff1).
 
 ```
    obs (B,139)
@@ -150,55 +156,55 @@ actuated segment (hip, ankle). **Ant instance:** `1 + 2·n_legs` tokens.
         ▼
  ┌───────────────┬─────────────────────────┬─────────────────────────┐
  ▼               ▼                         ▼
- torso token     hip token × n_legs        ankle token × n_legs
- (B, 11)         (B, n_legs, 6)            (B, n_legs, 12)
- torso obs       dof_pos · vel · act       dof_pos · vel · act
-                 · sin · cos · hip_len      · 6 force sensors
-                                            · sin · cos · ankle_len
+ root token      eff0 token × n_limbs      eff1 token × n_limbs
+ (B, 11)         (B, n_limbs, 6)           (B, n_limbs, 12)
+ root obs        dof_pos · vel · act       dof_pos · vel · act
+                 · sin · cos · eff0_len     · 6 force sensors
+                                            · sin · cos · eff1_len
 ```
 
-**Per-token features (ant instance, 8-leg):**
+**Per-token features (ant instance, 8-limb):**
 
 | token | dim | contents |
 |---|---|---|
-| torso (root) | 11 | y, quat, lin vel, ang vel |
-| hip × 8 | **6** | dof_pos, dof_vel, last_act, **sin, cos** (leg encoding), hip length |
-| ankle × 8 | **12** | dof_pos, dof_vel, **6 force-sensor channels**, last_act, **sin, cos**, ankle length |
+| root | 11 | y, quat, lin vel, ang vel |
+| eff0 (proximal) × 8 | **6** | dof_pos, dof_vel, last_act, **sin, cos** (limb encoding), eff0 module length |
+| eff1 (distal) × 8 | **12** | dof_pos, dof_vel, **6 force-sensor channels**, last_act, **sin, cos**, eff1 module length |
 
-4-leg instance: hip = 5, ankle = 11 (no length feature).
+4-limb instance: eff0 = 5, eff1 = 11 (no length feature).
 
-`tokenize_*` returns `(torso, hip_tokens, ankle_tokens, active_mask)`:
+`tokenize_*` returns `(root, eff0_tokens, eff1_tokens, active_mask)`:
 
 ```
-torso        (B, 11)
-hip_tokens   (B, n_legs, hip_dim)
-ankle_tokens (B, n_legs, ankle_dim)
-active_mask  (B, 2·n_legs)        # 1.0 = active DOF, derived from dof_mask>0
+root         (B, 11)
+eff0_tokens  (B, n_limbs, eff0_dim)
+eff1_tokens  (B, n_limbs, eff1_dim)
+active_mask  (B, 2·n_limbs)        # 1.0 = active DOF, derived from dof_mask>0
 ```
 
-`active_mask` is built `[all hips | all ankles]` (natural order, §7), from the hip/ankle
-bits of `dof_mask`. A leg is "active" iff its hip bit is set.
+`active_mask` is built `[all eff0 | all eff1]` (natural order, §7), from the eff0/eff1
+bits of `dof_mask`. A limb is "active" iff its eff0 bit is set.
 
-### Leg encoding (geometric augmentation)
+### Limb encoding (geometric augmentation)
 
-Each leg's **physical placement angle** is baked into its hip and ankle tokens as
+Each limb's **physical placement angle** is baked into its eff0 and eff1 tokens as
 `(sin θ, cos θ)`. This is data *augmentation that injects body geometry*: it tells the
-policy *where on the body* a leg sits, which a flat obs would not convey once legs are
+policy *where on the body* a limb sits, which a flat obs would not convey once limbs are
 interchangeable tokens.
 
 ```
-ant: leg n placed at angle (n-1)·45°   →  8 legs around the torso
+ant: limb n placed at angle (n-1)·45°   →  8 limbs around the root
                        0°
                   315° ┐ ┌ 45°
                        │ │
               270° ────┼─┼──── 90°       enc[i] = (sin θ_i, cos θ_i)
-                       │ │                zeroed for inactive legs
+                       │ │                zeroed for inactive limbs
                   225° ┘ └ 135°
                       180°
 ```
 
-Inactive legs get their `(sin, cos)` zeroed, so a padded slot carries no spurious
-geometry. Distinct from the **positional embedding** (§5): leg encoding is fixed body
+Inactive limbs get their `(sin, cos)` zeroed, so a padded slot carries no spurious
+geometry. Distinct from the **positional embedding** (§5): limb encoding is fixed body
 *geometry* in the token features; the positional embedding is a *learned* per-slot
 vector.
 
@@ -210,29 +216,30 @@ Each token is linearly projected to `d_model`, then two learned embeddings are a
 then inactive tokens are killed before attention.
 
 ```
- torso (B,11)──embed_torso─┐
- hip   (B,8,6)──embed_hip──┤ →  x (B, N, d_model)     N = 1 + 2·n_legs (=17 for ant)
- ankle (B,8,12)─embed_ankle┘
+ root (B,11)──embed_root─┐
+ eff0 (B,8,6)──embed_eff0┤ →  x (B, N, d_model)     N = 1 + 2·n_limbs (=17 for ant)
+ eff1 (B,8,12)─embed_eff1┘
 
- x += type_emb[type_ids]      # 3 types: torso / hip / ankle
- x += pos_emb [pos_ids]       # slot index 0..n_legs; a leg's hip & ankle share an index
+ x += type_emb[type_ids]      # 3 types: root / eff0 / eff1
+ x += pos_emb [pos_ids]       # slot index 0..n_limbs; a limb's eff0 & eff1 share an index
 
  x *= token_mask              # zero embeddings of inactive tokens (kills them as queries)
 ```
 
 **Embeddings (learned, augmentation of identity):**
-- **type embedding** — `nn.Embedding(3, d)`: marks each token's kind (root / hip / ankle).
-- **positional embedding** — `nn.Embedding(1+n_legs, d)`: a learned per-slot vector;
-  hip and ankle of the same leg share the slot index, so they are tied together.
+- **type embedding** — `nn.Embedding(3, d)`: marks each token's kind (root / eff0 / eff1).
+  Reserved to extend to link / cap / connector at Phase 5.
+- **positional embedding** — `nn.Embedding(1+n_limbs, d)`: a learned per-slot vector;
+  eff0 and eff1 of the same limb share the slot index, so they are tied together.
 
-**Token mask (attention-level masking of inactive legs)** — two coupled mechanisms:
+**Token mask (attention-level masking of inactive limbs)** — two coupled mechanisms:
 1. `x *= token_mask` zeroes inactive token embeddings (they carry no signal as queries).
 2. `src_key_padding_mask = ~active` tells the encoder those tokens are **padding keys**,
-   so active tokens never attend to them. The root (torso) is always unmasked.
+   so active tokens never attend to them. The root is always unmasked.
 
 ```
- token_mask = [1 | active hips | active ankles]   shape (B, N, 1)
- pad_mask   = [0 | ~active_hips | ~active_ankles]  shape (B, N)   (True = ignore as key)
+ token_mask = [1 | active eff0 | active eff1]   shape (B, N, 1)
+ pad_mask   = [0 | ~active_eff0 | ~active_eff1]  shape (B, N)   (True = ignore as key)
 ```
 
 After the encoder, `x *= token_mask` is applied **again** to zero inactive *outputs* —
@@ -268,27 +275,27 @@ Two heads read the encoder output `x (B, N, d_model)`.
 ### Action head (per part)
 
 ```
- joints      = x[:, 1:, :]                 # drop root → (B, 2·n_legs, d)
- a_nat       = tanh(joint_head(joints))    # (B, 2·n_legs)  one scalar per DOF, in [-1,1]
+ joints      = x[:, 1:, :]                 # drop root → (B, 2·n_limbs, d)
+ a_nat       = tanh(joint_head(joints))    # (B, 2·n_limbs)  one scalar per DOF, in [-1,1]
  a_nat      *= active_mask                  # zero inactive DOFs
- mu          = a_nat[:, nat_to_dof]         # reorder natural → DOF order  → (B, 2·n_legs)
+ mu          = a_nat[:, nat_to_dof]         # reorder natural → DOF order  → (B, 2·n_limbs)
 ```
 
-- **One shared `joint_head`** (`Linear(d,1)`) applied to every leg token — weight sharing
-  is what makes the policy permutation-equivariant across legs.
+- **One shared `joint_head`** (`Linear(d,1)`) applied to every effector token — weight
+  sharing is what makes the policy permutation-equivariant across limbs.
 - **Zero-initialized** (`weight=0, bias=0`): the policy starts emitting `mu≈0`, a standard
   RL stability trick so early actions are small.
 - **`tanh`** bounds each action to `[-1, 1]`.
 
 **Natural vs DOF order (the `nat_to_dof` scatter).** The transformer lays its outputs out
-in *natural* order — all hips, then all ankles — but the env wants them interleaved in
-*DOF* order (hip, ankle, hip, ankle …). A fixed index map reshuffles them:
+in *natural* order — all eff0, then all eff1 — but the env wants them interleaved in
+*DOF* order (eff0, eff1, eff0, eff1 …). A fixed index map reshuffles them:
 
 ```
- natural (transformer):  [ h0 h1 h2 | a0 a1 a2 ]    all hips, then all ankles
- DOF     (env expects):  [ h0 a0 h1 a1 h2 a2 ]      hip,ankle per leg
+ natural (transformer):  [ p0 p1 p2 | d0 d1 d2 ]    all eff0 (prox), then all eff1 (dist)
+ DOF     (env expects):  [ p0 d0 p1 d1 p2 d2 ]      eff0,eff1 per limb
 
- nat_to_dof[i] = i//2 + L·(i%2)        (L = n_legs; example below uses L = 3)
+ nat_to_dof[i] = i//2 + L·(i%2)        (L = n_limbs; example below uses L = 3)
    DOF slot   :  0  1  2  3  4  5
    pulls nat  :  0  3  1  4  2  5
 ```
@@ -296,10 +303,10 @@ in *natural* order — all hips, then all ankles — but the env wants them inte
 ### Value head
 
 ```
- value = value_head(x[:, 0, :])    # root (torso) token → (B, 1)
+ value = value_head(x[:, 0, :])    # root token → (B, 1)
 ```
 
-The **root token acts as a CLS-style aggregator**: it attends to all active part-tokens
+The **root token acts as a CLS-style aggregator**: it attends to all active tokens
 (and is never masked), so its encoder output is a whole-body summary — the natural place
 to read a single state value.
 
@@ -307,7 +314,7 @@ to read a single state value.
 
 ## 8. rl_games integration (the wrapper layer)
 
-The pure `LegTransformer` emits `(mu, value)`. Two rl_games pieces complete the
+The pure `LimbTransformer` emits `(mu, value)`. Two rl_games pieces complete the
 obs→action path. The *why* behind the masking choices is recorded in
 [`adaptive_ant_fixes.md`](adaptive_ant_fixes.md) and
 [ADR-0002](adr/0002-fixed-8-leg-padding-and-dof-mask.md) — summarized here, not duplicated.
@@ -325,7 +332,7 @@ The policy is a diagonal Gaussian; the builder supplies `log_std` and packages
 does two jobs: inactive dims get **σ=1** (a moderate value that keeps rl_games'
 `policy_kl` well-conditioned — tiny σ poisons the adaptive-LR controller), and inactive
 entries receive **zero gradient** (the `∂/∂log_std_param` is gated to active dims).
-Registered networks: `leg_transformer` (4-leg), `multimorph_leg_transformer` (8-leg).
+Registered networks: `limb_transformer` (4-limb), `multimorph_limb_transformer` (8-limb).
 
 ### Masked-norm model — `TransformerMaskedNorm` (`models.py`)
 
@@ -338,7 +345,7 @@ DOF mask** afterward:
 ```
 
 Without this, the constant mask's running mean converges to `1.0`, the fp32 cast rounds
-it to exactly `1.0`, and `(x-mean)=0` collapses every active bit to 0 — flipping all legs
+it to exactly `1.0`, and `(x-mean)=0` collapses every active bit to 0 — flipping all limbs
 to "inactive" mid-training (a hard entropy cliff). Registered as
 `transformer_masked_a2c_logstd`, selected via `model.name` in the configs.
 
@@ -346,15 +353,15 @@ to "inactive" mid-training (a hard entropy cliff). Registered as
 
 ## 9. Shapes reference
 
-Ant 8-leg instance, `B` = batch, `d` = `d_model`, `N = 1 + 2·n_legs = 17`.
+Ant 8-limb instance, `B` = batch, `d` = `d_model`, `N = 1 + 2·n_limbs = 17`.
 
 ```
  obs                         (B, 139)
  ── tokenize ──
- torso                       (B, 11)
- hip_tokens                  (B, 8, 6)
- ankle_tokens                (B, 8, 12)
- active_mask                 (B, 16)        natural order [hips | ankles]
+ root                        (B, 11)
+ eff0_tokens                 (B, 8, 6)
+ eff1_tokens                 (B, 8, 12)
+ active_mask                 (B, 16)        natural order [eff0 | eff1]
  ── embed + tag ──
  x                           (B, 17, d)
  token_mask                  (B, 17, 1)
@@ -362,7 +369,7 @@ Ant 8-leg instance, `B` = batch, `d` = `d_model`, `N = 1 + 2·n_legs = 17`.
  ── encoder ──
  x                           (B, 17, d)     shape-preserving
  ── heads ──
- mu                          (B, 16)        DOF order [h0 a0 h1 a1 …]
+ mu                          (B, 16)        DOF order [p0 d0 p1 d1 …]
  value                       (B, 1)
  ── builder ──
  log_std                     (B, 16)
@@ -372,12 +379,12 @@ Ant 8-leg instance, `B` = batch, `d` = `d_model`, `N = 1 + 2·n_legs = 17`.
 
 ## 10. Current configuration
 
-Architecture defaults live in `LegTransformer.__init__`; configs override the size knobs.
+Architecture defaults live in `LimbTransformer.__init__`; configs override the size knobs.
 These are **tuned** (Optuna; see `scripts/tune.py`) and will drift — treat as a snapshot.
 
-| knob | 4-leg (`ppo_ant`) | 8-leg full (`ppo_ant_full`) |
+| knob | 4-limb (`ppo_ant`) | 8-limb full (`ppo_ant_full`) |
 |---|---|---|
-| `n_legs` | 4 | 8 |
+| `n_limbs` | 4 | 8 |
 | `d_model` | 160 | 160 |
 | `n_heads` | 16 | 8 |
 | `n_layers` | 1 | 1 |
@@ -385,13 +392,16 @@ These are **tuned** (Optuna; see `scripts/tune.py`) and will drift — treat as 
 | dropout | 0.0 | 0.0 |
 | activation | gelu, pre-norm | gelu, pre-norm |
 
-(`MultiMorphLegTransformer` defaults to `n_layers=3` in code, but the live config sets 1.)
+(`MultiMorphLimbTransformer` defaults to `n_layers=3` in code, but the live config sets 1.)
 
 ---
 
 ## Changelog
 
-- **2026-06-03** — Initial doc. Captures the 8-leg multi-morphology architecture with
-  per-leg segment-length features (obs 139-D, mask `[123:139]`), σ=1 inactive log_std +
-  gradient gating, and the masked-norm model. 4-leg classic/adaptive documented as the
+- **2026-06-03** — Initial doc. Captures the 8-limb multi-morphology architecture with
+  per-limb module-length features (obs 139-D, mask `[123:139]`), σ=1 inactive log_std +
+  gradient gating, and the masked-norm model. 4-limb classic/adaptive documented as the
   smaller instance.
+- **2026-07-01** — Vocabulary generalized (ADR-0014): leg→limb, torso→root token,
+  hip/ankle tokens→eff0/eff1 effectors. Physics build + obs length block still spell
+  hip/ankle (data-model rename deferred to Phase 1).
