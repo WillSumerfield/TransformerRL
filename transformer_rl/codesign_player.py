@@ -26,6 +26,6 @@ class CodesignPlayer(PpoPlayerContinuous):
             presence = self.model.a2c_network.net.sample(e.total_num_envs)['presence']
             e.set_next(presence)
             e.resample()                               # full rebuild to the sampled bodies
-            print(f"[codesign-play] sampled bodies: mean #legs="
+            print(f"[codesign-play] sampled bodies: mean #limbs="
                   f"{presence.sum(1).mean().item():.2f}", flush=True)
         return super().env_reset(env)

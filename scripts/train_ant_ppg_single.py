@@ -11,7 +11,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
 from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
-from transformer_rl import MultiMorphLegTransformerBuilder
+from transformer_rl import MultiMorphLimbTransformerBuilder
 
 run_training(
     default_config="ppo_ant_ppg_single.yaml",
@@ -19,6 +19,6 @@ run_training(
     name="ant_ppg_single_transformer",
     env_class=AntMultiMorphEnv,
     env_name="ant-multimorph-env",
-    network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
+    network=("multimorph_limb_transformer", MultiMorphLimbTransformerBuilder),
     model="transformer_masked_a2c_logstd",
 )

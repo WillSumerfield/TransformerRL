@@ -30,7 +30,7 @@ import yaml
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from transformer_rl.models import MultiMorphLegTransformerBuilder
+from transformer_rl.models import MultiMorphLimbTransformerBuilder
 from transformer_rl.tokenize import OBS_DIM_8, LEN_DIM_8, MASK_DIM_8
 from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _stable_morphologies
 
@@ -116,7 +116,7 @@ def aggregate_curves(seeds):
 
 def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1):
     obs_total = _OBS_TOTAL + (1 if value_size == 2 else 0)   # +progress dim for the V1.0 head
-    net = MultiMorphLegTransformerBuilder.Network(
+    net = MultiMorphLimbTransformerBuilder.Network(
         params=net_params, actions_num=_N_ACT, input_shape=(obs_total,), num_seqs=1,
         value_size=value_size)
     raw = torch.load(ckpt, map_location=device, weights_only=False)["model"]
@@ -174,7 +174,7 @@ def run_inference(seeds):
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(DATA_DIR / "inference.npz",
-                        bodies_legcount=bcount, seeds=np.array(seeds), envs_per_body=ENVS_PER,
+                        bodies_limbcount=bcount, seeds=np.array(seeds), envs_per_body=ENVS_PER,
                         **results)
     print(f"[parity] inference -> {DATA_DIR / 'inference.npz'}")
 

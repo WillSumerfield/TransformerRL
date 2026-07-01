@@ -22,7 +22,7 @@ from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE
 
 
 _N_DOFS_FULL = 16   # 8 hips + 8 ankles (DOF order: h1,a1,...,h8,a8)
-_N_LEGS      = 8
+_N_LIMBS      = 8
 _OBS_BASE    = 107  # 1+4+3+3+16+16+16+8*6 (physical obs)
 _LEN_DIM     = 16   # 8 hip + 8 ankle segment lengths (raw; RMS-normalized by the policy)
 _MASK_DIM    = 16
@@ -34,15 +34,15 @@ _SET_GAP_CELLS = 4
 
 
 def _stable_morphologies(
-    min_legs: int = 3,
-    max_legs: int = 8,
+    min_limbs: int = 3,
+    max_limbs: int = 8,
     max_gap_deg: float = 135.0,
 ) -> list[frozenset]:
-    """Return stable morphologies with min_legs..max_legs legs and no circular gap > max_gap_deg."""
+    """Return stable morphologies with min_limbs..max_limbs limbs and no circular gap > max_gap_deg."""
     result = []
     for mask in range(1, 256):
         active = frozenset(i + 1 for i in range(8) if (mask >> i) & 1)
-        if not (min_legs <= len(active) <= max_legs):
+        if not (min_limbs <= len(active) <= max_limbs):
             continue
         angles = sorted((n - 1) * 45.0 for n in active)
         gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
@@ -58,20 +58,20 @@ def morph_split(
     seed: int,
     test_set: bool = False,
 ) -> list[frozenset]:
-    """Return train or test morphologies via stratified split by leg count.
+    """Return train or test morphologies via stratified split by limb count.
 
-    Stratifies by leg count so each stratum contributes proportionally to both halves.
+    Stratifies by limb count so each stratum contributes proportionally to both halves.
     Requires seed; caller must validate before calling.
     """
     import random as _random
     rng = _random.Random(seed)
-    by_legs: dict[int, list[frozenset]] = {}
+    by_limbs: dict[int, list[frozenset]] = {}
     for m in morphs:
-        by_legs.setdefault(len(m), []).append(m)
+        by_limbs.setdefault(len(m), []).append(m)
 
     train, test = [], []
-    for strat in sorted(by_legs):
-        group = by_legs[strat][:]
+    for strat in sorted(by_limbs):
+        group = by_limbs[strat][:]
         rng.shuffle(group)
         n_train = max(1, int(len(group) * train_pct))
         n_train = min(n_train, len(group) - 1)  # ensure at least 1 in test
@@ -82,20 +82,20 @@ def morph_split(
 
 
 def sample_morphologies(num: int, seed: int = None, rng: "random.Random" = None) -> list[Morphology]:
-    """Sample `num` full morphologies: leg count uniform in 3..8, topology uniform within that count,
-    each active leg's hip/ankle length uniform in its range. Pass a persistent `rng` for a
+    """Sample `num` full morphologies: limb count uniform in 3..8, topology uniform within that count,
+    each active limb's hip/ankle length uniform in its range. Pass a persistent `rng` for a
     reproducible resample stream, or a `seed` for a one-off draw."""
     rng = rng if rng is not None else random.Random(seed)
-    by_legs: dict[int, list[frozenset]] = {}
+    by_limbs: dict[int, list[frozenset]] = {}
     for m in _stable_morphologies():
-        by_legs.setdefault(len(m), []).append(m)
-    leg_counts = sorted(by_legs)
+        by_limbs.setdefault(len(m), []).append(m)
+    limb_counts = sorted(by_limbs)
     out = []
     for _ in range(num):
-        legs = rng.choice(by_legs[rng.choice(leg_counts)])
-        hip = {n: rng.uniform(*HIP_RANGE) for n in legs}
-        ank = {n: rng.uniform(*ANKLE_RANGE) for n in legs}
-        out.append(Morphology(legs, hip, ank))
+        limbs = rng.choice(by_limbs[rng.choice(limb_counts)])
+        hip = {n: rng.uniform(*HIP_RANGE) for n in limbs}
+        ank = {n: rng.uniform(*ANKLE_RANGE) for n in limbs}
+        out.append(Morphology(limbs, hip, ank))
     return out
 
 
@@ -266,11 +266,11 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 dtype=torch.long, device=self.device,
             )  # (n_dofs,)
 
-            # Scatter map for sensor forces into 48D slot (8 legs × 6)
+            # Scatter map for sensor forces into 48D slot (8 limbs × 6)
             sensor_indices = torch.tensor(
                 [j for n in active for j in range(6 * (n - 1), 6 * (n - 1) + 6)],
                 dtype=torch.long, device=self.device,
-            )  # (n_active_legs * 6,)
+            )  # (n_active_limbs * 6,)
 
             # DOF mask: 1 for active DOFs, 0 otherwise
             dof_mask = torch.zeros(_N_DOFS_FULL, dtype=torch.float32, device=self.device)
@@ -307,7 +307,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self._set_root_pose = torch.zeros((N, 7), dtype=torch.float32, device=self.device)
         self._set_root_vel  = torch.zeros((N, 6), dtype=torch.float32, device=self.device)
         self._global_dof_mask = torch.zeros((N, _N_DOFS_FULL), dtype=torch.float32, device=self.device)
-        # Per-env segment lengths, constant per body: [hip_leg1..8, ankle_leg1..8], 0 for inactive legs.
+        # Per-env segment lengths, constant per body: [hip_leg1..8, ankle_leg1..8], 0 for inactive limbs.
         self._global_lengths = torch.zeros((N, _LEN_DIM), dtype=torch.float32, device=self.device)
 
         # DOF/sensor data is ragged (per-morphology width + a per-morphology slot permutation), so
@@ -337,8 +337,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
 
         self._dof_gather_idx    = torch.zeros((N, _N_DOFS_FULL), dtype=torch.long, device=self.device)
         self._motor_src_idx     = torch.zeros(FLAT_DOF, dtype=torch.long, device=self.device)
-        self._sensor_gather_idx = torch.zeros((N, _N_LEGS * 6), dtype=torch.long, device=self.device)
-        self._sensor_mask       = torch.zeros((N, _N_LEGS * 6), dtype=torch.float32, device=self.device)
+        self._sensor_gather_idx = torch.zeros((N, _N_LIMBS * 6), dtype=torch.long, device=self.device)
+        self._sensor_mask       = torch.zeros((N, _N_LIMBS * 6), dtype=torch.float32, device=self.device)
 
         all_motor_cmds, all_sensor_cmds, all_get_cmds, all_set_cmds = [], [], [], []
         ar_epm = torch.arange(EPM, device=self.device)
@@ -373,7 +373,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             lvec = torch.zeros(_LEN_DIM, dtype=torch.float32, device=self.device)
             for n in g["active"]:
                 lvec[n - 1]           = morph.hip_lengths[n]
-                lvec[_N_LEGS + n - 1] = morph.ankle_lengths[n]
+                lvec[_N_LIMBS + n - 1] = morph.ankle_lengths[n]
             self._global_lengths[start:end] = lvec
 
             self._flat_dof_init[doff:doff + EPM * n_dofs] = g["dof_pos_init"].reshape(-1)
@@ -423,7 +423,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 ))
             g["n_sensors"] = n_sensors_per[gi]
             sen_idx = g["sensor_indices"]                    # (n_sensors*6,) canonical 48-slot per (si,comp)
-            base48 = torch.full((_N_LEGS * 6,), -1, dtype=torch.long, device=self.device)
+            base48 = torch.full((_N_LIMBS * 6,), -1, dtype=torch.long, device=self.device)
             p = torch.arange(sen_idx.numel(), device=self.device)
             base48[sen_idx] = (p // 6) * (EPM * 6) + (p % 6)   # canonical 48-slot -> within-group flat base
             self._sensor_mask[start:end] = (base48 >= 0).float().unsqueeze(0)

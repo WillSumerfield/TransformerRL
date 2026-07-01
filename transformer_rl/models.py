@@ -4,7 +4,7 @@ import torch.nn as nn
 from rl_games.algos_torch.network_builder import NetworkBuilder
 from rl_games.algos_torch.models import ModelA2CContinuousLogStd
 
-from .architectures import LegTransformer, MultiMorphLegTransformer
+from .architectures import LimbTransformer, MultiMorphLimbTransformer
 from .tokenize import (
     OBS_DIM_4 as OBS_DIM, MASK_DIM_4 as MASK_DIM,
     OBS_DIM_8 as DYN_OBS_DIM, LEN_DIM_8 as DYN_LEN_DIM, MASK_DIM_8 as DYN_MASK_DIM,
@@ -23,8 +23,8 @@ def _restore_mask_tail(normed, observation, normalize_input):
     return normed
 
 
-class LegTransformerBuilder(NetworkBuilder):
-    """rl_games builder for the classic fixed 4-leg ant."""
+class LimbTransformerBuilder(NetworkBuilder):
+    """rl_games builder for the classic fixed 4-limb ant."""
 
     def load(self, params):
         self.params = params
@@ -36,7 +36,7 @@ class LegTransformerBuilder(NetworkBuilder):
             kwargs.pop('input_shape', None)
             kwargs.pop('num_seqs', None)
             tc = params.get('transformer', {})
-            self.net = LegTransformer(**tc)
+            self.net = LimbTransformer(**tc)
             self.log_std_param = nn.Parameter(torch.zeros(8))
 
         def forward(self, obs_dict):
@@ -59,11 +59,11 @@ class LegTransformerBuilder(NetworkBuilder):
             return False
 
     def build(self, name, **kwargs):
-        return LegTransformerBuilder.Network(self.params, **kwargs)
+        return LimbTransformerBuilder.Network(self.params, **kwargs)
 
 
-class MultiMorphLegTransformerBuilder(NetworkBuilder):
-    """rl_games builder for the 8-leg multi-morphology ant."""
+class MultiMorphLimbTransformerBuilder(NetworkBuilder):
+    """rl_games builder for the 8-limb multi-morphology ant."""
 
     def load(self, params):
         self.params = params
@@ -76,7 +76,7 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
             kwargs.pop('num_seqs', None)
             kwargs.pop('value_size', None)               # single-net codesign: V1.0 is gencrit_head
             tc = params.get('transformer', {})
-            self.net = MultiMorphLegTransformer(**tc)
+            self.net = MultiMorphLimbTransformer(**tc)
             self.log_std_param = nn.Parameter(torch.zeros(16))
 
         def forward(self, obs_dict):
@@ -100,14 +100,14 @@ class MultiMorphLegTransformerBuilder(NetworkBuilder):
             return False
 
     def build(self, name, **kwargs):
-        return MultiMorphLegTransformerBuilder.Network(self.params, **kwargs)
+        return MultiMorphLimbTransformerBuilder.Network(self.params, **kwargs)
 
 
 class TransformerMaskedNorm(ModelA2CContinuousLogStd):
     """continuous_a2c_logstd whose input normalizer leaves the DOF mask dims raw.
 
     Standard RunningMeanStd collapses the constant mask to ~0 once running_mean
-    rounds to 1.0 in fp32 (a hard cliff that flips every leg to "inactive"). We keep
+    rounds to 1.0 in fp32 (a hard cliff that flips every limb to "inactive"). We keep
     the stock normalizer and only override norm_obs to restore the raw mask tail.
     """
 
@@ -126,7 +126,7 @@ class TransformerMaskedNorm(ModelA2CContinuousLogStd):
 
 
 class MultiMorphValueBuilder(NetworkBuilder):
-    """rl_games builder for the PPG disjoint value net (8-leg, value head only)."""
+    """rl_games builder for the PPG disjoint value net (8-limb, value head only)."""
 
     def load(self, params):
         self.params = params
@@ -138,7 +138,7 @@ class MultiMorphValueBuilder(NetworkBuilder):
             kwargs.pop('input_shape', None)
             kwargs.pop('num_seqs', None)
             tc = params.get('transformer', {})
-            self.net = MultiMorphLegTransformer(policy_head=False, value_head=True, **tc)
+            self.net = MultiMorphLimbTransformer(policy_head=False, value_head=True, **tc)
 
         def forward(self, obs_dict):
             return self.net(obs_dict['obs'])['value']

@@ -1,4 +1,4 @@
-"""Collect per-token attention weights over episodes for a trained LegTransformer policy."""
+"""Collect per-token attention weights over episodes for a trained LimbTransformer policy."""
 import sys
 from pathlib import Path
 
@@ -13,12 +13,12 @@ import yaml
 from tqdm import tqdm
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 
-from transformer_rl.models import LegTransformerBuilder
+from transformer_rl.models import LimbTransformerBuilder
 from envs.ant_envs import AntEnv
 
 
 def _load(checkpoint: Path, config: dict, device: torch.device):
-    network = LegTransformerBuilder.Network(
+    network = LimbTransformerBuilder.Network(
         params=config["params"]["network"],
         actions_num=8,
         input_shape=(59,),

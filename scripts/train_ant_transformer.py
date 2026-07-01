@@ -7,7 +7,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
 from envs.ant_envs.ant import AntEnv
-from transformer_rl import LegTransformerBuilder
+from transformer_rl import LimbTransformerBuilder
 
 
 def add_args(parser):
@@ -38,7 +38,7 @@ run_training(
     name="ant_transformer",
     env_class=AntEnv,
     env_name="ant-env",
-    network=("leg_transformer", LegTransformerBuilder),
+    network=("limb_transformer", LimbTransformerBuilder),
     extra_args_fn=add_args,
     post_config_fn=post_config,
 )

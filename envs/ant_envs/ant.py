@@ -10,7 +10,7 @@ from envs.ant_environment_gpu import AntEnvironmentGpu
 
 
 class AntEnv(AntEnvironmentGpu):
-    """Standard 4-leg vsim ant, no DOF masking."""
+    """Standard 4-limb vsim ant, no DOF masking."""
 
     _VALID_KWARGS = frozenset(inspect.signature(AntEnvironmentGpu.__init__).parameters) - {"self"}
 

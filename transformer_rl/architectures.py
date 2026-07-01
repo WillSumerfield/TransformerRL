@@ -15,15 +15,15 @@ _MODE_LIVE, _MODE_COMMITTED, _MODE_STOP = 0, 1, 2
 _GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action ids {on, stop}
 
 
-def _make_nat_to_dof(n_legs: int) -> torch.Tensor:
-    idx = torch.arange(2 * n_legs, dtype=torch.long)
-    return idx // 2 + n_legs * (idx % 2)
+def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
+    idx = torch.arange(2 * n_limbs, dtype=torch.long)
+    return idx // 2 + n_limbs * (idx % 2)
 
 
-class LegTransformer(nn.Module):
+class LimbTransformer(nn.Module):
     def __init__(
         self,
-        n_legs: int = 4,
+        n_limbs: int = 4,
         d_model: int = 128,
         n_heads: int = 8,
         n_layers: int = 1,
@@ -36,8 +36,8 @@ class LegTransformer(nn.Module):
         codesign_tokens: bool = False,
     ):
         super().__init__()
-        self.n_legs = n_legs
-        self.tokenize_fn = _TOKENIZE[n_legs]
+        self.n_limbs = n_limbs
+        self.tokenize_fn = _TOKENIZE[n_limbs]
         self.has_policy_head = policy_head
         self.has_value_head = value_head
         self.codesign_tokens = codesign_tokens
@@ -47,31 +47,31 @@ class LegTransformer(nn.Module):
         self.embed_ankle = nn.Linear(ankle_dim, d_model)
 
         self.type_emb = nn.Embedding(4 if codesign_tokens else 3, d_model)
-        self.pos_emb  = nn.Embedding(1 + n_legs, d_model)
+        self.pos_emb  = nn.Embedding(1 + n_limbs, d_model)
 
         if codesign_tokens:
-            # fixed 25-token layout: [CLS, start*n, hip*n, ankle*n]; off-legs are stop tokens,
+            # fixed 25-token layout: [CLS, start*n, hip*n, ankle*n]; off-limbs are stop tokens,
             # never masked. content (hip/ankle) carries a live/committed/stop mode embedding;
             # start tokens are persistent per-slot anchors (type+pos+angle).
             self.mode_emb = nn.Embedding(3, d_model)             # LIVE / COMMITTED / STOP
             self.angle_proj = nn.Linear(2, d_model)
             angle_enc = torch.tensor(
-                [[math.sin(i * math.pi / 4), math.cos(i * math.pi / 4)] for i in range(n_legs)],
-                dtype=torch.float32)                             # matches tokenize._LEG_ENC_8
+                [[math.sin(i * math.pi / 4), math.cos(i * math.pi / 4)] for i in range(n_limbs)],
+                dtype=torch.float32)                             # matches tokenize._LIMB_ENC_8
             self.register_buffer("angle_enc", angle_enc, persistent=False)
             type_ids = torch.tensor(
-                [_T_TORSO] + [_T_START] * n_legs + [_T_HIP] * n_legs + [_T_ANKLE] * n_legs,
+                [_T_TORSO] + [_T_START] * n_limbs + [_T_HIP] * n_limbs + [_T_ANKLE] * n_limbs,
                 dtype=torch.long)
-            pos_ids  = torch.tensor([0] + list(range(1, n_legs + 1)) * 3, dtype=torch.long)
-            self._content_start = 1 + n_legs                     # content tokens begin after starts
+            pos_ids  = torch.tensor([0] + list(range(1, n_limbs + 1)) * 3, dtype=torch.long)
+            self._content_start = 1 + n_limbs                     # content tokens begin after starts
         else:
-            type_ids = torch.tensor([0] + [1] * n_legs + [2] * n_legs, dtype=torch.long)
-            pos_ids  = torch.tensor([0] + list(range(1, n_legs + 1)) * 2, dtype=torch.long)
+            type_ids = torch.tensor([0] + [1] * n_limbs + [2] * n_limbs, dtype=torch.long)
+            pos_ids  = torch.tensor([0] + list(range(1, n_limbs + 1)) * 2, dtype=torch.long)
             self._content_start = 1
         self.n_tokens = type_ids.numel()
         self.register_buffer("type_ids",   type_ids,            persistent=False)
         self.register_buffer("pos_ids",    pos_ids,             persistent=False)
-        self.register_buffer("nat_to_dof", _make_nat_to_dof(n_legs), persistent=False)
+        self.register_buffer("nat_to_dof", _make_nat_to_dof(n_limbs), persistent=False)
 
         layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=n_heads, dim_feedforward=ffn,
@@ -116,7 +116,7 @@ class LegTransformer(nn.Module):
         x = torch.cat([t, h, a], dim=1)
         x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids)
 
-        # (B, 1+2*n_legs, 1): torso always active, then hip masks, then ankle masks
+        # (B, 1+2*n_limbs, 1): torso always active, then hip masks, then ankle masks
         token_mask = torch.cat(
             [torch.ones(B, 1, dtype=x.dtype, device=x.device), active_mask],
             dim=1,
@@ -130,12 +130,12 @@ class LegTransformer(nn.Module):
         return x * token_mask  # zero inactive outputs (cuts gradient through transformer)
 
     def _encode_codesign(self, torso, hip_tok, ankle_tok, active_mask, B):
-        """Fixed 25-token live-mode pass: off-legs become stop tokens (never masked), content
+        """Fixed 25-token live-mode pass: off-limbs become stop tokens (never masked), content
         carries a live/stop mode embedding, plus persistent start anchors. See CONTEXT.md."""
-        n = self.n_legs
-        leg_active = active_mask[:, :n]                          # (B,n) hip slots == per-leg presence
-        h = self.embed_hip(hip_tok)   * leg_active.unsqueeze(-1)  # zero stop legs' state embeds
-        a = self.embed_ankle(ankle_tok) * leg_active.unsqueeze(-1)
+        n = self.n_limbs
+        limb_active = active_mask[:, :n]                          # (B,n) hip slots == per-limb presence
+        h = self.embed_hip(hip_tok)   * limb_active.unsqueeze(-1)  # zero stop limbs' state embeds
+        a = self.embed_ankle(ankle_tok) * limb_active.unsqueeze(-1)
         cls = self.embed_torso(torso).unsqueeze(1)
         start = self.angle_proj(self.angle_enc).unsqueeze(0).expand(B, -1, -1)  # (B,n,d) angle only
         x = torch.cat([cls, start, h, a], dim=1)                 # (B, 1+3n, d)
@@ -186,8 +186,8 @@ class LegTransformer(nn.Module):
     def sample(self, n: int) -> dict[str, torch.Tensor]:
         """Unroll the generation MDP for n envs. Per env a random slot order; each step encode the
         current designed prefix, read v(prefix) from CLS, emit on/stop on the step's START token,
-        commit. >=1-leg guard forces ON on the final slot if nothing is on yet."""
-        dev, L = self.type_ids.device, self.n_legs
+        commit. >=1-limb guard forces ON on the final slot if nothing is on yet."""
+        dev, L = self.type_ids.device, self.n_limbs
         order = torch.argsort(torch.rand(n, L, device=dev), dim=1)   # (n,L) per-env permutation
         on   = torch.zeros(n, L, dtype=torch.bool, device=dev)
         stop = torch.zeros(n, L, dtype=torch.bool, device=dev)
@@ -201,7 +201,7 @@ class LegTransformer(nn.Module):
             v_states[:, t] = self.gencrit_head(H[:, 0]).squeeze(-1)
             slot = order[:, t]
             logits = self.gen_head(H[arange, 1 + slot])              # (n,2) from start token
-            if t == L - 1:                                           # >=1-leg guard on forced slot
+            if t == L - 1:                                           # >=1-limb guard on forced slot
                 logits[~on.any(1), _GEN_STOP] = float('-inf')
             dist = torch.distributions.Categorical(logits=logits)
             a = dist.sample()
@@ -221,7 +221,7 @@ class LegTransformer(nn.Module):
         (stack B*(L+1) designed prefixes, mask pending content per row). Returns the per-step GenAct
         logits at the chosen slot (B,L,2) and v(prefix) at every prefix (B,L+1)."""
         B, L = slots.shape
-        n = self.n_legs
+        n = self.n_limbs
         inv = torch.argsort(slots, dim=1)                          # (B,L) slot -> step decided
         act_by_slot = torch.gather(actions, 1, inv)               # (B,L) slot -> action
         steps = torch.arange(L + 1, device=slots.device).view(1, L + 1, 1)
@@ -269,8 +269,8 @@ class LegTransformer(nn.Module):
         return out
 
 
-def MultiMorphLegTransformer(n_layers: int = 3, **kwargs) -> LegTransformer:
-    kwargs.setdefault('n_legs', 8)
-    kwargs.setdefault('hip_dim', HIP_DIM_8)      # 8-leg tokens carry segment lengths
+def MultiMorphLimbTransformer(n_layers: int = 3, **kwargs) -> LimbTransformer:
+    kwargs.setdefault('n_limbs', 8)
+    kwargs.setdefault('hip_dim', HIP_DIM_8)      # 8-limb tokens carry segment lengths
     kwargs.setdefault('ankle_dim', ANKLE_DIM_8)
-    return LegTransformer(n_layers=n_layers, **kwargs)
+    return LimbTransformer(n_layers=n_layers, **kwargs)

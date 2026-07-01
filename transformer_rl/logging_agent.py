@@ -21,16 +21,16 @@ from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 
 
-# Leg slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
+# Limb slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
 # right = -Z, slot number increasing clockwise toward the right. See architectures/build_vsim.
 _LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
 _LEADERBOARD_EVERY = 50  # epochs
 _LEADERBOARD_K = 5       # top-k and bottom-k
 
 
-def _morph_label(legs) -> str:
-    """frozenset/list of leg slots -> compass-coded label, e.g. {2,4,6,8} -> 'FR.BR.BL.FL'."""
-    return "·".join(_LIMB_CODE[n] for n in sorted(legs))
+def _morph_label(limbs) -> str:
+    """frozenset/list of limb slots -> compass-coded label, e.g. {2,4,6,8} -> 'FR.BR.BL.FL'."""
+    return "·".join(_LIMB_CODE[n] for n in sorted(limbs))
 
 
 class LoggingA2CAgent(A2CAgent):
@@ -235,15 +235,15 @@ class LoggingA2CAgent(A2CAgent):
             self._morph_meta = False
             return False
         morphs = [sorted(g['morph'].legs) for g in env.groups]
-        by_legs: dict[int, list[int]] = {}
+        by_limbs: dict[int, list[int]] = {}
         for i, m in enumerate(morphs):
-            by_legs.setdefault(len(m), []).append(i)
+            by_limbs.setdefault(len(m), []).append(i)
         self._morph_meta = {
             'epm': env.envs_per_morph,
             'n': len(morphs),
             'labels': [_morph_label(m) for m in morphs],
-            'leg_counts': [len(m) for m in morphs],
-            'by_legs': by_legs,
+            'limb_counts': [len(m) for m in morphs],
+            'by_limbs': by_limbs,
         }
         return self._morph_meta
 
@@ -265,19 +265,19 @@ class LoggingA2CAgent(A2CAgent):
         w.add_scalar('morph_reward/std', per_morph.std().item(), frame)
 
         pm = per_morph.detach().cpu()
-        for k, idxs in meta['by_legs'].items():
-            w.add_scalar(f'morph_reward_legs/{k}', pm[torch.tensor(idxs)].mean().item(), frame)
+        for k, idxs in meta['by_limbs'].items():
+            w.add_scalar(f'morph_reward_limbs/{k}', pm[torch.tensor(idxs)].mean().item(), frame)
 
         if epoch_num and epoch_num % _LEADERBOARD_EVERY == 0:
             order = torch.argsort(pm, descending=True).tolist()
             k = min(_LEADERBOARD_K, n)
-            rows = ['| rank | morph | legs | reward |', '|---:|:---|---:|---:|']
+            rows = ['| rank | morph | limbs | reward |', '|---:|:---|---:|---:|']
             for r in range(k):  # top
                 i = order[r]
-                rows.append(f'| {r + 1} | {meta["labels"][i]} | {meta["leg_counts"][i]} | {pm[i]:.3f} |')
+                rows.append(f'| {r + 1} | {meta["labels"][i]} | {meta["limb_counts"][i]} | {pm[i]:.3f} |')
             if n > 2 * k:
                 rows.append('| … | … | … | … |')
             for r in range(max(k, n - k), n):  # bottom
                 i = order[r]
-                rows.append(f'| {r + 1} | {meta["labels"][i]} | {meta["leg_counts"][i]} | {pm[i]:.3f} |')
+                rows.append(f'| {r + 1} | {meta["labels"][i]} | {meta["limb_counts"][i]} | {pm[i]:.3f} |')
             w.add_text('morph_leaderboard', '\n'.join(rows), frame)

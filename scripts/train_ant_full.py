@@ -8,7 +8,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
 from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
-from transformer_rl import MultiMorphLegTransformerBuilder
+from transformer_rl import MultiMorphLimbTransformerBuilder
 
 # Full ant samples num_envs variable-length bodies (one per env) via env.sample_morphs in the config;
 # no fixed morphology_set, so num_actors stays as configured (epm=1).
@@ -18,6 +18,6 @@ run_training(
     name="ant_full_transformer",
     env_class=AntMultiMorphEnv,
     env_name="ant-multimorph-env",
-    network=("multimorph_leg_transformer", MultiMorphLegTransformerBuilder),
+    network=("multimorph_limb_transformer", MultiMorphLimbTransformerBuilder),
     model="transformer_masked_a2c_logstd",
 )

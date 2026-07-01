@@ -28,8 +28,8 @@ _VSIM_WINDOW_TITLES = ["vsim_render", "vsim", "vlearn"]
 _LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
 
 
-def _morph_label(legs) -> str:
-    return "·".join(_LIMB_CODE[n] for n in sorted(legs))
+def _morph_label(limbs) -> str:
+    return "·".join(_LIMB_CODE[n] for n in sorted(limbs))
 
 
 class _PlayLimiter:
@@ -66,7 +66,7 @@ def _print_and_save_test_results(
 
     morphs = [sorted(g['morph'].legs) for g in groups]
     labels = [_morph_label(m) for m in morphs]
-    leg_counts = [len(m) for m in morphs]
+    limb_counts = [len(m) for m in morphs]
     has_split = split_labels is not None
 
     rows = []
@@ -75,7 +75,7 @@ def _print_and_save_test_results(
             continue
         arr = np.array(ep_scores, dtype=np.float32)
         row = {
-            'gi': gi, 'morph': labels[gi], 'legs': leg_counts[gi],
+            'gi': gi, 'morph': labels[gi], 'limbs': limb_counts[gi],
             'n': len(arr), 'mean': float(arr.mean()),
             'median': float(np.median(arr)), 'std': float(arr.std()),
             'min': float(arr.min()), 'max': float(arr.max()),
@@ -92,12 +92,12 @@ def _print_and_save_test_results(
         return {'n': len(a), 'mean': a.mean(), 'median': float(np.median(a)),
                 'std': a.std(), 'min': a.min(), 'max': a.max()}
 
-    # Per-leg group summaries, optionally broken down by split
-    by_legs: dict[tuple, list[float]] = {}  # key = (split, legs) or (legs,)
+    # Per-limb group summaries, optionally broken down by split
+    by_limbs: dict[tuple, list[float]] = {}  # key = (split, limbs) or (limbs,)
     for r in rows:
-        key = (r.get('split', ''), r['legs']) if has_split else (r['legs'],)
-        by_legs.setdefault(key, []).extend(scores[r['gi']])
-    leg_rows = {k: _stats(v) for k, v in sorted(by_legs.items())}
+        key = (r.get('split', ''), r['limbs']) if has_split else (r['limbs'],)
+        by_limbs.setdefault(key, []).extend(scores[r['gi']])
+    limb_rows = {k: _stats(v) for k, v in sorted(by_limbs.items())}
 
     # Split-level summaries
     split_rows: dict[str, dict] = {}
@@ -109,14 +109,14 @@ def _print_and_save_test_results(
 
     # Console
     W = 20
-    hdr = f"{'morph':<{W}} {'legs':>4} {'n':>5} {'mean':>8} {'med':>8} {'std':>8} {'min':>8} {'max':>8}"
+    hdr = f"{'morph':<{W}} {'limbs':>4} {'n':>5} {'mean':>8} {'med':>8} {'std':>8} {'min':>8} {'max':>8}"
     sep = '-' * len(hdr)
     print(f"\n{'='*len(hdr)}\n{hdr}\n{sep}")
     for r in rows:
-        print(f"{r['morph']:<{W}} {r['legs']:>4} {r['n']:>5} {r['mean']:>8.2f} "
+        print(f"{r['morph']:<{W}} {r['limbs']:>4} {r['n']:>5} {r['mean']:>8.2f} "
               f"{r['median']:>8.2f} {r['std']:>8.2f} {r['min']:>8.2f} {r['max']:>8.2f}")
     print(sep)
-    for key, s in leg_rows.items():
+    for key, s in limb_rows.items():
         lbl = f"{key[0]} {key[1]}L" if has_split else f"{key[0]}L group"
         print(f"{lbl:<{W}} {key[-1]:>4} {s['n']:>5} {s['mean']:>8.2f} "
               f"{s['median']:>8.2f} {s['std']:>8.2f} {s['min']:>8.2f} {s['max']:>8.2f}")
@@ -159,16 +159,16 @@ def _print_and_save_test_results(
         for sp, s in split_rows.items():
             md_lines.append(_md_stats_row(sp, s))
     md_lines.append(_md_stats_row("**global**", _stats(all_scores)))
-    leg_hdr = "| split | legs |" if has_split else "| legs |"
-    leg_sep = "|:------|-----:|" if has_split else "|-----:|"
+    limb_hdr = "| split | limbs |" if has_split else "| limbs |"
+    limb_sep = "|:------|-----:|" if has_split else "|-----:|"
     md_lines += [
         f"",
-        f"## By Leg Count",
+        f"## By Limb Count",
         f"",
-        f"{leg_hdr} n | mean | median | std | min | max |",
-        f"{leg_sep}--:|-----:|-------:|----:|----:|----:|",
+        f"{limb_hdr} n | mean | median | std | min | max |",
+        f"{limb_sep}--:|-----:|-------:|----:|----:|----:|",
     ]
-    for key, s in leg_rows.items():
+    for key, s in limb_rows.items():
         prefix = f"{key[0]} | {key[1]}" if has_split else str(key[0])
         md_lines.append(_md_stats_row(prefix, s))
     split_col = " split |" if has_split else ""
@@ -177,13 +177,13 @@ def _print_and_save_test_results(
         f"",
         f"## Per Morphology",
         f"",
-        f"| morph | legs |{split_col} n | mean | median | std | min | max |",
+        f"| morph | limbs |{split_col} n | mean | median | std | min | max |",
         f"|:------|-----:|{split_sep}--:|-----:|-------:|----:|----:|----:|",
     ]
     for r in rows:
         sc = f" {r['split']} |" if has_split else ""
         md_lines.append(
-            f"| {r['morph']} | {r['legs']} |{sc} {r['n']} | {_f(r['mean'])} |"
+            f"| {r['morph']} | {r['limbs']} |{sc} {r['n']} | {_f(r['mean'])} |"
             f" {_f(r['median'])} | {_f(r['std'])} | {_f(r['min'])} | {_f(r['max'])} |"
         )
     md_path = out_dir / f"{stem}.md"
@@ -192,8 +192,8 @@ def _print_and_save_test_results(
 
     # CSV
     csv_path = out_dir / f"{stem}.csv"
-    fields = ['morph', 'legs', 'split', 'n', 'mean', 'median', 'std', 'min', 'max'] if has_split \
-        else ['morph', 'legs', 'n', 'mean', 'median', 'std', 'min', 'max']
+    fields = ['morph', 'limbs', 'split', 'n', 'mean', 'median', 'std', 'min', 'max'] if has_split \
+        else ['morph', 'limbs', 'n', 'mean', 'median', 'std', 'min', 'max']
     with open(csv_path, 'w', newline='') as f:
         w = _csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
         w.writeheader()
@@ -206,25 +206,25 @@ def _print_and_save_test_results(
     fig, ax = plt.subplots(figsize=(max(10, n * 0.45), 5))
 
     if not has_split:
-        unique_legs = sorted(set(r['legs'] for r in rows))
-        cmap = plt.cm.get_cmap('tab10', len(unique_legs))
-        leg_color = {l: cmap(i) for i, l in enumerate(unique_legs)}
-        colors = [leg_color[r['legs']] for r in rows]
-        legend_handles = [Patch(color=leg_color[l], label=f'{l} legs') for l in unique_legs]
+        unique_limbs = sorted(set(r['limbs'] for r in rows))
+        cmap = plt.cm.get_cmap('tab10', len(unique_limbs))
+        limb_color = {l: cmap(i) for i, l in enumerate(unique_limbs)}
+        colors = [limb_color[r['limbs']] for r in rows]
+        legend_handles = [Patch(color=limb_color[l], label=f'{l} limbs') for l in unique_limbs]
     else:
         def _shade(i, n): return 0.45 + 0.4 * (i / max(1, n - 1))
-        train_legs = sorted(set(r['legs'] for r in rows if r.get('split') == 'train'))
-        test_legs  = sorted(set(r['legs'] for r in rows if r.get('split') == 'test'))
-        train_color = {l: plt.cm.Blues(_shade(i, len(train_legs)))   for i, l in enumerate(train_legs)}
-        test_color  = {l: plt.cm.Oranges(_shade(i, len(test_legs)))  for i, l in enumerate(test_legs)}
+        train_limbs = sorted(set(r['limbs'] for r in rows if r.get('split') == 'train'))
+        test_limbs  = sorted(set(r['limbs'] for r in rows if r.get('split') == 'test'))
+        train_color = {l: plt.cm.Blues(_shade(i, len(train_limbs)))   for i, l in enumerate(train_limbs)}
+        test_color  = {l: plt.cm.Oranges(_shade(i, len(test_limbs)))  for i, l in enumerate(test_limbs)}
         colors = [
-            train_color.get(r['legs'], plt.cm.Blues(0.6)) if r.get('split') == 'train'
-            else test_color.get(r['legs'], plt.cm.Oranges(0.6))
+            train_color.get(r['limbs'], plt.cm.Blues(0.6)) if r.get('split') == 'train'
+            else test_color.get(r['limbs'], plt.cm.Oranges(0.6))
             for r in rows
         ]
         legend_handles = (
-            [Patch(color=train_color[l], label=f'train {l}L') for l in train_legs] +
-            [Patch(color=test_color[l],  label=f'test {l}L')  for l in test_legs]
+            [Patch(color=train_color[l], label=f'train {l}L') for l in train_limbs] +
+            [Patch(color=test_color[l],  label=f'test {l}L')  for l in test_limbs]
         )
 
     means = [r['mean'] for r in rows]
@@ -1099,7 +1099,7 @@ def run_training(
     from .models import TransformerMaskedNorm, MultiMorphValueBuilder, TransformerMaskedValue
     mb_module.register_model('transformer_masked_a2c_logstd', TransformerMaskedNorm)
     # PPG disjoint value net + value-only model (built by PPGAgent; harmless otherwise).
-    mb_module.register_network('multimorph_leg_value', MultiMorphValueBuilder)
+    mb_module.register_network('multimorph_limb_value', MultiMorphValueBuilder)
     mb_module.register_model('transformer_masked_value', TransformerMaskedValue)
 
     # --- Run ---

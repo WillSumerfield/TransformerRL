@@ -1,4 +1,4 @@
-"""Own-the-loop test rollout for the leg transformer (ADR-0007).
+"""Own-the-loop test rollout for the limb transformer (ADR-0007).
 
 `test` mode reuses the rl_games player only to *load* the checkpoint (weights + obs/value
 normalizers); this module owns the rollout so it can read the critic's per-step value estimate
@@ -19,7 +19,7 @@ import torch
 from rl_games.algos_torch.players import rescale_actions
 
 # obs layout (see envs/ant_envs/ant_multimorph.py): [107:123] = 8 hip + 8 ankle lengths,
-# [123:139] = 16-bit DOF mask (2 per leg).
+# [123:139] = 16-bit DOF mask (2 per limb).
 _LEN_LO, _LEN_HI = 107, 123
 _MASK_LO, _MASK_HI = 123, 139
 
@@ -88,7 +88,7 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
     cap = env.max_episode_length + 5
 
     # per-env summary (one row per env per sample) + ragged per-step traces (padded later)
-    s_sample, s_legs, s_lengths, s_rew, s_len, s_term, s_vt0 = ([] for _ in range(7))
+    s_sample, s_limbs, s_lengths, s_rew, s_len, s_term, s_vt0 = ([] for _ in range(7))
     val_traces: list[torch.Tensor] = []   # each [n, len_s] half, cpu
     rew_traces: list[torch.Tensor] = []
 
@@ -99,7 +99,7 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
         obs, _ = env.reset()
 
         lengths = obs[:, _LEN_LO:_LEN_HI].clone()                              # [n,16] hip*8 ankle*8
-        leg_count = (obs[:, _MASK_LO:_MASK_HI] > 0).sum(dim=1) // 2            # [n]
+        limb_count = (obs[:, _MASK_LO:_MASK_HI] > 0).sum(dim=1) // 2            # [n]
 
         active = torch.ones(n, dtype=torch.bool, device=dev)   # still in first episode
         cur_rew = torch.zeros(n, device=dev)
@@ -130,7 +130,7 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
         bar.close()
 
         s_sample.append(torch.full((n,), s, dtype=torch.long))
-        s_legs.append(leg_count.cpu())
+        s_limbs.append(limb_count.cpu())
         s_lengths.append(lengths.cpu())
         s_rew.append(cur_rew.cpu())
         s_len.append(ep_len.cpu())
@@ -148,7 +148,7 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
             out[s, :, : t.shape[1]] = t
         return out.numpy()
 
-    legs = torch.stack(s_legs).numpy()
+    limbs = torch.stack(s_limbs).numpy()
     lengths = torch.stack(s_lengths).numpy()
     rew = torch.stack(s_rew).numpy()
     ep_len = torch.stack(s_len).numpy()
@@ -165,7 +165,7 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
         npz_path,
         value=_pad_stack(val_traces),      # [S, n, max_len] raw-reward units, nan = post-episode pad
         reward=_pad_stack(rew_traces),     # [S, n, max_len] per-step raw reward
-        leg_count=legs, lengths=lengths, episode_reward=rew, episode_len=ep_len,
+        limb_count=limbs, lengths=lengths, episode_reward=rew, episode_len=ep_len,
         terminated=termed, value_t0=v_t0,
         reward_scale=reward_scale, max_episode_length=env.max_episode_length,
         checkpoint=str(checkpoint),

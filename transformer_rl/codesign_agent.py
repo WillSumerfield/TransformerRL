@@ -1,5 +1,5 @@
 """CodesignAgent: single-network codesign. Control (ContAct + ContCrit/V0.98) and the morphology
-generator (GenAct + GenCrit/V1.0) share ONE LegTransformer trunk (codesign_tokens=True) under one
+generator (GenAct + GenCrit/V1.0) share ONE LimbTransformer trunk (codesign_tokens=True) under one
 optimizer. See temp/codesign_single_network_plan.md and CONTEXT.md "Codesign heads/tokens".
 
 Two training regimes, both on self.optimizer:
@@ -124,7 +124,7 @@ class CodesignAgent(LoggingA2CAgent):
             return presence
         N = presence.shape[0]
         base = torch.bernoulli(self._base_toggle_p.expand(N, _N_LIMBS))
-        base[base.sum(1) == 0] = self._base_row            # >=1-leg guard for base draws
+        base[base.sum(1) == 0] = self._base_row            # >=1-limb guard for base draws
         self._base_draw = base                             # the around-base samples (build/limbcount_base)
         use_gen = (torch.rand(N, device=presence.device) < frac).unsqueeze(1)
         return torch.where(use_gen, presence, base)
@@ -301,7 +301,7 @@ class CodesignAgent(LoggingA2CAgent):
         env.set_next(presence)
         print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
-              f"legcount={presence.sum(1).mean().item():.2f}", flush=True)
+              f"limbcount={presence.sum(1).mean().item():.2f}", flush=True)
         env.resample()
         self.obs = self.env_reset()
         self.current_rewards.zero_(); self.current_lengths.zero_()
@@ -336,9 +336,9 @@ class CodesignAgent(LoggingA2CAgent):
         if self._base_draw is not None:                    # pretrain only: the around-base draws
             w.add_scalar('build/limbcount_base', self._base_draw.sum(1).mean().item(), frame)
         if self._cur_trace is not None:
-            legc = self._cur_trace['presence'].sum(1)      # per-env generated limb count (intent)
-            w.add_scalar('build/limbcount', legc.mean().item(), frame)
-            w.add_scalar('build/limbcount_var', legc.var().item(), frame)  # diversity / collapse canary
+            limbc = self._cur_trace['presence'].sum(1)      # per-env generated limb count (intent)
+            w.add_scalar('build/limbcount', limbc.mean().item(), frame)
+            w.add_scalar('build/limbcount_var', limbc.var().item(), frame)  # diversity / collapse canary
         if 'n_distinct_bodies' in g:
             w.add_scalar('build/n_distinct', g['n_distinct_bodies'], frame)
 

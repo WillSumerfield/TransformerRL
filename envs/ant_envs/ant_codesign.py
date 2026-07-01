@@ -1,14 +1,14 @@
 """AntCodesignEnv: the agent (owner of the morphology generator) hands it the per-env presence to
-build each resample window; the env builds REAL variable-leg bodies and reports.
+build each resample window; the env builds REAL variable-limb bodies and reports.
 
 Discrete presence: unlike the retired value-ascent AntCodesignEnv (ValueGradGenerator branch) there
-is NO continuous obs_p signal and NO binary-leg stub -- a removed leg is genuinely absent, so the
+is NO continuous obs_p signal and NO binary-limb stub -- a removed limb is genuinely absent, so the
 dof-mask + lengths in obs reflect it for free (no allocate_buffers override). One body per env
 (EPM=1, 4096 groups). See ADR-0010 / temp/ppg_phase2_plan.md.
 """
 import torch
 
-from .ant_multimorph import AntMultiMorphEnv, _N_LEGS
+from .ant_multimorph import AntMultiMorphEnv, _N_LIMBS
 from .build_vsim import Morphology
 
 
@@ -20,10 +20,10 @@ class AntCodesignEnv(AntMultiMorphEnv):
         super().__init__(num_envs, device, **kwargs)
 
     def set_next(self, presence):
-        """Store per-env presence (N,8) {0,1}; column j -> leg j+1. Effective at next rebuild."""
+        """Store per-env presence (N,8) {0,1}; column j -> limb j+1. Effective at next rebuild."""
         p = presence.detach().cpu().numpy() if torch.is_tensor(presence) else presence
-        bodies = [frozenset(j + 1 for j in range(_N_LEGS) if row[j]) for row in p]
-        assert all(b for b in bodies), "0-leg body; generator must guarantee >=1 active leg"
+        bodies = [frozenset(j + 1 for j in range(_N_LIMBS) if row[j]) for row in p]
+        assert all(b for b in bodies), "0-limb body; generator must guarantee >=1 active limb"
         self._next_bodies = bodies
 
     def _draw_morphs(self, num):
