@@ -1,6 +1,14 @@
 ---
-status: accepted
+status: superseded by ADR-0013
 ---
+
+> **Revision:** the **separate-net + distill-pair** framing here is superseded by
+> [ADR-0013](0013-codesign-single-network-merged-gencrit.md) — control and generator now share **one
+> trunk**, and the generator's aux value is **merged** with the control V1.0 head into a single
+> GenCrit head (no distill pair, no standalone time-aware V1.0 head; `R` is the true window return,
+> not `V1.0(s0)`). The **sequential per-token generation, the marginal-value advantage, the ≥1-leg
+> guard, and the pretrain BC ramp below all still stand** — ADR-0013 only changes the network
+> topology and the value function.
 
 # The codesign generator is a sequential per-token PPG with a marginal-value advantage (supersedes ADR-0010's generator)
 

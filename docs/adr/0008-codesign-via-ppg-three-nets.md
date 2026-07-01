@@ -1,12 +1,14 @@
 ---
-status: accepted
+status: superseded by ADR-0013
 ---
 
-> **Revision (Phase 2):** the **generator** half of this ADR is superseded by
-> [ADR-0010](0010-codesign-generator-unconditional-bandit.md) — the generator is now an
-> unconditional Bernoulli bandit (no transformer, no aux head, no V1.0 critic head). The
-> **control** half (PPG, disjoint nets) stands and was validated in Phase 1, but Phase-2 v1
-> runs **combined PPO control only** (the PPG-vs-combined A/B is deferred).
+> **Superseded by [ADR-0013](0013-codesign-single-network-merged-gencrit.md):** the three-net
+> codesign architecture is fully replaced by a **single shared trunk** (control + generator as four
+> heads). The generator half was already superseded by
+> [ADR-0010](0010-codesign-generator-unconditional-bandit.md) → ADR-0012; the **control** half here
+> (PPG, disjoint nets *for codesign*) is now retired too — codesign control trains as combined PPO
+> on the shared trunk. (Dual-network PPG survives only as a stand-alone control baseline, unrelated
+> to codesign.)
 
 # Codesign trains the morphology generator with classic PPG over three separate nets
 
