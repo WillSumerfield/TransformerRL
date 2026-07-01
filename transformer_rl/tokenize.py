@@ -2,15 +2,15 @@ import math
 import torch
 
 ROOT_DIM = 11   # y(1) + quat(4) + linvel(3) + angvel(3)
-HIP_DIM   = 5    # pos(1) + vel(1) + last_action(1) + sin(1) + cos(1)
-ANKLE_DIM = 11   # pos(1) + vel(1) + cfrc(6) + last_action(1) + sin(1) + cos(1)
-HIP_DIM_8   = 6  # 8-limb adds hip segment length
-ANKLE_DIM_8 = 12 # 8-limb adds ankle segment length
+EFF0_DIM   = 5    # pos(1) + vel(1) + last_action(1) + sin(1) + cos(1)
+EFF1_DIM = 11   # pos(1) + vel(1) + cfrc(6) + last_action(1) + sin(1) + cos(1)
+EFF0_DIM_8   = 6  # 8-limb adds eff0 segment length
+EFF1_DIM_8 = 12 # 8-limb adds eff1 segment length
 
 OBS_DIM_4  = 59
 MASK_DIM_4 = 8
 OBS_DIM_8  = 107  # physical obs; then lengths[107:123], then dof mask[123:139]
-LEN_DIM_8  = 16   # 8 hip + 8 ankle segment lengths (raw; normalized by the policy input normalizer)
+LEN_DIM_8  = 16   # 8 eff0 + 8 eff1 segment lengths (raw; normalized by the policy input normalizer)
 MASK_DIM_8 = 16
 
 _LIMB_ENC_4 = torch.tensor(
@@ -35,34 +35,34 @@ def _tokenize(obs, n_limbs, obs_dim, mask_dim, limb_enc, len_dim=0):
     acts      = obs[:, 11 + 2 * n_dof : 11 + 3 * n_dof]
     sensors   = obs[:, 11 + 3 * n_dof : obs_dim]
 
-    # Per-limb segment lengths (8-limb only): obs[obs_dim : obs_dim+n_limbs] hip, then ankle. The mask
+    # Per-limb segment lengths (8-limb only): obs[obs_dim : obs_dim+n_limbs] eff0, then eff1. The mask
     # follows the length block, so its offset shifts by len_dim.
-    hip_len   = obs[:, obs_dim : obs_dim + n_limbs] if len_dim else None
-    ankle_len = obs[:, obs_dim + n_limbs : obs_dim + 2 * n_limbs] if len_dim else None
+    eff0_len   = obs[:, obs_dim : obs_dim + n_limbs] if len_dim else None
+    eff1_len = obs[:, obs_dim + n_limbs : obs_dim + 2 * n_limbs] if len_dim else None
     mask_off  = obs_dim + len_dim
     raw_mask  = (obs[:, mask_off : mask_off + mask_dim]
                  if obs.shape[1] >= mask_off + mask_dim
                  else torch.ones(B, mask_dim, device=obs.device))
 
-    limb_active = (raw_mask[:, 0::2] > 0).float()  # (B, n_limbs) from hip slots
+    limb_active = (raw_mask[:, 0::2] > 0).float()  # (B, n_limbs) from eff0 slots
     enc = limb_enc.to(obs.device).unsqueeze(0).expand(B, -1, -1)  # (B, n_limbs, 2)
     enc = enc * limb_active.unsqueeze(-1)  # zero sin/cos for inactive limbs
 
-    hip_tokens = torch.stack([
+    eff0_tokens = torch.stack([
         torch.cat([dof_pos[:, 2*i:2*i+1], dof_vel[:, 2*i:2*i+1], acts[:, 2*i:2*i+1], enc[:, i, :]]
-                  + ([hip_len[:, i:i+1]] if len_dim else []), dim=-1)
+                  + ([eff0_len[:, i:i+1]] if len_dim else []), dim=-1)
         for i in range(n_limbs)
-    ], dim=1)  # (B, n_limbs, HIP_DIM[+1])
+    ], dim=1)  # (B, n_limbs, EFF0_DIM[+1])
 
-    ankle_tokens = torch.stack([
+    eff1_tokens = torch.stack([
         torch.cat([dof_pos[:, 2*i+1:2*i+2], dof_vel[:, 2*i+1:2*i+2], sensors[:, 6*i:6*i+6],
                    acts[:, 2*i+1:2*i+2], enc[:, i, :]]
-                  + ([ankle_len[:, i:i+1]] if len_dim else []), dim=-1)
+                  + ([eff1_len[:, i:i+1]] if len_dim else []), dim=-1)
         for i in range(n_limbs)
-    ], dim=1)  # (B, n_limbs, ANKLE_DIM[+1])
+    ], dim=1)  # (B, n_limbs, EFF1_DIM[+1])
 
     active_mask = (torch.cat([raw_mask[:, 0::2], raw_mask[:, 1::2]], dim=-1) > 0).float()  # (B, mask_dim)
-    return root, hip_tokens, ankle_tokens, active_mask
+    return root, eff0_tokens, eff1_tokens, active_mask
 
 
 def tokenize_4(obs):
