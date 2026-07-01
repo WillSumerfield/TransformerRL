@@ -12,8 +12,8 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEOS_DIR = _PROJECT_ROOT / "videos"
 
-# Camera position relative to the followed ant (world axes, Y up). The look
-# direction is auto-derived to point back at the ant.
+# Camera position relative to the followed robot (world axes, Y up). The look
+# direction is auto-derived to point back at the robot.
 CAMERA_OFFSET = (2.5, 2.5, 2.5)
 
 # Give the SDL render window a stable, unique WM_CLASS so _find_xwindow can
@@ -564,7 +564,7 @@ class FollowCamera:
     """Drives the viewer camera, with operator override via mouse + keys + GUI panel.
 
     Three viewing states (see scripts/CONTEXT.md "Follow camera"):
-      - auto-cycle : hops to a random ant each episode (the unattended default).
+      - auto-cycle : hops to a random robot each episode (the unattended default).
       - manual-follow : locked to one chosen group+env, persists across resets.
       - free-cam : camera detached; the renderer's built-in WASD/drag fly it.
     auto/manual are mutually exclusive; free-cam is an orthogonal overlay that
@@ -572,7 +572,7 @@ class FollowCamera:
 
     Orbit/zoom is mouse-driven in the two fixed states: the cursor is pinned to
     the window (warped back to centre each frame, see _MouseInput) and its motion
-    orbits the focused ant while the scroll wheel zooms. Because the cursor is
+    orbits the focused robot while the scroll wheel zooms. Because the cursor is
     pinned, the GUI widgets aren't clickable while following — press F (free-cam)
     to release the cursor and use the panel. In free-cam the mouse hands back to
     the renderer's built-in WASD/drag.
@@ -582,8 +582,8 @@ class FollowCamera:
       Q / E  prev / next group        Z / X  prev / next env
       F      toggle free-cam          C      back to auto-cycle
     The viewpoint in fixed states is a spherical offset (azimuth, elevation,
-    radius) around the focused ant; mouse/scroll mutate it and it persists as the
-    focus hops between ants. The GUI panel mirrors and also drives the discrete
+    radius) around the focused robot; mouse/scroll mutate it and it persists as the
+    focus hops between robots. The GUI panel mirrors and also drives the discrete
     state (bidirectional); keys win over a same-frame widget click.
     """
 
@@ -591,7 +591,7 @@ class FollowCamera:
     _KEYS = ("q", "e", "z", "x", "f", "c")          # discrete (rising-edge), left-hand
     MOUSE_SENS_BASE = math.radians(0.15)            # radians per pixel at sens=1.0
     SCROLL_ZOOM = 1.1                               # radius multiply per wheel tick
-    ELEV_MIN = math.radians(0.0)                  # don't look up from below the ant
+    ELEV_MIN = math.radians(0.0)                  # don't look up from below the robot
     ELEV_MAX = math.radians(85.0)                   # clamp near top to avoid pole flip
     RADIUS_MIN, RADIUS_MAX = 1.0, 30.0
 
@@ -743,7 +743,7 @@ class FollowCamera:
                 self.radius *= self.SCROLL_ZOOM ** (-ticks)   # wheel up -> zoom in
             self.radius = max(self.RADIUS_MIN, min(self.RADIUS_MAX, self.radius))
 
-        # Auto-cycle hops to a new ant when the followed episode ends or times out.
+        # Auto-cycle hops to a new robot when the followed episode ends or times out.
         if self.mode == "auto":
             prog = int(self.env.progress_buf[self._cur_idx()].item())
             if prog - self._start_time > self.MAX_FRAMES_PER_MORPH or prog < self._last_progress:
