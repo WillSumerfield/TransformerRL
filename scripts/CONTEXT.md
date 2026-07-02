@@ -5,7 +5,7 @@ PPO training, Optuna tuning, and play/render/test orchestration for the limb tra
 ## Language
 
 **Run mode**:
-The first positional arg to any `train_ant_*.py`: `train` (default), `play`, `random`, or `test`. Headless defaults: `train` and `test` are headless; `play` opens a render window. `--video` is not supported in `train` mode.
+The first positional arg to any `train_ant_*.py`: `train` (default), `play`, `random`, or `test`. Headless defaults: `train` and `test` are headless; `play` opens a render window. `--video` is not supported in `train` mode. In `play` the positional checkpoint arg accepts a directory (see [Controller](#) / [Policy switching](#)), not just a `.pth` file; `test` still takes a single `.pth`.
 
 **Run name**:
 The leaf label identifying a single training run, the last segment of its output dir (`runs/<env>/<model>/<run-name>`). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.
@@ -29,7 +29,18 @@ Optional parameter to `run_training`. When provided, enables `--train-pct`/`--te
 **Follow camera**:
 The viewer's camera controller in `play`/`random`. Has three viewing states: **auto-cycle** (default — hops to a random robot each episode), **manual-follow** (locked to one operator-chosen group+env, persists across episode resets), and **free-cam** (camera detached, driven by the renderer's built-in WASD/drag). Group = morphology (`EnvironmentGroup`), env = one robot instance within it. Auto-cycle and manual-follow are mutually exclusive; free-cam is an orthogonal overlay that restores the prior state on exit.
 In both fixed states (auto-cycle and manual-follow) the operator can **orbit** (mouse motion rotates the viewpoint around the focused robot) and **zoom** (scroll wheel sets the focus distance); the chosen angle and distance persist as the focus hops between robots. Orbit/zoom have no effect in free-cam (the built-in controls own the camera there). While following, the cursor is pinned to the window (so the mouse can orbit), which makes the GUI panel unclickable — switch to free-cam to use it.
+The same panel also hosts the [policy-switching](#) controls (epoch dropdown, run dropdown, and the `R`/`T` epoch keys); the camera controller detects those changes and hands them to the player.
 _Avoid_: calling free-cam "manual" — manual-follow still tracks a robot; free-cam tracks nothing. Orbit is not free-cam: orbit keeps the robot centred, free-cam does not.
+
+**Controller**:
+The trained checkpoint currently driving the robots in `play` — the control policy (and, in codesign envs, the body generator inside the same net). "Changing the controller" means loading different weights: a different [epoch](#) or a different run. Every controller change triggers a full env reset; in codesign envs that reset re-runs the new generator and rebuilds the sim to freshly-sampled bodies, so a controller change also changes the morphology distribution on screen.
+
+**Policy switching** (`play`):
+The `play`-mode feature for stepping through a run's checkpoints live. The positional arg is a directory, not a `.pth`:
+- a **run dir** (contains `nn/`, e.g. `runs/ant_full/full_transformer/s42`) → one **epoch dropdown**;
+- a **model dir** (a `<model>` dir of run folders, e.g. `runs/ant_full/full_transformer`) → an extra **run dropdown** plus the epoch dropdown.
+The epoch dropdown lists a run's `nn/` checkpoints with **best** on top (the bare `<name>.pth`, rl_games' best-mean-reward save, identified via `config.name`) followed by the `last_<name>_ep_<N>_rew_<R>.pth` snapshots ascending by epoch; playback starts on **best**. `R`/`T` step the epoch backward/forward through the dropdown order (wrapping); the run dropdown has no hotkey and, when changed, is itself a [controller](#) change that repopulates the epoch dropdown and jumps to that run's best. The env/network are still built from the script default config (or `--config`) — the run dir supplies weights only. `play` also defaults to **64 envs** (overriding the config's `num_actors`, itself overridden by `--num_envs`) to keep the codesign rebuild-on-switch snappy.
+_Avoid_: calling the run dropdown the "model" dropdown in prose — it selects **runs** within one `<model>` dir; all share one architecture, which is what makes live restore shape-safe.
 
 **Episode score**:
 Cumulative raw reward over one episode (sum of `_rew_buf` across steps until termination or truncation). The unit of measurement in `test` mode results.
