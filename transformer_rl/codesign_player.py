@@ -29,9 +29,11 @@ class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
     def env_reset(self, env):
         e = self._env()
         if self._gen and getattr(e, '_sample_morphs', False):
-            presence = self.model.a2c_network.net.sample(e.total_num_envs)['presence']
-            e.set_next(presence)
+            tr = self.model.a2c_network.net.sample(e.total_num_envs)
+            counts = tr['counts'].long()
+            e.set_next(counts)
             e.resample()                               # full rebuild to the sampled bodies
             print(f"[codesign-play] sampled bodies: mean #limbs="
-                  f"{presence.sum(1).mean().item():.2f}", flush=True)
+                  f"{(counts > 0).sum(1).float().mean().item():.2f} "
+                  f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
         return super().env_reset(env)

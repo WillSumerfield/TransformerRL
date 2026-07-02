@@ -22,10 +22,8 @@ from torch.nn.utils import clip_grad_norm_
 
 from .architectures import _GEN_ON, _GEN_STOP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
-from .tokenize import OBS_DIM_8, LEN_DIM_8
 
-_N_LIMBS = 8
-_MASK_OFF = OBS_DIM_8 + LEN_DIM_8           # DOF mask at obs[123:139]
+_N_LIMBS = 8                                 # obs mask offset / n_dof derive from the net's tdims
 
 
 def _gauss_kl(mu_old, ls_old, mu_new, ls_new):
@@ -46,14 +44,21 @@ class CodesignAgent(LoggingA2CAgent):
         dev = self.ppo_device
         N = self.num_actors * self.num_agents
 
+        # obs layout + action dim from the net's tdims (single source of truth). Phase-1: 32 DOF,
+        # mask at obs[187:219]; a limb is a chain of up to _max_len modules.
+        self._n_dof = net.tdims['n_dof']
+        self._mask_off = net.tdims['obs_base'] + net.tdims['len_dim']
+        self._max_len = net.max_limb_length
+
         env = self._env()                                  # base_legs from the ENV -> window-0 match
         self._base_legs = tuple(sorted(getattr(env, '_base_legs', cd.get('base_legs', (1, 4, 6)))))
-        flip = float(cd.get('desirable_flip_prob', 0.10))
+        self._flip = float(cd.get('desirable_flip_prob', 0.10))    # per-token continue/stop flip prob
         bset = set(self._base_legs)
-        self._base_toggle_p = torch.tensor(
-            [(1.0 - flip) if (i + 1) in bset else flip for i in range(_N_LIMBS)], device=dev)
-        self._base_row = torch.tensor(
-            [1.0 if (i + 1) in bset else 0.0 for i in range(_N_LIMBS)], device=dev)
+        # base morph = base_legs @ count-2 (1 swing + 1 knee). Per-token flip noise around this target
+        # length gives P(limb differs by +-1 token)=flip, +-2=flip^2, ... (presence + length unified).
+        self._base_target = torch.tensor(
+            [2 if (i + 1) in bset else 0 for i in range(_N_LIMBS)], dtype=torch.long, device=dev)
+        self._base_counts = self._base_target.clone()      # window-0 realized body == base target
 
         # generator hyperparameters (shared optimizer; the heads live on self.model)
         self._n_pretrain = cd.get('n_pretrain', 8)
@@ -70,10 +75,10 @@ class CodesignAgent(LoggingA2CAgent):
         self._r_scale = float(_shaper['scale_value'] if isinstance(_shaper, dict)
                               else getattr(_shaper, 'scale_value', 1.0))
 
-        # window state: window 0 is the env's base build, so _cur_presence = base everywhere.
-        self._cur_presence = self._base_row.expand(N, _N_LIMBS).clone()
+        # window state: window 0 is the env's base build, so _cur_counts = base everywhere.
+        self._cur_counts = self._base_counts.view(1, _N_LIMBS).expand(N, _N_LIMBS).clone()
         self._cur_trace = None                             # last sample() trace (RL update input)
-        self._base_draw = None                             # last base+-flip ramp draws (pretrain)
+        self._base_draw = None                             # last base+-flip ramp draws (counts, pretrain)
         self._gen_window = 0
         self._gen_log = None
         self._last_R = None
@@ -90,8 +95,53 @@ class CodesignAgent(LoggingA2CAgent):
         return self.model.a2c_network.net
 
     def _log_std(self, obs):
-        mask = (obs[..., _MASK_OFF:_MASK_OFF + 2 * _N_LIMBS] > 0).float()
+        mask = (obs[..., self._mask_off:self._mask_off + self._n_dof] > 0).float()
         return mask * self.model.a2c_network.log_std_param
+
+    # ---- scripted frontier rollout: target-length teacher, optional per-token flip noise ---------
+    @torch.no_grad()
+    def _frontier_rollout(self, target, flip):
+        """Walk the SAME frontier MDP as net.sample but with a scripted policy: at a limb of current
+        length c, canonical action = continue if c < target[limb] else stop, flipped with prob `flip`.
+        Random growable tip each step, >=1-limb guard, cap _max_len. Returns
+        (slots, actions, active_step, counts) over L=n*max_len steps. Used to (a) draw base+-flip
+        bodies (flip=p, target=base) and (b) reconstruct a valid token sequence for a target body
+        (flip=0, target=counts) for BC."""
+        dev = target.device
+        N, n = target.shape
+        max_len = self._max_len
+        L = n * max_len
+        count = torch.zeros(N, n, dtype=torch.long, device=dev)
+        stopped = torch.zeros(N, n, dtype=torch.bool, device=dev)
+        slots = torch.zeros(N, L, dtype=torch.long, device=dev)
+        actions = torch.zeros(N, L, dtype=torch.long, device=dev)
+        active_step = torch.zeros(N, L, dtype=torch.bool, device=dev)
+        arange = torch.arange(N, device=dev)
+        for t in range(L):
+            growable = ~stopped
+            active = growable.any(1)
+            r = torch.rand(N, n, device=dev)
+            slot = torch.where(growable, r, r.new_full((), -1.0)).argmax(1)
+            canon_cont = count[arange, slot] < target[arange, slot]
+            if flip > 0:
+                canon_cont = canon_cont ^ (torch.rand(N, device=dev) < flip)
+            force = active & (count.sum(1) == 0) & (growable.sum(1) == 1)   # >=1-limb guard
+            do_cont = canon_cont | force
+            cont = do_cont & active
+            count[arange, slot] += cont.long()
+            reached = count[arange, slot] >= max_len
+            stopped[arange, slot] |= ((~do_cont) & active) | (cont & reached)
+            slots[:, t] = slot
+            actions[:, t] = torch.where(do_cont, do_cont.new_full((), _GEN_ON),
+                                        do_cont.new_full((), _GEN_STOP)).long()
+            active_step[:, t] = active
+        return slots, actions, active_step, count
+
+    @torch.no_grad()
+    def _draw_base_counts(self, N):
+        """Base +- per-token flip noise -> body counts (N, n)."""
+        return self._frontier_rollout(self._base_target.view(1, _N_LIMBS).expand(N, _N_LIMBS),
+                                      self._flip)[3]
 
     # ---- accumulate true episode returns (R_i, gamma=1) over the window ----------------
     def env_step(self, actions):
@@ -117,17 +167,17 @@ class CodesignAgent(LoggingA2CAgent):
 
     # ---- ramp: replace (1 - gen_fraction) of envs with base+-flip bodies -----------
     @torch.no_grad()
-    def _apply_ramp(self, presence):
+    def _apply_ramp(self, counts):
+        """counts: (N, n) long generator-sampled module counts. Mix in base+-flip draws by fraction."""
         frac = self._gen_fraction()
         if frac >= 1.0:
             self._base_draw = None                         # RL phase: pure gen samples, no base draws
-            return presence
-        N = presence.shape[0]
-        base = torch.bernoulli(self._base_toggle_p.expand(N, _N_LIMBS))
-        base[base.sum(1) == 0] = self._base_row            # >=1-limb guard for base draws
-        self._base_draw = base                             # the around-base samples (build/limbcount_base)
-        use_gen = (torch.rand(N, device=presence.device) < frac).unsqueeze(1)
-        return torch.where(use_gen, presence, base)
+            return counts
+        N = counts.shape[0]
+        base = self._draw_base_counts(N)                   # (N,n) counts (>=1-module guaranteed)
+        self._base_draw = base                             # the around-base samples (build/*_base)
+        use_gen = (torch.rand(N, device=counts.device) < frac).unsqueeze(1)
+        return torch.where(use_gen, counts, base)
 
     # ---- the resample-boundary joint update (one optimizer) -------------------------
     def _resample_update(self, R, obses):
@@ -144,7 +194,7 @@ class CodesignAgent(LoggingA2CAgent):
         # H*N can be ~65k states -> a single trunk pass OOMs at scale (storing the result is cheap).
         with torch.no_grad():
             ls_old = self._log_std(obs_flat)
-            mu_old = obs_flat.new_empty(HN, 2 * _N_LIMBS)
+            mu_old = obs_flat.new_empty(HN, self._n_dof)
             v098_old = obs_flat.new_empty(HN, 1)
             for s in range(0, HN, self.minibatch_size):
                 m, v, _ = net.codesign_forward(self.model.norm_obs(obs_flat[s:s + self.minibatch_size]))
@@ -152,18 +202,18 @@ class CodesignAgent(LoggingA2CAgent):
                 v098_old[s:s + self.minibatch_size] = v
 
         pretrain = self._in_pretrain()
-        if pretrain:                                       # BC toward the built body, random order
-            order = torch.argsort(torch.rand(N, _N_LIMBS, device=dev), dim=1)
-            pres = self._cur_presence
-            act = torch.where(pres > 0, pres.new_full((), _GEN_ON),
-                              pres.new_full((), _GEN_STOP)).long()
-            slots, actions = order, torch.gather(act, 1, order)
+        if pretrain:                                       # BC toward the built body (frontier tokens)
+            # reconstruct a valid token sequence that yields _cur_counts (random tip order, no flip)
+            slots, actions, valid, _ = self._frontier_rollout(self._cur_counts, 0.0)
             old_logp, adv, raw_adv = None, None, None
         else:                                              # RL: PPO over the sampled trace
             tr = self._cur_trace
             slots, actions, old_logp = tr['slots'], tr['actions'], tr['old_logp']
+            valid = tr['active_step']                                     # mask no-op frontier steps
             raw_adv = tr['v_states'][:, 1:] - tr['v_states'][:, :-1]      # telescoping (Shapley)
-            adv = (raw_adv - raw_adv.mean()) / (raw_adv.std() + 1e-8)
+            sel = raw_adv[valid]
+            adv = torch.zeros_like(raw_adv)
+            adv[valid] = (sel - sel.mean()) / (sel.std() + 1e-8)
 
         G = self._gen_minibatches
         mb_size = max(1, N // G)
@@ -173,16 +223,20 @@ class CodesignAgent(LoggingA2CAgent):
             for s in range(0, N, mb_size):
                 mb = perm[s:s + mb_size]
                 # --- generator: GenAct (PPO or BC) + GenCrit prefix fit ---
-                logits, v = net.gen_replay(slots[mb], actions[mb])       # (m,L,2), (m,L+1)
+                # gen_replay re-derives the valid (non-no-op) step mask from (slots,actions); average
+                # GenAct losses over valid steps only so no-op frontier steps don't dilute the signal.
+                logits, v, vm = net.gen_replay(slots[mb], actions[mb])   # (m,L,2), (m,L+1), (m,L)
+                vf = vm.float()
+                nval = vf.sum().clamp(min=1.0)
                 dist = torch.distributions.Categorical(logits=logits)
                 if pretrain:
-                    gen_pg = -dist.log_prob(actions[mb]).mean()
+                    gen_pg = -(dist.log_prob(actions[mb]) * vf).sum() / nval
                 else:
                     ratio = (dist.log_prob(actions[mb]) - old_logp[mb]).exp()
                     a = adv[mb]
-                    gen_pg = -torch.min(ratio * a, ratio.clamp(1 - self._gen_clip,
-                                                               1 + self._gen_clip) * a).mean()
-                ent = dist.entropy().mean()
+                    per = torch.min(ratio * a, ratio.clamp(1 - self._gen_clip, 1 + self._gen_clip) * a)
+                    gen_pg = -(per * vf).sum() / nval
+                ent = (dist.entropy() * vf).sum() / nval
                 v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
 
                 # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
@@ -206,22 +260,23 @@ class CodesignAgent(LoggingA2CAgent):
 
         self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
         # body-quality outcome (the optimization target); R aligns with the current window's
-        # realized bodies (_cur_presence), before _maybe_resample samples the next window.
+        # realized bodies (_cur_counts), before _maybe_resample samples the next window.
         self._gen_log['R_var'] = R.var(unbiased=False).item()    # scale for the GenCrit vloss norm
         self._gen_log['R_mean'] = R.mean().item()
         self._gen_log['R_std'] = R.std().item()
-        self._gen_log['by_limbcount'] = self._by_limbcount(R, self._cur_presence)
+        self._gen_log['by_limbcount'] = self._by_limbcount(R, self._cur_counts)
         if not pretrain:                                   # RL: built body == generated (ramp off)
-            self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions)
-            rank, ev, K = self._body_value_metrics(self._cur_trace['presence'],
+            self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions, valid)
+            rank, ev, K = self._body_value_metrics(self._cur_trace['counts'],
                                                    self._cur_trace['v_states'][:, -1], R)
             self._gen_log['value_rank_corr'] = rank       # denoised Spearman (NaN if <5 bodies)
             self._gen_log['value_ev'] = ev                # denoised per-body explained variance
             self._gen_log['n_distinct_bodies'] = float(K)
 
     @torch.no_grad()
-    def _slot_marginal(self, raw_adv, slots, actions):
-        on = actions == _GEN_ON
+    def _slot_marginal(self, raw_adv, slots, actions, valid):
+        """Per-limb marginal value of adding a module (continue token), over valid steps only."""
+        on = (actions == _GEN_ON) & valid
         marg = torch.full((_N_LIMBS,), float('nan'), device=raw_adv.device)
         for k in range(_N_LIMBS):
             m = on & (slots == k)
@@ -231,23 +286,24 @@ class CodesignAgent(LoggingA2CAgent):
 
     @staticmethod
     @torch.no_grad()
-    def _by_limbcount(R, presence):
-        """Mean body-return R grouped by LIMB count (start tokens with >=1 committed content
-        token == presence.sum(1)). Answers the codesign hypothesis: do more limbs earn more R?"""
-        lc = presence.sum(1).long()
+    def _by_limbcount(R, counts):
+        """Mean body-return R grouped by LIMB count (#limbs with >=1 module == (counts>0).sum(1)).
+        Answers the codesign hypothesis: do more limbs earn more R?"""
+        lc = (counts > 0).sum(1).long()
         return {int(k): R[lc == k].mean().item() for k in lc.unique()}
 
     @staticmethod
     @torch.no_grad()
-    def _body_value_metrics(presence, v_full, R):
-        """Denoised body-quality fit: group envs by distinct body, then compare the generator's
-        v(full) to each body's MEAN R (removes reset noise). Returns (rank_corr, ev, n_bodies):
+    def _body_value_metrics(counts, v_full, R):
+        """Denoised body-quality fit: group envs by distinct body (module-count vector), then compare
+        the generator's v(full) to each body's MEAN R (removes reset noise). Returns (rank_corr, ev,
+        n_bodies):
           rank_corr = Spearman over bodies (NaN if <5 -> unreliable); spread/scale-robust.
           ev        = 1 - Var(meanR - v)/Var(meanR) over bodies (NaN if <2).
         Valid only when built==generated (RL phase), where R matches the generated body."""
         dev = R.device
-        bits = (presence > 0).long()
-        body_id = (bits * (2 ** torch.arange(_N_LIMBS, device=dev))).sum(1)
+        base = int(counts.max().item()) + 1                       # radix over count values (>= max_len+1)
+        body_id = (counts.long() * (base ** torch.arange(_N_LIMBS, device=dev))).sum(1)
         _, inv = body_id.unique(return_inverse=True)
         K = int(inv.max().item()) + 1
         cnt = torch.zeros(K, device=dev).index_add_(0, inv, torch.ones_like(R))
@@ -296,12 +352,13 @@ class CodesignAgent(LoggingA2CAgent):
                      R=R.cpu().numpy())
 
         trace = self._net().sample(N)
-        presence = self._apply_ramp(trace['presence'])
-        self._cur_trace, self._cur_presence = trace, presence
-        env.set_next(presence)
+        counts = self._apply_ramp(trace['counts'].long())
+        self._cur_trace, self._cur_counts = trace, counts
+        env.set_next(counts)
         print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
-              f"limbcount={presence.sum(1).mean().item():.2f}", flush=True)
+              f"limbcount={(counts > 0).sum(1).float().mean().item():.2f} "
+              f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
         env.resample()
         self.obs = self.env_reset()
         self.current_rewards.zero_(); self.current_lengths.zero_()
@@ -328,17 +385,22 @@ class CodesignAgent(LoggingA2CAgent):
         frame = args[11] if len(args) > 11 else kwargs.get('frame')
         g = self._gen_log
 
-        # --- build/: the body the generator produces ---
-        rate = self._cur_presence.mean(0)                  # per-limb realized on-rate
+        # --- build/: the body the generator produces (realized = built body, counts) ---
+        rate = (self._cur_counts > 0).float().mean(0)      # per-limb realized presence rate
         for i in range(_N_LIMBS):
             w.add_scalar(f'build/p/{_LIMB_CODE[i + 1]}', rate[i].item(), frame)
-        w.add_scalar('build/limbcount_realized', self._cur_presence.sum(1).mean().item(), frame)
+        w.add_scalar('build/limbcount_realized', (self._cur_counts > 0).sum(1).float().mean().item(), frame)
+        w.add_scalar('build/modulecount_realized', self._cur_counts.sum(1).float().mean().item(), frame)
         if self._base_draw is not None:                    # pretrain only: the around-base draws
-            w.add_scalar('build/limbcount_base', self._base_draw.sum(1).mean().item(), frame)
+            w.add_scalar('build/limbcount_base', (self._base_draw > 0).sum(1).float().mean().item(), frame)
+            w.add_scalar('build/modulecount_base', self._base_draw.sum(1).float().mean().item(), frame)
         if self._cur_trace is not None:
             limbc = self._cur_trace['presence'].sum(1)      # per-env generated limb count (intent)
+            modc = self._cur_trace['counts'].sum(1)         # per-env generated module count (intent)
             w.add_scalar('build/limbcount', limbc.mean().item(), frame)
             w.add_scalar('build/limbcount_var', limbc.var().item(), frame)  # diversity / collapse canary
+            w.add_scalar('build/modulecount', modc.mean().item(), frame)
+            w.add_scalar('build/modulecount_var', modc.var().item(), frame)
         if 'n_distinct_bodies' in g:
             w.add_scalar('build/n_distinct', g['n_distinct_bodies'], frame)
 
@@ -377,7 +439,7 @@ class CodesignAgent(LoggingA2CAgent):
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):
         s = super().get_full_state_weights()
-        s.update(gen_window=self._gen_window, cur_presence=self._cur_presence,
+        s.update(gen_window=self._gen_window, cur_counts=self._cur_counts,
                  cur_trace=self._cur_trace, steps_since_resample=self._steps_since_resample)
         return s
 
@@ -386,7 +448,7 @@ class CodesignAgent(LoggingA2CAgent):
         if 'gen_window' not in weights:
             return
         self._gen_window = int(weights['gen_window'])
-        self._cur_presence = weights['cur_presence'].to(self.ppo_device)
+        self._cur_counts = weights['cur_counts'].to(self.ppo_device)
         tr = weights.get('cur_trace')
         self._cur_trace = {k: v.to(self.ppo_device) for k, v in tr.items()} if tr else None
         self._steps_since_resample = int(weights.get('steps_since_resample', 0))
