@@ -12,11 +12,14 @@ effect on runtime, performance, convergence, and morphology diversity is measure
 overlaid in one shared notebook. This is a contract — changing it later means re-running every
 phase — so it is fixed here.
 
-**Artifact.** Each phase commits one self-contained `data/phase_comparison/<phaseN_name>.npz`. The
-notebook globs the directory and overlays each phase as a series on every chart. The artifact holds
-the phase's **best-config** run over a **fixed seed set of 5** (`[42..46]`), storing **per-seed
-arrays** (needed for between-seed diversity + mode-overlap) plus mean±std. No single-seed
-cherry-picking. Re-running a phase = check out its commit, rerun, recommit its `.npz`.
+**Artifact.** Each phase's run writes one self-contained `data/phase_comparison/<phaseN_name>.npz`.
+`data/` is **gitignored** (repo convention — all experiment outputs are scratch), so artifacts are
+**local-only, never committed**; the notebook globs the local directory and overlays whatever phases
+are present. It holds the phase's **best-config** run over a **fixed seed set of 5** (`[42..46]`),
+storing **per-seed arrays** (needed for between-seed diversity + mode-overlap) plus mean±std. No
+single-seed cherry-picking. **Regenerating a phase** = check out its commit and rerun
+`phase_comparison.py`, which reproduces its local `.npz`. The per-phase *interpretation prose* lives
+in the tracked notebook, so it travels across branches even though the raw arrays do not.
 
 **Fair-comparison axis.** Held constant across phases: **total env-step budget**, env count, seed
 set. Everything else is a measured *output* (runtime cannot be an input — it is a headline metric).
@@ -76,6 +79,10 @@ series every later phase is compared against. It generalizes `experiments/ant_co
 
 - The `.npz` schema + metric definitions are a **contract**; every phase honors it, and changing it
   forces re-running all phases (the reason this is an ADR).
+- **Artifacts are local scratch, not version-controlled** (`data/` is gitignored). The notebook
+  overlays only phases present in the local `data/phase_comparison/`; a fresh clone shows nothing
+  until phases are (re)run. Regeneration = check out the phase's commit and rerun the harness. Only
+  code, the ADR, the glossary, and the notebook (incl. its interpretation prose) are committed.
 - **Eval-return is only cross-comparable within one task.** Phases 7 (new tasks) and 10 (multi-task)
   break the single-return axis — the notebook must group performance by task there, not overlay
   raw returns. Runtime and diversity remain comparable across all phases.
