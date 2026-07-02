@@ -18,10 +18,11 @@ from pathlib import Path
 import torch
 from rl_games.algos_torch.players import rescale_actions
 
-# obs layout (see envs/ant_envs/ant_multimorph.py): [107:123] = 8 hip + 8 ankle lengths,
-# [123:139] = 16-bit DOF mask (2 per limb).
-_LEN_LO, _LEN_HI = 107, 123
-_MASK_LO, _MASK_HI = 123, 139
+# obs layout (see envs/ant_envs/ant_multimorph.py): [obs_base : obs_base+n_dof] = module lengths,
+# then [.. : obs_total] = the n_dof-bit depth-major DOF mask. Phase-1: lengths[155:187], mask[187:219].
+from envs.ant_envs.ant_multimorph import (_OBS_BASE as _LEN_LO, _LEN_DIM, _N_LIMBS, _MAX_LEN)  # noqa: E402
+_LEN_HI = _MASK_LO = _LEN_LO + _LEN_DIM
+_MASK_HI = _MASK_LO + _LEN_DIM
 
 
 @torch.no_grad()
@@ -98,8 +99,10 @@ def _run_full(player, env, *, num_samples, reward_scale, checkpoint, out_stem):
             env.resample()
         obs, _ = env.reset()
 
-        lengths = obs[:, _LEN_LO:_LEN_HI].clone()                              # [n,16] hip*8 ankle*8
-        limb_count = (obs[:, _MASK_LO:_MASK_HI] > 0).sum(dim=1) // 2            # [n]
+        lengths = obs[:, _LEN_LO:_LEN_HI].clone()                              # [n, n_dof] module lengths
+        # limb count = #limbs with >=1 module (depth-major mask -> (max_len, n_limbs), any over depth)
+        mask_dn = (obs[:, _MASK_LO:_MASK_HI] > 0).view(-1, _MAX_LEN, _N_LIMBS)
+        limb_count = mask_dn.any(dim=1).sum(dim=1)                              # [n]
 
         active = torch.ones(n, dtype=torch.bool, device=dev)   # still in first episode
         cur_rew = torch.zeros(n, device=dev)
