@@ -45,7 +45,7 @@ params:
 
     generator:               # generator heads share the trunk/optimizer (no separate net/lr)
       base_legs: [1, 4, 6]
-      desirable_flip_prob: 0.10
+      desirable_flip_prob: 0.05
       n_pretrain: 8          # warmup windows (BC toward built body + value fit, ramp gen-frac 0->1)
       epochs: 4
       minibatches: 4
