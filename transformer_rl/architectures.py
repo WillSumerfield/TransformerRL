@@ -4,6 +4,7 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .tokenize import tokenize_4, tokenize_8, ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8
 
@@ -18,6 +19,24 @@ _GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action i
 def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
     idx = torch.arange(2 * n_limbs, dtype=torch.long)
     return idx // 2 + n_limbs * (idx % 2)
+
+
+class MatmulEmbedding(nn.Embedding):
+    """Drop-in `nn.Embedding` whose forward is `one_hot(ids) @ weight` instead of a row gather.
+
+    Forward output is identical (bit-for-bit). The only difference is the BACKWARD. A gather's
+    backward is a scatter-accumulate into the weight rows; `torch.use_deterministic_algorithms(True)`
+    (which we enable whenever `--seed` is passed) forces that scatter onto a serialized deterministic
+    kernel. That is catastrophically slow when a *tiny* table is indexed by a *huge* batch -- our
+    3-row mode table hit by B*16 tokens made its backward ~60% of GPU time and seeded codesign ~2.4x
+    slower. The matmul form's backward is `one_hotᵀ @ grad`, a GEMM: deterministic AND fast.
+
+    Use ONLY for small categorical markers (a handful of rows). For real vocabularies keep
+    `nn.Embedding` -- the one-hot would waste memory. Basic lookup only (no padding_idx / max_norm).
+    Full rationale: docs/deterministic_embedding.md.
+    """
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        return F.one_hot(ids, self.num_embeddings).to(self.weight.dtype) @ self.weight
 
 
 class LimbTransformer(nn.Module):
@@ -53,7 +72,10 @@ class LimbTransformer(nn.Module):
             # fixed 25-token layout: [CLS, start*n, eff0*n, eff1*n]; off-limbs are stop tokens,
             # never masked. content (eff0/eff1) carries a live/committed/stop mode embedding;
             # start tokens are persistent per-slot anchors (type+pos+angle).
-            self.mode_emb = nn.Embedding(3, d_model)             # LIVE / COMMITTED / STOP
+            # LIVE / COMMITTED / STOP. MatmulEmbedding (not nn.Embedding): a 3-row table indexed by
+            # B*16 tokens has a scatter backward that is ~2.4x slower under deterministic algorithms
+            # (--seed) + torch.compile. See MatmulEmbedding / docs/deterministic_embedding.md.
+            self.mode_emb = MatmulEmbedding(3, d_model)
             self.angle_proj = nn.Linear(2, d_model)
             angle_enc = torch.tensor(
                 [[math.sin(i * math.pi / 4), math.cos(i * math.pi / 4)] for i in range(n_limbs)],
