@@ -19,7 +19,8 @@ params:
       n_heads: 8
       n_layers: 1
       ffn: 640
-      codesign_tokens: true     # fixed 25-token scheme + gen/critic heads on the shared trunk
+      codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
+      max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
 
   config:
     num_actors: 4096
