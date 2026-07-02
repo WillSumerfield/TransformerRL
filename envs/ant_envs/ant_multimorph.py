@@ -18,16 +18,37 @@ from envs.ant_environment_common import (
 from envs.common import create_plane
 
 from ..multigroup_environment import MultiGroupEnvironmentGpu
-from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE
+from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE, MAX_LIMB_LENGTH
 
 
-_N_DOFS_FULL = 16   # 8 hips + 8 ankles (DOF order: h1,a1,...,h8,a8)
 _N_LIMBS      = 8
-_OBS_BASE    = 107  # 1+4+3+3+16+16+16+8*6 (physical obs)
-_LEN_DIM     = 16   # 8 hip + 8 ankle segment lengths (raw; RMS-normalized by the policy)
-_MASK_DIM    = 16
-# obs layout: [0:107] physical, [107:123] lengths, [123:139] dof mask
-_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 139
+_MAX_LEN      = MAX_LIMB_LENGTH                 # up to 4 modules per limb (Phase 1)
+_N_DOFS_FULL  = _N_LIMBS * _MAX_LEN            # 32 = 8 limbs x 4 modules, 1 DOF each.
+# Canonical padded DOF/length/mask slot for (limb n, module depth d, both 1-based): DEPTH-MAJOR,
+# slot = (d-1)*8 + (n-1). Depth d in [1..4]; d=1 is the swing module, d>=2 the knee chain. Length-2
+# bodies occupy depths 1,2 -> the [0:16] band. Aligns with the eff0(pos1)/eff1(pos2+) token blocks.
+_N_SENSOR    = _N_LIMBS * 6                     # 48: one terminal contact sensor per limb, 6 comps
+# obs layout (offsets): root | dofpos | dofvel | lastact | sensors | lengths | dofmask
+_O_ROOT      = 11                               # y(1)+quat(4)+linvel(3)+angvel(3)
+_O_DOFPOS    = _O_ROOT                           # 11
+_O_DOFVEL    = _O_DOFPOS + _N_DOFS_FULL          # 43
+_O_LASTACT   = _O_DOFVEL + _N_DOFS_FULL          # 75
+_O_SENSOR    = _O_LASTACT + _N_DOFS_FULL         # 107
+_OBS_BASE    = _O_SENSOR + _N_SENSOR             # 155  (end of physical obs)
+_LEN_DIM     = _N_DOFS_FULL                      # 32 module lengths (raw; RMS-normalized by policy)
+_MASK_DIM    = _N_DOFS_FULL                      # 32
+_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 219
+
+
+def _slot(n: int, d: int) -> int:
+    """Canonical padded slot for limb n (1..8), module depth d (1..4). Depth-major."""
+    return (d - 1) * _N_LIMBS + (n - 1)
+
+
+def _parse_joint(name: str) -> tuple:
+    """'joint_{n}_{d}' -> (n, d)."""
+    _, ns, ds = name.split("_")
+    return int(ns), int(ds)
 
 # Empty grid cells of padding between adjacent morphology sets (in units of `spacing`).
 _SET_GAP_CELLS = 4
@@ -243,7 +264,6 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
 
         for gi, morph in enumerate(self._morphologies):
             active = sorted(morph.legs)
-            n_dofs = len(active) * 2
 
             tmpfile = write_vsim(morph, gi)
 
@@ -261,13 +281,17 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             group_offset = v.Vec3((gi % n_grp_cols) * stride_x, 0, (gi // n_grp_cols) * stride_z)
             env_group    = self.create_env_group(env_def_handle, epm, group_offset)
 
-            # Scatter maps into full 16-DOF space (DOF order: h1,a1,...,h8,a8)
+            # DOF scatter into the padded 32-DOF space. We do NOT assume vsim's packed DOF order:
+            # query each DOF's joint name ('joint_{n}_{d}') and map packed k -> canonical slot(n,d).
+            # (Probed order is per-limb ascending, depth ascending; querying makes it robust.)
+            n_dofs = art_def.get_num_joint_dof_defs()
             dof_indices = torch.tensor(
-                [j for n in active for j in (2 * (n - 1), 2 * (n - 1) + 1)],
+                [_slot(*_parse_joint(art_def.get_joint_dof_def_name(k))) for k in range(n_dofs)],
                 dtype=torch.long, device=self.device,
-            )  # (n_dofs,)
+            )  # (n_dofs,) canonical slot per packed DOF k
 
-            # Scatter map for sensor forces into 48D slot (8 limbs × 6)
+            # Sensor scatter into 48D slot (8 limbs x 6). One terminal contact sensor per limb,
+            # emitted in ascending-active order (build_vsim), so sensor si -> active[si].
             sensor_indices = torch.tensor(
                 [j for n in active for j in range(6 * (n - 1), 6 * (n - 1) + 6)],
                 dtype=torch.long, device=self.device,
@@ -373,8 +397,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             morph = g["morph"]
             lvec = torch.zeros(_LEN_DIM, dtype=torch.float32, device=self.device)
             for n in g["active"]:
-                lvec[n - 1]           = morph.hip_lengths[n]
-                lvec[_N_LIMBS + n - 1] = morph.ankle_lengths[n]
+                for d, ln in enumerate(morph.module_lengths[n], start=1):  # depth-major slot(n,d)
+                    lvec[_slot(n, d)] = ln
             self._global_lengths[start:end] = lvec
 
             self._flat_dof_init[doff:doff + EPM * n_dofs] = g["dof_pos_init"].reshape(-1)
@@ -474,15 +498,15 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         obs[:, 1:5]  = self._get_root_pose[:, 0:4]   # quaternion
         obs[:, 5:8]  = self._get_root_vel[:, 3:6]    # linear velocity
         obs[:, 8:11] = self._get_root_vel[:, 0:3]    # angular velocity
-        obs[:, 11:27] = self._flat_get_dof_pos[self._dof_gather_idx] * self._global_dof_mask
-        obs[:, 27:43] = self._flat_get_dof_vel[self._dof_gather_idx] * self._global_dof_mask
-        obs[:, 43:59] = self._act_buf   # last actions (already masked)
+        obs[:, _O_DOFPOS:_O_DOFVEL] = self._flat_get_dof_pos[self._dof_gather_idx] * self._global_dof_mask
+        obs[:, _O_DOFVEL:_O_LASTACT] = self._flat_get_dof_vel[self._dof_gather_idx] * self._global_dof_mask
+        obs[:, _O_LASTACT:_O_SENSOR] = self._act_buf   # last actions (already masked)
         if self._has_sensors:
-            obs[:, 59:107] = self._flat_sensor[self._sensor_gather_idx] * self._sensor_mask
+            obs[:, _O_SENSOR:_OBS_BASE] = self._flat_sensor[self._sensor_gather_idx] * self._sensor_mask
         else:
-            obs[:, 59:107].zero_()
+            obs[:, _O_SENSOR:_OBS_BASE].zero_()
 
-        # [107:123] = lengths, [123:139] = dof_mask — set once at allocate time, preserved here
+        # [_OBS_BASE:+_LEN_DIM] = lengths, [..:_OBS_TOTAL] = dof_mask — set once at allocate, preserved
 
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         # Reward needs only root pose plus the already-global act/old-root/progress buffers, so it
