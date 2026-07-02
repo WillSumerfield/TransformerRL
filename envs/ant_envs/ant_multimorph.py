@@ -18,7 +18,7 @@ from envs.ant_environment_common import (
 from envs.common import create_plane
 
 from ..multigroup_environment import MultiGroupEnvironmentGpu
-from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE, MAX_LIMB_LENGTH
+from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE, MAX_LIMB_LENGTH, DEFAULT_ANKLE
 
 
 _N_LIMBS      = 8
@@ -392,6 +392,13 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                  root_trans_init.p.z],
                 dtype=torch.float32, device=self.device,
             )
+            # Spawn higher when the longest limb exceeds the default 2-module chain, so long legs
+            # don't clip through the ground at reset. Constant +DEFAULT_ANKLE (one default knee-module
+            # length) per extra module; no lift when the longest limb is <= 2 modules. Index 5 = root
+            # Y (up-axis) in [qx,qy,qz,qw, px,py,pz]. store_initial_conditions returns a fixed height,
+            # so we add the offset to the reset pose (which governs — envs reset before stepping).
+            longest = max((g["morph"].num_modules(n) for n in g["active"]), default=0)
+            self._set_root_pose[start:end, 5] += DEFAULT_ANKLE * max(0, longest - 2)
             self._global_dof_mask[start:end] = g["dof_mask"]
 
             morph = g["morph"]
