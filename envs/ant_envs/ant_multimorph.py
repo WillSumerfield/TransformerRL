@@ -93,9 +93,10 @@ def sample_morphologies(num: int, seed: int = None, rng: "random.Random" = None)
     out = []
     for _ in range(num):
         limbs = rng.choice(by_limbs[rng.choice(limb_counts)])
-        hip = {n: rng.uniform(*HIP_RANGE) for n in limbs}
-        ank = {n: rng.uniform(*ANKLE_RANGE) for n in limbs}
-        out.append(Morphology(limbs, hip, ank))
+        # Full-ant sampler stays length-2 (one hip + one ankle module) in Phase 1; only the
+        # codesign env grows variable-length limbs. module_lengths = {limb -> [hip, ankle]}.
+        out.append(Morphology({n: [rng.uniform(*HIP_RANGE), rng.uniform(*ANKLE_RANGE)]
+                               for n in limbs}))
     return out
 
 
