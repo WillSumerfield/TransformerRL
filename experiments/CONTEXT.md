@@ -2,6 +2,24 @@
 
 Studies of what a trained limb transformer attends to, and how that relates to reward — the groundwork for using attention as a future bridge to a generative morphology policy. Owns `experiments/`, `notebooks/`, and the figures/`.npz` in `data/`. Shared terms live in the [Context Map](../CONTEXT-MAP.md); architecture terms (token, limb transformer) in [Control](../transformer_rl/CONTEXT.md).
 
+## Diversity
+
+Metrics comparing the *set* of morphologies a codesign run produces, on a shared representation: a morphology = 8 fixed compass **slots**, each holding a limb as a **distal→proximal** module sequence (index 0 = tip) or `∅`. Reused across phases as modules gain types/lengths. All are reported **within-run** (spread over the M bodies one converged generator samples) and **between-seed** (spread over each seed's **dominant body** = its argmax-likelihood design), on the same converged-body sample the eval-return pass draws.
+
+**Morphology distance**:
+A distance `d(A,B)` between two robot designs. Two instantiations feed the diversity metrics — composition and tip-aligned structural. Representation-agnostic so it survives added module types/lengths.
+
+**Composition distance** (`d_comp`):
+L1 between the robots' module-type **histograms** (bag-of-modules; position/limb-invariant). Raw counts headlined (size-sensitive — "more/bigger robot"), normalized frequency secondary (pure composition). Answers *what parts, how many*.
+
+**Tip-aligned structural distance** (`d_struct`):
+Slot-matched sum of per-limb **tip-anchored edit** distances — limbs aligned at the distal tip (index 0), length slack charged at the proximal end, so `E-C` and `E-E-C` are near. Absent limb = empty sequence, folding presence in. Answers *how are limbs shaped*.
+_Avoid_: root-aligned / positional limb comparison (misranks unequal-length limbs — the reason tip-alignment exists).
+
+**Effective number of modes** (`N_modes`):
+Prevalence-weighted count of *distinct designs* a converged generator produces: Hill number (order q=1, perplexity) over `d_struct`-clusters (τ = 1 module) of the sampled bodies. `1.0` = single design (ES-like); `>1` = branching (EA-like). The Phase-8 diversity target. Between-seed variant adds **mode-overlap** (fraction of seed-pairs sharing a mode).
+_Avoid_: generator-entropy as the diversity headline (inflates independent-component flipping without breaking the common core — see Phase 8).
+
 ## Language
 
 **Attention weight**:
