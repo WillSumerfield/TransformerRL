@@ -588,17 +588,19 @@ class FollowCamera:
     """
 
     MAX_FRAMES_PER_MORPH = 250
-    _KEYS = ("q", "e", "z", "x", "f", "c")          # discrete (rising-edge), left-hand
+    _KEYS = ("q", "e", "z", "x", "f", "c", "r", "t")  # discrete (rising-edge), left-hand
+                                                    # r/t = prev/next epoch (policy switch)
     MOUSE_SENS_BASE = math.radians(0.15)            # radians per pixel at sens=1.0
     SCROLL_ZOOM = 1.1                               # radius multiply per wheel tick
     ELEV_MIN = math.radians(0.0)                  # don't look up from below the robot
     ELEV_MAX = math.radians(85.0)                   # clamp near top to avoid pole flip
     RADIUS_MIN, RADIUS_MAX = 1.0, 30.0
 
-    def __init__(self, env, offset_xyz=CAMERA_OFFSET):
+    def __init__(self, env, offset_xyz=CAMERA_OFFSET, switch=None):
         import vlearn as v
         self._v = v
         self.env = env
+        self.switch = switch        # PolicySwitch | None (live epoch/run switching)
         # Spherical viewpoint around the focus, seeded from the static offset so
         # the default view is unchanged. azimuth in XZ plane, elevation above it.
         ox, oy, oz = offset_xyz
@@ -651,7 +653,33 @@ class FollowCamera:
         for w in (self.w_group, self.w_env, self.w_free, self.w_auto, self.w_sens):
             r.register_menu_item(w)
         self._panel_render = r          # the gym_render these widgets are registered on
+        if self.switch is not None:
+            self._build_switch_widgets()
         self._sync_panel()
+
+    # --- policy-switch widgets: a Run combo (model dir only) + an Epoch combo.
+    # Rebuilt from scratch by _build_panel on every gym swap; the Epoch combo also
+    # rebuilds on a run change (UserCombo items are fixed at construction). ---
+    def _build_switch_widgets(self) -> None:
+        v, r = self._v, self.env.gym_render
+        self.w_run = None
+        if self.switch.has_runs:
+            self.w_run = v.UserCombo("Run", self.switch.run_labels(), self.switch.run_idx)
+            r.register_menu_item(self.w_run)
+            self._run_syncedidx = self.switch.run_idx
+        self.w_epoch = None             # fresh render: don't unregister the dead one
+        self._build_epoch_combo(self.switch.run_idx)
+
+    def _build_epoch_combo(self, run_idx: int) -> None:
+        v, r = self._v, self.env.gym_render
+        if getattr(self, "w_epoch", None) is not None:
+            r.unregister_menu_item(self.w_epoch)
+        labels = self.switch.epoch_labels(run_idx)
+        idx = self.switch.epoch_idx if run_idx == self.switch.run_idx else 0
+        idx = min(idx, len(labels) - 1)
+        self.w_epoch = v.UserCombo("Epoch (R/T)", labels, idx)
+        r.register_menu_item(self.w_epoch)
+        self._epoch_syncedidx = idx
 
     def _sync_panel(self) -> None:
         self.w_group.set_current_index(self.gi)
@@ -730,6 +758,30 @@ class FollowCamera:
         elif u_free:
             self.free = self.w_free.get_value()
 
+        # --- Live policy switch. Base off any un-applied request so rapid R/T
+        # queue correctly; the player commits run_idx/epoch_idx when it applies. ---
+        if self.switch is not None:
+            s = self.switch
+            base_run, base_epoch = s.pending or (s.run_idx, s.epoch_idx)
+            depoch = (1 if ev["t"] else 0) - (1 if ev["r"] else 0)   # R prev / T next
+            u_run = self.w_run is not None and self.w_run.get_current_index() != self._run_syncedidx
+            u_epoch = self.w_epoch.get_current_index() != self._epoch_syncedidx
+            if u_run:                                   # new run -> repopulate epochs, jump to best
+                new_run = self.w_run.get_current_index()
+                self._run_syncedidx = new_run
+                self._build_epoch_combo(new_run)        # new run's epochs, best (idx 0) selected
+                s.request(new_run, 0)
+            elif depoch:
+                n = s.n_epochs(base_run)
+                new_epoch = (base_epoch + depoch) % n
+                self.w_epoch.set_current_index(new_epoch)
+                self._epoch_syncedidx = new_epoch
+                s.request(base_run, new_epoch)
+            elif u_epoch:
+                new_epoch = self.w_epoch.get_current_index()
+                self._epoch_syncedidx = new_epoch
+                s.request(base_run, new_epoch)
+
         # Orbit/zoom: mouse-driven, inert in free-cam (built-in controls own it
         # there). Cursor is pinned to window-centre while following; dx/dy are the
         # pre-warp pixel deltas, scroll ticks zoom.
@@ -759,13 +811,13 @@ class FollowCamera:
             r.reset_camera(eye, look)
 
 
-def _attach_render_callback(env, recorder=None) -> None:
+def _attach_render_callback(env, recorder=None, switch=None) -> None:
     """Compose follow-camera (if env supports it and is rendering) + video capture."""
     hooks = []
     if getattr(env, "rendering", False):
         env.gym_render.capped_step = True   # start real-time-capped, not free-running
     if getattr(env, "rendering", False) and hasattr(env, "follow_sets"):
-        hooks.append(FollowCamera(env).update)
+        hooks.append(FollowCamera(env, switch=switch).update)
     if recorder is not None:
         hooks.append(recorder.make_callback(env))
     if not hooks:
@@ -897,6 +949,18 @@ def run_training(
     mode = args.mode
     checkpoint = args.checkpoint
 
+    # --- play: a run/model dir enables live policy switching (see policy_switch.py);
+    # a plain .pth stays single-checkpoint. base name = `name` (the checkpoint stem). ---
+    switch = None
+    if mode == "play" and checkpoint is not None:
+        from .policy_switch import resolve_source, PolicySwitch
+        source = resolve_source(Path(checkpoint), name)
+        if source["mode"] != "file":
+            switch = PolicySwitch(source)
+            checkpoint = switch.current_path()        # placeholder; redirected post-filter
+            print(f"[play] policy switching ({source['mode']} dir): "
+                  f"{len(switch.runs)} run(s) found", flush=True)
+
     video_path = None
     if args.video:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -964,6 +1028,8 @@ def run_training(
         config["params"]["config"]["timing"] = True
     if args.num_envs is not None:
         config["params"]["config"]["num_actors"] = args.num_envs
+    elif mode == "play":
+        config["params"]["config"]["num_actors"] = 64   # snappy switch/rebuild; --num_envs overrides
     if args.max_epochs is not None:
         config["params"]["config"]["max_epochs"] = args.max_epochs
     if args.horizon_length is not None:
@@ -1074,7 +1140,15 @@ def run_training(
         if mode == "test":
             env_ref[0] = envs
             return NewToOldAPICompatilibity(envs)
-        _attach_render_callback(envs, recorder)
+        if switch is not None:                       # drop arch-incompatible runs (mixed-gen dirs)
+            skipped = switch.filter_compatible(
+                math.prod(envs.observation_space.shape), math.prod(envs.action_space.shape))
+            if skipped:
+                print("[play] skipped %d incompatible run(s): %s" % (
+                    len(skipped), ", ".join(f"{n} ({why})" for n, why in skipped)), flush=True)
+            print(f"[play] starting at {switch.current_label()} "
+                  f"({len(switch.runs)} compatible run(s))", flush=True)
+        _attach_render_callback(envs, recorder, switch)
         if mode == "play" and num_episodes is not None:
             max_ep = env_kwargs.get("max_episode_length", 1000)
             limiter = _PlayLimiter(envs, num_episodes * max_ep)
@@ -1120,12 +1194,20 @@ def run_training(
     # Play/test use rl_games' Player, not the agent. PPG shares the standard continuous net so the
     # stock player runs it; codesign uses a custom player that samples bodies from the trained
     # generator distribution each episode (else it would just show the fixed base morph).
-    from rl_games.algos_torch.players import PpoPlayerContinuous
-    runner.player_factory.register_builder(
-        'ppg_continuous', lambda **kwargs: PpoPlayerContinuous(**kwargs))
-    from .codesign_player import CodesignPlayer
-    runner.player_factory.register_builder(
-        'codesign_continuous', lambda **kwargs: CodesignPlayer(**kwargs))
+    # All three share SwitchMixin so play can hot-swap checkpoints (inert when switch=None).
+    from .codesign_player import CodesignPlayer, SwitchablePlayer
+
+    def _mk_player(cls):
+        def build(**kwargs):
+            p = cls(**kwargs)
+            if switch is not None:
+                p.attach_switch(switch)
+            return p
+        return build
+
+    runner.player_factory.register_builder('a2c_continuous', _mk_player(SwitchablePlayer))
+    runner.player_factory.register_builder('ppg_continuous', _mk_player(SwitchablePlayer))
+    runner.player_factory.register_builder('codesign_continuous', _mk_player(CodesignPlayer))
     runner.load(config)
 
     # test mode owns its rollout loop (ADR-0007): reuse the player only to restore the

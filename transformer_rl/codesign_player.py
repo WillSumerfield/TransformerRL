@@ -6,8 +6,14 @@ checkpoint's net has no codesign generator. See codesign_agent.py."""
 import torch
 from rl_games.algos_torch.players import PpoPlayerContinuous
 
+from .policy_switch import SwitchMixin
 
-class CodesignPlayer(PpoPlayerContinuous):
+
+class SwitchablePlayer(SwitchMixin, PpoPlayerContinuous):
+    """Standard continuous player with live checkpoint switching (a2c / ppg play)."""
+
+
+class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
     def restore(self, fn):
         super().restore(fn)                            # control model + obs/value normalizers
         net = self.model.a2c_network.net
