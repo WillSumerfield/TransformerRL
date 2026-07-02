@@ -46,6 +46,9 @@ class LoggingA2CAgent(A2CAgent):
         self._timing = self.config.get('timing', False)
         self._timings = {}
         self._tics = {}
+        self._last_fps = None                 # env-steps/sec of the last epoch (timed path)
+        if self._timing and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()   # perf/peak_mem_mib measured from train start
 
     # ---- opt-in phase timing (cuda.synchronize + perf_counter); shared w/ PPGAgent ----
 
@@ -131,6 +134,8 @@ class LoggingA2CAgent(A2CAgent):
         play_time = play_time_end - play_time_start
         update_time = update_time_end - update_time_start
         total_time = update_time_end - play_time_start
+        if total_time > 0:
+            self._last_fps = self.curr_frames / total_time   # throughput (env-steps/sec)
         return (batch_dict['step_time'], play_time, update_time, total_time,
                 a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul)
 
@@ -220,6 +225,12 @@ class LoggingA2CAgent(A2CAgent):
             for k, v in self._timings.items():
                 w.add_scalar(k, v, frame)
             self._timings = {}
+        if self._timing:
+            if self._last_fps is not None:
+                w.add_scalar('perf/steps_per_sec', self._last_fps, frame)
+                self._last_fps = None
+            if torch.cuda.is_available():
+                w.add_scalar('perf/peak_mem_mib', torch.cuda.max_memory_allocated() / 1e6, frame)
 
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
