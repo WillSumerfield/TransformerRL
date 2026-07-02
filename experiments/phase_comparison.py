@@ -57,8 +57,9 @@ EPS_MORPH = 0.05                  # morphology: max per-slot |on-rate - final| t
 PLATEAU_TAIL = 5                  # windows averaged for the "final" plateau value
 
 # curves stored per-seed for the notebook to overlay (step + val)
+_FPS_TAG = "performance/step_inference_rl_update_fps"   # rl_games native throughput (env-steps/sec)
 CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "rewards/step",
-              "perf/steps_per_sec", "perf/peak_mem_mib"]
+              _FPS_TAG, "perf/peak_mem_mib"]
 
 
 # ---- 1. training -----------------------------------------------------------------
@@ -70,8 +71,10 @@ def train_all(seeds, max_epochs, num_envs):
         run_dir = _ROOT / RUN.format(name=name)
         if run_dir.exists():
             shutil.rmtree(run_dir)                      # always retrain (only this exact phase0_ dir)
+        # NB: no --timing -- it inserts cuda.synchronize()/epoch that kills GPU pipelining (~2x
+        # slower). Throughput comes from rl_games' native performance/* tag; peak-mem logs passively.
         cmd = [sys.executable, str(_ROOT / SCRIPT), "train", "--headless", "True",
-               "--seed", str(seed), "--name", name, "--timing",
+               "--seed", str(seed), "--name", name,
                "--max_epochs", str(max_epochs if max_epochs is not None else MAX_EPOCHS)]
         if num_envs is not None:
             cmd += ["--num_envs", str(num_envs)]
@@ -212,7 +215,7 @@ def scrape_all(seeds):
         qs, qv = _scalar(ea, "quality/R_mean")
         out["conv_quality"].append(_quality_conv(qs, qv))
         out["conv_morph"].append(_morph_conv(ea))
-        ss, sv = _scalar(ea, "perf/steps_per_sec")
+        ss, sv = _scalar(ea, _FPS_TAG)         # rl_games native throughput (no --timing needed)
         out["steps_per_sec"].append(float(np.median(sv[1:])) if sv is not None and len(sv) > 1 else np.nan)
         ms, mv = _scalar(ea, "perf/peak_mem_mib")
         out["peak_mem_mib"].append(float(mv.max()) if mv is not None else np.nan)
