@@ -236,7 +236,7 @@ def _agg(d):
     """Add mean/std for every per-seed scalar array (seed_* keys)."""
     agg = {}
     for k, v in d.items():
-        if k.startswith("seed_") and v.dtype != np.int64 and v.size:
+        if k.startswith("seed_") and v.dtype != np.int64 and v.size and not np.all(np.isnan(v)):
             agg[k.replace("seed_", "mean_")] = np.float32(np.nanmean(v))
             agg[k.replace("seed_", "std_")] = np.float32(np.nanstd(v))
     return agg
@@ -253,7 +253,7 @@ def build_artifact(seeds):
     np.savez_compressed(path, **payload)
     print(f"[phase] artifact -> {path}")
     for k in ("perf_top", "perf_distavg", "perf_topk", "conv_quality", "conv_morph",
-              "steps_per_sec", "peak_mem_mib", "div_struct", "div_nmodes"):
+              "steps_per_sec", "peak_mem_mib", "div_comp", "div_struct", "div_nmodes"):
         m, s = payload.get(f"mean_{k}"), payload.get(f"std_{k}")
         if m is not None:
             print(f"    {k:14s} {float(m):10.3f} ± {float(s):.3f}")
