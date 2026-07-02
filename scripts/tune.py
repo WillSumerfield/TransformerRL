@@ -91,6 +91,33 @@ def _final_score(series: list[float], mode: str, window: int) -> float:
     return sum(tail) / len(tail)
 
 
+def _param_or_base(params: dict, base_cfg: dict, path: str):
+    """Value of a config path: the swept value if this trial tuned it, else the base-config default."""
+    if path in params:
+        return params[path]
+    d = base_cfg
+    for k in path.split("."):
+        d = d[k]
+    return d
+
+
+def _final_frac_score(series: list[float], params: dict, sc: dict, base_cfg: dict) -> float:
+    """Objective when resample_interval is swept (windows vary in length). Mean of the last
+    max(eval_min, min(floor(score_frac*N), N - n_pretrain)) logged windows, N = total logged. Capping
+    the tail at the RL (non-pretrain) window count keeps warmup points out of the score even when a
+    trial ends up with few windows. Empty series (no metric logged) -> _NEGINF (failure)."""
+    if not series:
+        return _NEGINF
+    n = len(series)
+    npre = int(_param_or_base(params, base_cfg, "params.config.generator.n_pretrain"))
+    frac = sc.get("score_frac", 0.20)
+    eval_min = sc.get("eval_min", 1)
+    window = max(eval_min, min(int(frac * n), n - npre))
+    window = max(1, min(window, n))
+    tail = series[-window:]
+    return sum(tail) / len(tail)
+
+
 # ── state ─────────────────────────────────────────────────────────────
 
 class _Trial:
@@ -553,7 +580,10 @@ def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Pat
             return _NEGINF  # real failure/crash: worst score, eligible for one retry
         # Success OR soft-capped timeout: score on the TB log. A timed-out trial is scored on
         # the partial run, not discarded — the timeout is a wall-clock safety net.
-        return _final_score(_tb_series(log_dir, metric), score_mode, window)
+        series = _tb_series(log_dir, metric)
+        if score_mode == "final_frac":
+            return _final_frac_score(series, params, sc, base_cfg)
+        return _final_score(series, score_mode, window)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -663,6 +693,24 @@ def main():
                         )
                     case "categorical":
                         params[path] = trial.suggest_categorical(path, p["choices"])
+
+            # Feasibility guard: reject configs whose derived eval window can't reach the RL phase
+            # BEFORE spending any GPU (the sampled params alone decide it). Expr sees each swept param
+            # by short name plus the injected budget constants; False -> prune (marked PRUNED, no retry).
+            fexpr = sc.get("feasibility_expr")
+            if fexpr:
+                cc = base_cfg["params"]["config"]
+                fns = {p["path"].split(".")[-1]: params[p["path"]] for p in tune_cfg["params"]}
+                fns.update(max_epochs=cc["max_epochs"], horizon_length=cc["horizon_length"],
+                           max_episode_length=sc.get("max_episode_length", 1000),
+                           eval_min=sc.get("eval_min", 1))
+                if not eval(fexpr, {"__builtins__": {}}, fns):
+                    state.begin(trial.number, params)
+                    state.prune(trial.number)
+                    log_file.write(json.dumps(
+                        {"trial": trial.number, "params": params, "score": "infeasible"}) + "\n")
+                    log_file.flush()
+                    raise optuna.TrialPruned()
 
             state.begin(trial.number, params)
             try:

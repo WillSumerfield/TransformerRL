@@ -1,18 +1,24 @@
 # Codesign hyperparameter sweep (Optuna TPE via scripts/tune.py). Finetunes the single-network
 # codesign model: tunes the never-swept generator/clone knobs plus the few control-PPO knobs most
-# affected by the shared trunk. Objective = quality/R_mean (the body-quality target), reduced as the
-# MEAN OF THE LAST 5 RESAMPLE WINDOWS (converged RL state, not a lucky spike).
+# affected by the shared trunk. Objective = quality/R_mean (the body-quality target), reduced over a
+# DERIVED tail window (see score_mode=final_frac below): the converged RL state, not a lucky spike.
 #
 #   run:    python scripts/tune.py            # this file is the default
 #   resume: same command (study.db);  --reset to start over
 #
-# Cadence: resample_interval=1 -> ~62 epochs/window. The 1200-epoch proxy (base config) is ~19
-# windows; n_pretrain (<=10) eats the first windows, leaving >=9 RL windows for the objective.
+# Cadence: quality/R_mean logs once per resample window (pretrain windows included). Window LENGTH
+# scales with resample_interval: ~62 epochs at interval=1, so the 1200-epoch proxy is ~19 windows at
+# interval=1, ~9 at 2, ~6 at 3. n_pretrain (in windows) eats the first ones; the rest are RL windows.
+#
+# resample_interval is now SWEPT, so a fixed "last 5 windows" objective would land in the warmup phase
+# at high interval. Instead score_mode=final_frac averages the last floor(score_frac * N) logged
+# windows (N = total logged) but never more than the RL windows (N - n_pretrain), floored at eval_min.
+# The feasibility_expr prunes (interval, n_pretrain) combos with too few RL windows BEFORE training,
+# so no GPU is wasted on a config whose eval window can't land in the RL phase.
 #
 # Pruning OFF (ADR-0009): n_pretrain is tuned, so the RL phase starts at a different epoch per trial
-# and same-epoch median comparison would be unfair. With pruning off the tuner would default to a
-# max-over-training objective; quality/R_mean is sparse+noisy (one point/window) so we instead force
-# a final-level objective via study.score_mode=final + study.score_window=5.
+# and same-epoch median comparison would be unfair. quality/R_mean is sparse+noisy (one point/window)
+# so we force the final_frac tail objective instead of a max-over-training one.
 study:
   name: codesign_ant_tune
   n_trials: 200                 # generous ceiling; cancel early when satisfied (resumes from study.db)
@@ -23,8 +29,13 @@ study:
                                 # Must exceed full-proxy time: the objective scores the LAST windows,
                                 # so a premature timeout would cut off exactly what we score on.
   metric_key: "quality/R_mean"
-  score_mode: final             # mean of the last `score_window` logged points (not max-over-training)
-  score_window: 5               # last 5 resample windows (~the converged RL state)
+  score_mode: final_frac        # tail = last max(eval_min, min(floor(score_frac*N), N-n_pretrain)) windows
+  score_frac: 0.20              # eval window = 20% of the N total logged windows...
+  eval_min: 1                   # ...but at least this many (also the min RL windows the guard requires)
+  max_episode_length: 1000      # ant env horizon (for the feasibility guard's windows-per-trial math)
+  # Prune (interval, n_pretrain) combos whose eval window can't reach the RL phase, BEFORE training.
+  # predicted total windows = max_epochs // (resample_interval * max_episode_length / horizon_length).
+  feasibility_expr: "(max_epochs // (resample_interval * max_episode_length / horizon_length)) - n_pretrain >= eval_min"
   experiment_name_path: params.config.full_experiment_name
   train_dir_path: params.config.train_dir
   summaries_subdir: summaries
@@ -97,8 +108,20 @@ params:
     type: categorical
     choices: [2, 4, 6, 8]
 
-  # Warmup windows. Capped at 10 so >=9 RL windows survive the 1200-epoch proxy (the last-5-window
-  # objective must land in the RL phase). Varying this is why pruning is off.
+  # Warmup windows. At high resample_interval a large n_pretrain leaves too few RL windows for the
+  # eval tail; feasibility_expr prunes those combos pre-launch (not a hard cap here). Why pruning off.
   - path: params.config.generator.n_pretrain
     type: categorical
     choices: [4, 6, 8, 10]
+
+  # ── aux frequency + gen-update granularity (newly swept) ──
+  # resample_interval = "aux freq": rebuild/generator windows are `interval` episode-lengths long, so
+  # higher interval = more control PPO between morphology updates (fewer, longer windows in-budget).
+  - path: params.config.resample_interval
+    type: categorical
+    choices: [1, 2, 3]
+
+  # GenAct/GenCrit minibatch count over the resample buffer.
+  - path: params.config.generator.minibatches
+    type: categorical
+    choices: [2, 4, 8]
