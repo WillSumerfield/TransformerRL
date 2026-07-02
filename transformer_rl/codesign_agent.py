@@ -64,6 +64,10 @@ class CodesignAgent(LoggingA2CAgent):
         self._n_pretrain = cd.get('n_pretrain', 8)
         self._gen_epochs = cd.get('epochs', 4)
         self._gen_minibatches = cd.get('minibatches', 4)
+        # gen_replay encodes M = mb_size*(L+1) designed prefixes in ONE grad forward; L grew from 8
+        # (presence) to n_dof=32 (variable length), so a fixed N/minibatches fraction OOMs. Cap the
+        # minibatch by a prefix budget so that forward stays near the old ~9k-prefix footprint.
+        self._gen_max_prefixes = cd.get('max_prefixes', 6000)
         self._gen_clip = cd.get('clip', 0.2)
         self._gen_ent = cd.get('entropy_coef', 0.01)
         self._gencrit_coef = cd.get('gencrit_coef', 0.5)   # weight on the V1.0 fit (prefixes+rollout)
@@ -215,8 +219,8 @@ class CodesignAgent(LoggingA2CAgent):
             adv = torch.zeros_like(raw_adv)
             adv[valid] = (sel - sel.mean()) / (sel.std() + 1e-8)
 
-        G = self._gen_minibatches
-        mb_size = max(1, N // G)
+        L1 = self._n_dof + 1                               # (L+1) prefixes gen_replay stacks per env
+        mb_size = max(1, min(N // self._gen_minibatches, self._gen_max_prefixes // L1))
         logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn')}
         for _ in range(self._gen_epochs):
             perm = torch.randperm(N, device=dev)
