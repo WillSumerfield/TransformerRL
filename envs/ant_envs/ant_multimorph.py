@@ -331,6 +331,10 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         # and never touched in the step loop. _set_root_vel stays zero.
         self._set_root_pose = torch.zeros((N, 7), dtype=torch.float32, device=self.device)
         self._set_root_vel  = torch.zeros((N, 6), dtype=torch.float32, device=self.device)
+        # Per-env spawn-height lift (offset added to the reset Y for long-limbed bodies). Used to make
+        # the healthy_y_range CEILING relative to standing height so taller ants aren't killed at spawn
+        # (the floor stays absolute — see compute_reward_termination_truncation).
+        self._height_offset = torch.zeros(N, dtype=torch.float32, device=self.device)
         self._global_dof_mask = torch.zeros((N, _N_DOFS_FULL), dtype=torch.float32, device=self.device)
         # Per-env segment lengths, constant per body: [hip_leg1..8, ankle_leg1..8], 0 for inactive limbs.
         self._global_lengths = torch.zeros((N, _LEN_DIM), dtype=torch.float32, device=self.device)
@@ -398,7 +402,9 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             # Y (up-axis) in [qx,qy,qz,qw, px,py,pz]. store_initial_conditions returns a fixed height,
             # so we add the offset to the reset pose (which governs — envs reset before stepping).
             longest = max((g["morph"].num_modules(n) for n in g["active"]), default=0)
-            self._set_root_pose[start:end, 5] += DEFAULT_ANKLE * max(0, longest - 2)
+            offset = DEFAULT_ANKLE * max(0, longest - 2)
+            self._set_root_pose[start:end, 5] += offset
+            self._height_offset[start:end] = offset
             self._global_dof_mask[start:end] = g["dof_mask"]
 
             morph = g["morph"]
@@ -518,9 +524,17 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         # Reward needs only root pose plus the already-global act/old-root/progress buffers, so it
         # runs whole-tensor (the helper is elementwise per env).
+        # The healthy Y band is ASYMMETRIC in body height: the CEILING scales with the spawn lift (a
+        # long-legged ant stands taller), but the FLOOR is ABSOLUTE — a fallen ant's torso is near the
+        # ground regardless of leg length (only the limbs are longer, not the torso). So we pass a
+        # Y-normalized pose to the helper (giving the correct relative ceiling + untouched forward
+        # reward from X), then revive any body the shifted floor wrongly killed while its torso is
+        # still above the absolute floor. (Shifting BOTH bounds killed standing tall ants at normY<0.3.)
+        root_pose = self._get_root_pose.clone()
+        root_pose[:, 5] -= self._height_offset
         rew, term, trunc = compute_reward_termination_truncation_helper(
             self._act_buf,
-            self._get_root_pose,
+            root_pose,
             self.old_root_pos_buf,
             self._progress_buf,
             self.healthy_y_range,
@@ -529,6 +543,11 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             self.ctrl_cost_weight,
             self.max_episode_length,
         )
+        lo = self.healthy_y_range[0]
+        # helper killed it on the (shifted) floor, but the real torso is above the absolute floor:
+        wrongly_low = term & (root_pose[:, 5] < lo) & (self._get_root_pose[:, 5] >= lo)
+        term = term & ~wrongly_low
+        rew  = rew + self.healthy_reward_val * wrongly_low.to(rew.dtype)   # restore healthy bonus
         self._rew_buf[:]        = rew
         self._next_term_buf[:]  = term
         self._next_trunc_buf[:] = trunc
