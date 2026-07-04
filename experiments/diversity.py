@@ -170,6 +170,13 @@ def presence_to_repr(presence):
     return [["E", "E"] if p else None for p in presence]
 
 
+def counts_to_repr(counts):
+    """P1: 8-slot per-limb module count (0..MAX) -> repr, each limb = ['E']*count (all effectors,
+    tip-first). count 0 = absent; count 2 == P0 present limb, so P0/P1 diversity is comparable and
+    d_struct/N_modes see limb length (count-3 vs count-2 -> tip-anchored overhang 1)."""
+    return [["E"] * int(c) if c > 0 else None for c in counts]
+
+
 # ---- self-test -------------------------------------------------------------------
 
 if __name__ == "__main__":

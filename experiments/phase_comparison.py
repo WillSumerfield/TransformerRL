@@ -30,14 +30,19 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from experiments.diversity import within_run_metrics, between_seed_metrics, presence_to_repr
+from experiments.diversity import within_run_metrics, between_seed_metrics, counts_to_repr
 
 # ---- phase identity (the ONE block a future phase edits) -------------------------
-PHASE = "phase0_baseline"
+PHASE = "phase1_longer_limbs"
+BRANCH = "phase-1"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
 SCRIPT = "scripts/train_ant_codesign_single.py"
 CONFIG = "configs/ppo_ant_codesign_single.yaml"
-RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase0_s{seed}
-NAME = lambda seed: f"phase0_s{seed}"
+RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase1_s{seed}
+NAME = lambda seed: f"phase1_s{seed}"
+
+
+def _git(args):
+    return subprocess.check_output(["git", *args], cwd=_ROOT, text=True).strip()
 
 DATA_DIR = _ROOT / "data" / "phase_comparison"
 DEFAULT_SEEDS = [42, 43, 44, 45, 46]
@@ -58,8 +63,8 @@ PLATEAU_TAIL = 5                  # windows averaged for the "final" plateau val
 
 # curves stored per-seed for the notebook to overlay (step + val)
 _FPS_TAG = "performance/step_inference_rl_update_fps"   # rl_games native throughput (env-steps/sec)
-CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "rewards/step",
-              _FPS_TAG, "perf/peak_mem_mib"]
+CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "build/modulecount",
+              "rewards/step", _FPS_TAG, "perf/peak_mem_mib"]
 
 
 # ---- 1. training -----------------------------------------------------------------
@@ -67,7 +72,7 @@ CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "rewards/ste
 def train_all(seeds, max_epochs, num_envs):
     for seed in seeds:
         name = NAME(seed)
-        assert name.startswith("phase0_"), "safety: only ever delete phase0_* run dirs"
+        assert name.startswith("phase1_"), "safety: only ever delete phase1_* run dirs"
         run_dir = _ROOT / RUN.format(name=name)
         if run_dir.exists():
             shutil.rmtree(run_dir)                      # always retrain (only this exact phase0_ dir)
@@ -96,17 +101,14 @@ def _final_ckpt(run_dir: Path) -> Path | None:
     return pths[-1] if pths else None                   # else newest .pth
 
 
-def _legs_of(presence_row) -> tuple:
-    return tuple(i + 1 for i, v in enumerate(presence_row) if v > 0)
-
-
 def eval_all(seeds):
     import gc
     import torch
     import yaml
     import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
-    from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
+    from envs.ant_envs.ant_multimorph import (AntMultiMorphEnv, _OBS_TOTAL as OBS_BASE,
+                                              _MASK_DIM as MASK_DIM, _N_DOFS_FULL as N_ACT)
     from envs.ant_envs.build_vsim import Morphology
 
     assert torch.cuda.is_available()
@@ -122,20 +124,23 @@ def eval_all(seeds):
         ckpt = _final_ckpt(_ROOT / RUN.format(name=NAME(seed)))
         if ckpt is None:
             print(f"[phase] WARN no checkpoint for {NAME(seed)}"); continue
-        net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size)
+        net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size,
+                                     obs_base=OBS_BASE, n_act=N_ACT)
 
         with torch.no_grad():                            # sample the converged generator
-            presence = net.net.sample(N_SAMPLE)["presence"].cpu().numpy()   # (N,8) {0,1}
-        patterns, counts = np.unique(presence, axis=0, return_counts=True)
+            mods = net.net.sample(N_SAMPLE)["counts"].cpu().numpy()   # (N,8) per-limb module count 0..MAX
+        patterns, counts = np.unique(mods, axis=0, return_counts=True)
         keep = np.argsort(counts)[::-1][:MAX_BODIES]     # most-frequent distinct bodies (mode first)
         kept_pat, kept_cnt = patterns[keep], counts[keep].astype(float)
 
-        bodies = [Morphology.from_legs(_legs_of(p)) for p in kept_pat]
+        bodies = [Morphology.from_counts({i + 1: int(c) for i, c in enumerate(row) if c > 0})
+                  for row in kept_pat]                   # 1-based limb ids; count 0 = absent
         env = AntMultiMorphEnv(len(bodies) * EVAL_EPM, device, morphologies=bodies,
                                sample_morphs=False, rendering=False, raise_exception=False,
                                seed=EVAL_SEED, with_window=False, value_size=value_size)
         epm = env.envs_per_morph
-        ep = _rollout_return(net, obs_norm, env, device)             # (len*epm,) raw returns
+        ep = _rollout_return(net, obs_norm, env, device,
+                             obs_base=OBS_BASE, mask_dim=MASK_DIM)    # (len*epm,) raw returns
         per_body = np.array([ep[i * epm:(i + 1) * epm].mean() for i in range(len(bodies))])
 
         w = kept_cnt / kept_cnt.sum()
@@ -143,10 +148,10 @@ def eval_all(seeds):
         scal["perf_top"].append(float(per_body[0]))                  # mode / argmax-likelihood body
         scal["perf_topk"].append(float(np.sort(per_body)[::-1][:TOPK].mean()))
 
-        wm = within_run_metrics([presence_to_repr(p) for p in presence])   # full N sample (dedup inside)
+        wm = within_run_metrics([counts_to_repr(p) for p in mods])   # full N sample (dedup inside)
         for k in ("div_comp", "div_comp_norm", "div_struct", "div_nmodes"):
             scal[k].append(wm[k])
-        dominants.append(presence_to_repr(kept_pat[0]))              # dominant = mode body
+        dominants.append(counts_to_repr(kept_pat[0]))                # dominant = mode body
         used_seeds.append(seed)
         print(f"[phase] eval {NAME(seed)}: top={scal['perf_top'][-1]:.1f} "
               f"distavg={scal['perf_distavg'][-1]:.1f} top{TOPK}={scal['perf_topk'][-1]:.1f} "
@@ -257,12 +262,17 @@ def _agg(d):
 
 def build_artifact(seeds):
     payload = {"phase": PHASE, "seeds": np.array(seeds), "n_sample": N_SAMPLE,
-               "topk": TOPK, "max_epochs": MAX_EPOCHS}
+               "topk": TOPK, "max_epochs": MAX_EPOCHS,
+               "git_branch": BRANCH, "git_commit": _git(["rev-parse", "--short", "HEAD"])}
     payload.update(eval_all(seeds))
     payload.update(scrape_all(seeds))
     payload.update(_agg(payload))
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     path = DATA_DIR / f"{PHASE}.npz"
+    if path.exists():                                    # never clobber another phase/branch's frozen data
+        _prev = np.load(path, allow_pickle=True)
+        prev_b = str(_prev["git_branch"]) if "git_branch" in _prev else BRANCH
+        assert prev_b == BRANCH, f"{path.name} written on {prev_b!r}; refusing to overwrite from {BRANCH!r}"
     np.savez_compressed(path, **payload)
     print(f"[phase] artifact -> {path}")
     for k in ("perf_top", "perf_distavg", "perf_topk", "conv_quality", "conv_morph",
@@ -277,8 +287,10 @@ def main():
     ap.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS)
     ap.add_argument("--max-epochs", type=int, default=None, help="override budget (dry run)")
     ap.add_argument("--num-envs", type=int, default=None, help="override num_actors (dry run)")
-    ap.add_argument("--skip-train", action="store_true", help="eval+scrape existing phase0_ runs only")
+    ap.add_argument("--skip-train", action="store_true", help="eval+scrape existing phase1_ runs only")
     a = ap.parse_args()
+    cur = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+    assert cur == BRANCH, f"harness pinned to {BRANCH!r} but on {cur!r} — edit the identity block for this phase"
     if not a.skip_train:
         train_all(a.seeds, a.max_epochs, a.num_envs)
     build_artifact(a.seeds)
