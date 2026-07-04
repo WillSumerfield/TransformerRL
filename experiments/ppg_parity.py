@@ -114,10 +114,11 @@ def aggregate_curves(seeds):
 
 # ---- 3. final-inference return (controlled clean bodies) -------------------------
 
-def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1):
-    obs_total = _OBS_TOTAL + (1 if value_size == 2 else 0)   # +progress dim for the V1.0 head
+def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1,
+                 obs_base: int = _OBS_TOTAL, n_act: int = _N_ACT):
+    obs_total = obs_base + (1 if value_size == 2 else 0)     # +progress dim for the V1.0 head
     net = MultiMorphLimbTransformerBuilder.Network(
-        params=net_params, actions_num=_N_ACT, input_shape=(obs_total,), num_seqs=1,
+        params=net_params, actions_num=n_act, input_shape=(obs_total,), num_seqs=1,
         value_size=value_size)
     raw = torch.load(ckpt, map_location=device, weights_only=False)["model"]
     state = {k.removeprefix("_orig_mod."): v for k, v in raw.items()}
@@ -129,15 +130,15 @@ def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1):
     return net, obs_norm
 
 @torch.no_grad()
-def _rollout_return(net, obs_norm, env, device):
+def _rollout_return(net, obs_norm, env, device, obs_base: int = _OBS_TOTAL, mask_dim: int = _MASK_DIM):
     n, L = env.total_num_envs, env.max_episode_length
     ep = torch.zeros(n, device=device)
     done = torch.zeros(n, dtype=torch.bool, device=device)
     obs, _ = env.reset()
     for _ in range(L):
         normed = obs_norm(obs).clone()
-        _m0 = _OBS_TOTAL - _MASK_DIM                        # mask = [123:139]; front-offset works at
-        normed[..., _m0:_OBS_TOTAL] = obs[..., _m0:_OBS_TOTAL]   # value_size 1 (139) AND 2 (progress@139)
+        _m0 = obs_base - mask_dim                           # mask = last mask_dim of the base obs
+        normed[..., _m0:obs_base] = obs[..., _m0:obs_base]  # raw mask; progress dim (value_size 2) sits past obs_base
         mu, _, _, _ = net({"obs": normed})
         obs, rew, term, trunc, _ = env.step(mu.clamp(-1.0, 1.0))
         rew = rew.squeeze(-1) if rew.ndim > 1 else rew
