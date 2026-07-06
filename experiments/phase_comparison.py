@@ -101,8 +101,10 @@ def _legs_of(presence_row) -> tuple:
 
 
 def eval_all(seeds):
+    import gc
     import torch
     import yaml
+    import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
     from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
     from envs.ant_envs.build_vsim import Morphology
@@ -149,7 +151,15 @@ def eval_all(seeds):
         print(f"[phase] eval {NAME(seed)}: top={scal['perf_top'][-1]:.1f} "
               f"distavg={scal['perf_distavg'][-1]:.1f} top{TOPK}={scal['perf_topk'][-1]:.1f} "
               f"| {len(patterns)} distinct, nmodes={wm['div_nmodes']:.2f}", flush=True)
-        del env
+        # vsim gym is a licensed per-process singleton: must tear down before the next seed's
+        # create_gym (else "License validation failed"). Drain in-flight work first, mirroring
+        # AntMultiMorphEnv._rebuild, so delete_gym doesn't free vsim buffers under a live async op.
+        torch.cuda.synchronize()
+        for _fn in ("end_streaming", "_check_for_cuda_errors"):
+            try: getattr(env.gym, _fn)()
+            except Exception: pass
+        env.gym = None; del env; gc.collect()
+        v.delete_gym()
 
     out = {f"seed_{k}": np.array(v, dtype=np.float32) for k, v in scal.items()}
     if dominants:
