@@ -18,6 +18,7 @@ import os
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
 from .architectures import _GEN_ON, _GEN_STOP
@@ -94,6 +95,8 @@ class CodesignAgent(LoggingA2CAgent):
         self._jepa_coef = float(jc.get('coef', 1.0))
         self._jepa_mask_prob = float(jc.get('mask_prob', 0.25))
         self._jepa_chunk = int(jc.get('chunk_states', 8192))   # 0 -> whole minibatch (memory cap)
+        self._jepa_anchor_coef = float(jc.get('anchor_coef', 1.0))         # repr-anchor in resample
+        self._jepa_anchor_states = int(jc.get('anchor_snapshot_states', 16384))  # <=0 or >=HN -> full
         self._jepa_losses = []
 
         # R_i accumulator: true completed-episode return per env over the window (gamma=1).
@@ -239,6 +242,20 @@ class CodesignAgent(LoggingA2CAgent):
                 mu_old[s:s + self.minibatch_size] = m
                 v098_old[s:s + self.minibatch_size] = v
 
+            # JEPA repr-anchor: snapshot H_full over a random SUBSET of rollout states (bf16; cosine
+            # is scale-invariant so half-precision storage is fine). The generator update then pulls
+            # H_full back toward this pre-update snapshot so it can't destroy the control rep.
+            anchor_on = self._jepa_enabled and self._jepa_anchor_coef > 0
+            if anchor_on:
+                S = HN if (self._jepa_anchor_states <= 0 or self._jepa_anchor_states >= HN) \
+                    else self._jepa_anchor_states
+                sub = torch.randperm(HN, device=dev)[:S]     # subset global indices
+                H_old = obs_flat.new_empty(S, net.n_tokens, net._d_model, dtype=torch.bfloat16)
+                for s in range(0, S, self.minibatch_size):
+                    idx = sub[s:s + self.minibatch_size]
+                    *_, H = net.codesign_forward(self.model.norm_obs(obs_flat[idx]), return_hidden=True)
+                    H_old[s:s + self.minibatch_size] = H.to(torch.bfloat16)
+
         pretrain = self._in_pretrain()
         if pretrain:                                       # BC toward the built body (frontier tokens)
             # reconstruct a valid token sequence that yields _cur_counts (random tip order, no flip)
@@ -255,7 +272,7 @@ class CodesignAgent(LoggingA2CAgent):
 
         L1 = self._n_dof + 1                               # (L+1) prefixes gen_replay stacks per env
         mb_size = max(1, min(N // self._gen_minibatches, self._gen_max_prefixes // L1))
-        logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn')}
+        logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn', 'anchor')}
         for _ in range(self._gen_epochs):
             perm = torch.randperm(N, device=dev)
             for s in range(0, N, mb_size):
@@ -278,22 +295,34 @@ class CodesignAgent(LoggingA2CAgent):
                 v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
 
                 # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
-                ridx = torch.randint(0, HN, (N,), device=dev)
-                ob = obs_flat[ridx]
-                mu_n, v098_n, v1_n = net.codesign_forward(self.model.norm_obs(ob))
+                # Anchor on: sample from the snapshot SUBSET so H_full_new reuses this single forward
+                # (no extra pass); the clone is a soft regularizer, so a subset sample is fine.
+                if anchor_on:
+                    j = torch.randint(0, S, (N,), device=dev)
+                    ridx = sub[j]
+                    ob = obs_flat[ridx]
+                    mu_n, v098_n, v1_n, H_new = net.codesign_forward(self.model.norm_obs(ob),
+                                                                     return_hidden=True)
+                    anchor = (1 - F.cosine_similarity(H_new, H_old[j].float(), dim=-1)).mean()
+                else:
+                    ridx = torch.randint(0, HN, (N,), device=dev)
+                    ob = obs_flat[ridx]
+                    mu_n, v098_n, v1_n = net.codesign_forward(self.model.norm_obs(ob))
+                    anchor = ob.new_zeros(())
                 kl = _gauss_kl(mu_old[ridx], ls_old[ridx], mu_n, self._log_std(ob))
                 crit = (v098_n - v098_old[ridx]).pow(2).mean()
                 v_roll = (v1_n.squeeze(-1) - R_roll[ridx]).pow(2).mean()
 
                 loss = (gen_pg - self._gen_ent * ent
                         + self._gencrit_coef * (v_prefix + v_roll)
-                        + self._beta * kl + self._lam * crit)
+                        + self._beta * kl + self._lam * crit
+                        + self._jepa_anchor_coef * anchor)
                 self.optimizer.zero_grad()
                 loss.backward()
                 logs['gn'].append(clip_grad_norm_(self.model.parameters(), self.grad_norm))
                 self.optimizer.step()
                 for k, val in (('gen_pg', gen_pg), ('ent', ent), ('v_prefix', v_prefix),
-                               ('v_roll', v_roll), ('kl', kl), ('crit', crit)):
+                               ('v_roll', v_roll), ('kl', kl), ('crit', crit), ('anchor', anchor)):
                     logs[k].append(val.detach())
 
         self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
@@ -477,6 +506,7 @@ class CodesignAgent(LoggingA2CAgent):
         # --- clone/: control preservation at resample ---
         w.add_scalar('clone/actor_kl', g['kl'], frame)
         w.add_scalar('clone/critic_mse', g['crit'], frame)
+        w.add_scalar('clone/repr_anchor', g['anchor'], frame)
 
         self._gen_log = None
 
