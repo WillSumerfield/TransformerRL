@@ -201,16 +201,19 @@ class LimbTransformer(nn.Module):
         mode = torch.cat([x.new_zeros(B, 1 + n, d), self.mode_emb(mode_ids)], dim=1)
         return self.encoder(x + mode)                                  # all tokens real -> no padding
 
-    def codesign_forward(self, obs: torch.Tensor):
+    def codesign_forward(self, obs: torch.Tensor, return_hidden: bool = False):
         """Live pass returning ContAct mu, ContCrit V0.98, and GenCrit/V1.0 in ONE trunk encode
         (resample-update path, grad-enabled). obs is model-normalized; the global log_std lives on
         the builder Network and is applied by the caller. Module tokens are already in canonical
-        depth-major slot order == env action order, so NO nat_to_dof remap."""
+        depth-major slot order == env action order, so NO nat_to_dof remap.
+        return_hidden=True also returns the post-trunk hidden states H (B, n_tokens, d) for JEPA
+        target / repr-anchor use."""
         root, module_tok, active_mask = self._tokenize_modules(obs)
         H = self._encode_codesign(root, module_tok, active_mask, obs.shape[0])
         modules = H[:, self._content_start:, :]
         mu = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask
-        return mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0])
+        out = (mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0]))
+        return out + (H,) if return_hidden else out
 
     # ---- design mode: morphology-only generation pass (no physical state) ------------------------
     def _encode_design(self, count, stopped):
