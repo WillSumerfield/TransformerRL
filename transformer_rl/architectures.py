@@ -142,6 +142,14 @@ class LimbTransformer(nn.Module):
             nn.init.zeros_(self.gen_head.bias)             # p_continue = 0.5 at init
             self.gencrit_head = nn.Linear(d_model, 1)
             self.cls_design = nn.Parameter(torch.zeros(d_model))
+            # JEPA: shared learned [MASK] latent (swapped in pre-additive at masked positions) +
+            # BYOL-style 2-layer predictor (LayerNorm inner norm: batch-independent, safe for the
+            # variable-size masked-token index). Inert unless jepa_loss is called (agent config gate).
+            self.mask_token = nn.Parameter(torch.randn(d_model) * 0.02)
+            self.jepa_predictor = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.LayerNorm(d_model),
+                nn.GELU(), nn.Linear(d_model, d_model),
+            )
         self._xavier_init()
 
     def _xavier_init(self) -> None:
@@ -185,15 +193,19 @@ class LimbTransformer(nn.Module):
         return x * token_mask  # zero inactive outputs (cuts gradient through transformer)
 
     # ---- live control pass (uniform module tokens) ----------------------------------------------
-    def _encode_codesign(self, root, module_tok, active_mask, B):
+    def _encode_codesign(self, root, module_tok, active_mask, B, mask_pos=None):
         """Fixed (1+n+n*max_len)-token live-mode pass: inactive module slots become STOP tokens
         (never masked, state embed zeroed), real modules carry LIVE mode; plus persistent start
-        anchors + CLS. Depth/type/pos are additive. See CONTEXT.md."""
+        anchors + CLS. Depth/type/pos are additive. See CONTEXT.md.
+        mask_pos (B, n_tokens) bool (JEPA): swap the pre-additive latent for the learned [MASK] at
+        masked positions BEFORE additive type/pos/depth/mode (which still disambiguate the slot)."""
         n, d = self.n_limbs, self._d_model
         m = self.embed_module(module_tok) * active_mask.unsqueeze(-1)   # zero inactive module state
         cls = self.embed_root(root).unsqueeze(1)
         start = self.angle_proj(self.angle_enc).unsqueeze(0).expand(B, -1, -1)  # (B,n,d) angle anchor
         x = torch.cat([cls, start, m], dim=1)                          # (B, 1+n+n_dof, d)
+        if mask_pos is not None:
+            x = torch.where(mask_pos.unsqueeze(-1), self.mask_token.to(x.dtype), x)
         x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids) + self._depth_add()
 
         mode_ids = torch.where(active_mask > 0, active_mask.new_full((), _MODE_LIVE),
@@ -214,6 +226,42 @@ class LimbTransformer(nn.Module):
         mu = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask
         out = (mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0]))
         return out + (H,) if return_hidden else out
+
+    def _sample_jepa_mask(self, active_mask: torch.Tensor, mask_prob: float) -> torch.Tensor:
+        """(B, n_tokens) bool JEPA mask. Maskable = CLS + active modules (never start/inactive-STOP).
+        Bernoulli(mask_prob) per maskable token, then per-sample guards force >=1 masked AND >=1
+        unmasked among the maskable set (always satisfiable: >=1 module + CLS => >=2 maskable)."""
+        B, T, dev = active_mask.shape[0], self.n_tokens, active_mask.device
+        maskable = torch.zeros(B, T, dtype=torch.bool, device=dev)
+        maskable[:, 0] = True                                          # CLS
+        maskable[:, self._content_start:] = active_mask.bool()         # active modules
+        mask_pos = maskable & (torch.rand(B, T, device=dev) < mask_prob)
+        ar = torch.arange(B, device=dev)
+        neg = torch.full((B, T), -1.0, device=dev)
+        need_mask = mask_pos.sum(1) == 0                               # force one maskable -> masked
+        r = torch.where(maskable, torch.rand(B, T, device=dev), neg)
+        mask_pos[ar[need_mask], r.argmax(1)[need_mask]] = True
+        need_unmask = mask_pos.sum(1) == maskable.sum(1)              # force one masked -> unmasked
+        r2 = torch.where(mask_pos, torch.rand(B, T, device=dev), neg)
+        mask_pos[ar[need_unmask], r2.argmax(1)[need_unmask]] = False
+        return mask_pos
+
+    def jepa_loss(self, obs: torch.Tensor, mask_prob: float):
+        """Same-step I-JEPA on the control trunk: mask a random subset of tokens (CLS + active
+        modules) and predict their post-trunk latent from the unmasked context. Target =
+        stop-grad post-trunk H_full (unmasked pass); pred = predictor(H_masked[mask]). BYOL cosine
+        loss (2-2cos). Grad flows into embed_*/trunk (via unmasked tokens) + mask_token + predictor.
+        obs is model-normalized."""
+        root, module_tok, active_mask = self._tokenize_modules(obs)
+        B = obs.shape[0]
+        with torch.no_grad():                                          # target: unmasked context
+            H_full = self._encode_codesign(root, module_tok, active_mask, B)
+        mask_pos = self._sample_jepa_mask(active_mask, mask_prob)
+        H_masked = self._encode_codesign(root, module_tok, active_mask, B, mask_pos=mask_pos)
+        pred = self.jepa_predictor(H_masked[mask_pos])                 # (n_masked, d)
+        tgt = H_full[mask_pos]                                         # already no-grad
+        loss = (2 - 2 * (F.normalize(pred, dim=-1) * F.normalize(tgt, dim=-1)).sum(-1)).mean()
+        return loss
 
     # ---- design mode: morphology-only generation pass (no physical state) ------------------------
     def _encode_design(self, count, stopped):
