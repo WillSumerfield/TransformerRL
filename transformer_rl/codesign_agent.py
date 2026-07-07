@@ -87,6 +87,15 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_log = None
         self._last_R = None
 
+        # JEPA aux (Phase 2): same-step masked-latent prediction on the shared control trunk.
+        # Disabled -> zero extra forwards, behaviour == phase-1 baseline (A/B control).
+        jc = self.config.get('jepa', {})
+        self._jepa_enabled = bool(jc.get('enabled', False))
+        self._jepa_coef = float(jc.get('coef', 1.0))
+        self._jepa_mask_prob = float(jc.get('mask_prob', 0.25))
+        self._jepa_chunk = int(jc.get('chunk_states', 8192))   # 0 -> whole minibatch (memory cap)
+        self._jepa_losses = []
+
         # R_i accumulator: true completed-episode return per env over the window (gamma=1).
         self._ep_ret = torch.zeros(N, device=dev)
         self._win_ret_sum = torch.zeros(N, device=dev)
@@ -97,6 +106,31 @@ class CodesignAgent(LoggingA2CAgent):
 
     def _net(self):
         return self.model.a2c_network.net
+
+    def calc_gradients(self, input_dict):
+        # PPO control step (+ saturation logging) first, untouched -> control stays clean.
+        super().calc_gradients(input_dict)
+        if not self._jepa_enabled:
+            return
+        # Separate JEPA forward+backward+step on the SAME rollout obs (own step; PPO already stepped).
+        # Plain optimizer path (no scaler), matching the _resample_update aux convention.
+        # The masked forward+backward over the full minibatch OOMs a 15GB card on top of PPO's
+        # resident memory, so grad-accumulate over chunks (peak = one chunk; ALL states used).
+        net = self._net()
+        obs = self.model.norm_obs(input_dict['obs'])
+        B = obs.shape[0]
+        chunk = self._jepa_chunk if self._jepa_chunk > 0 else B
+        self.optimizer.zero_grad()
+        acc = 0.0
+        for s in range(0, B, chunk):
+            ob = obs[s:s + chunk]
+            jl = net.jepa_loss(ob, self._jepa_mask_prob)
+            (self._jepa_coef * jl * (ob.shape[0] / B)).backward()   # batch-mean over chunks
+            acc += jl.detach() * ob.shape[0]
+        if self.truncate_grads:
+            clip_grad_norm_(self.model.parameters(), self.grad_norm)
+        self.optimizer.step()
+        self._jepa_losses.append(acc / B)
 
     def _log_std(self, obs):
         mask = (obs[..., self._mask_off:self._mask_off + self._n_dof] > 0).float()
@@ -384,9 +418,15 @@ class CodesignAgent(LoggingA2CAgent):
     def write_stats(self, *args, **kwargs):
         super().write_stats(*args, **kwargs)
         w = self.writer
-        if w is None or self._gen_log is None:
+        if w is None:
             return
         frame = args[11] if len(args) > 11 else kwargs.get('frame')
+        # JEPA loss logs every epoch (independent of the resample-boundary _gen_log).
+        if self._jepa_losses:
+            w.add_scalar('losses/jepa', torch.stack(self._jepa_losses).mean().item(), frame)
+            self._jepa_losses = []
+        if self._gen_log is None:
+            return
         g = self._gen_log
 
         # --- build/: the body the generator produces (realized = built body, counts) ---
