@@ -73,65 +73,77 @@ def tokenize_8(obs):
     return _tokenize(obs, 8, OBS_DIM_8, MASK_DIM_8, _LIMB_ENC_8, len_dim=LEN_DIM_8)
 
 
-# ── Phase 1: variable-length limbs, uniform module tokens, parameterized by (n_limbs, max_len) ──
-# Single source of truth for the 32-DOF depth-major obs layout (must match ant_multimorph._slot and
-# its _OBS_* constants, which derive from the SAME (n_limbs, max_len)). A limb is a chain of up to
-# max_len modules; each module is one uniform token.
-MODULE_DIM = 12   # pos(1)+vel(1)+last_action(1)+sin(1)+cos(1)+module_len(1)+cfrc(6)
+# ── Phase 2 (2a): relative-geometry module tokens, parameterized by (n_limbs, max_len) ──
+# Single source of truth for the depth-major obs layout (must match ant_multimorph._O_* / _slot,
+# derived from the SAME (n_limbs, max_len)). A limb is a chain of up to max_len modules; each module
+# is ONE uniform token. Rotations are 6D (first two cols of the 3x3); per-module geometry is
+# RELATIVE-TO-PARENT (parent-local frame), computed ENV-SIDE and written into obs BEFORE the
+# RunningMeanStd normalizer (so it only ever sees already-6D features).
+#   obs: root(13) | [sin cos vel act] (n_dof each) | [relpos(3) relrot(6) relvel(6)] (per module)
+#        | sensors(n_limbs*6) | lengths(n_dof) | mask(n_dof)
+# `lengths` stays in obs (constant per body; consumed by the diversity harness, NOT the token) — so
+# obs_base/len_dim/obs_total keep phase-1 semantics and their downstream readers are unchanged.
+ROOT_DIM_P2 = 13   # y(1) + rot6d(6) + linvel(3) + angvel(3)   (quat->6D; vs phase-1 ROOT_DIM=11)
+# per-module dynamic obs blocks (SoA, depth-major slot order): (name, width). cfrc is NOT here — it
+# rides the shared per-limb sensor block, routed to each limb's terminal module below.
+_MOD_BLOCKS = (("sin", 1), ("cos", 1), ("vel", 1), ("act", 1),
+               ("relpos", 3), ("relrot", 6), ("relvel", 6))
+MODULE_DYN = 19   # sum of _MOD_BLOCKS widths — per-module obs dims (excludes terminal cfrc)
+MODULE_DIM = 25   # token content: sin, cos, vel, act, cfrc(6), relpos(3), relrot6d(6), relvel(6)
 
 
 def token_dims(n_limbs: int, max_len: int) -> dict:
-    """Derived obs/token dims. slot(n,d)=(d-1)*n_limbs+(n-1) depth-major; sensors stay per-limb (6)."""
+    """Derived obs/token dims. slot(n,d)=(d-1)*n_limbs+(n-1) depth-major; sensors stay per-limb (6).
+    obs_base = start of the lengths block (== phase-1 semantics, so mask_off = obs_base + len_dim)."""
     n_dof = n_limbs * max_len
-    obs_base = ROOT_DIM + 3 * n_dof + n_limbs * 6          # root + dofpos+dofvel+lastact + sensors
-    return dict(n_limbs=n_limbs, max_len=max_len, n_dof=n_dof, obs_base=obs_base,
+    sens_off = ROOT_DIM_P2 + MODULE_DYN * n_dof                    # start of per-limb contact sensors
+    obs_base = sens_off + n_limbs * 6                             # start of lengths block
+    return dict(n_limbs=n_limbs, max_len=max_len, n_dof=n_dof, sens_off=sens_off, obs_base=obs_base,
                 len_dim=n_dof, mask_dim=n_dof, obs_total=obs_base + 2 * n_dof,
                 n_module_tokens=n_dof, n_tokens=1 + n_limbs + n_dof)  # CLS + start*n + module*n_dof
 
 
 def limb_enc(n_limbs: int) -> torch.Tensor:
-    """sin/cos of each limb's placement angle i*45deg (matches build_vsim._DIR / _LIMB_ENC_8)."""
+    """sin/cos of each limb's placement angle i*45deg (matches build_vsim._DIR / _LIMB_ENC_8).
+    Still used for the model's per-limb START-anchor (angle_proj); NOT a per-module token feature."""
     return torch.tensor([[math.sin(i * math.pi / 4), math.cos(i * math.pi / 4)] for i in range(n_limbs)],
                         dtype=torch.float32)
 
 
 def tokenize_modules(obs, n_limbs: int, max_len: int, enc: torch.Tensor = None):
-    """Tokenize a depth-major variable-length obs into (root, module_tokens, active_mask).
-      module_tokens: (B, n_limbs*max_len, MODULE_DIM) in canonical depth-major slot order.
+    """Tokenize a depth-major relative-geometry obs into (root, module_tokens, active_mask).
+      root:          (B, ROOT_DIM_P2=13) = y + rot6d(6) + linvel(3) + angvel(3).
+      module_tokens: (B, n_limbs*max_len, MODULE_DIM=25) canonical depth-major slot order:
+                     [sin, cos, vel, act, cfrc(6), relpos(3), relrot6d(6), relvel(6)].
       active_mask:   (B, n_limbs*max_len) 1 for real modules. cfrc rides ONLY on each limb's
-                     terminal (last active) module.
-    """
+                     terminal (last active) module. `enc` is accepted for call compat but unused
+                     (per-module limb-direction feature dropped in 2a). Inactive slots stay 0."""
     B = obs.shape[0]
     d = token_dims(n_limbs, max_len)
-    n_dof, obs_base = d["n_dof"], d["obs_base"]
+    n_dof, sens_off, obs_base = d["n_dof"], d["sens_off"], d["obs_base"]
     dev = obs.device
-    root    = obs[:, 0:ROOT_DIM]
-    dof_pos = obs[:, ROOT_DIM              : ROOT_DIM + n_dof]
-    dof_vel = obs[:, ROOT_DIM + n_dof      : ROOT_DIM + 2 * n_dof]
-    acts    = obs[:, ROOT_DIM + 2 * n_dof  : ROOT_DIM + 3 * n_dof]
-    sensors = obs[:, ROOT_DIM + 3 * n_dof  : obs_base]              # (B, n_limbs*6) per-limb contact
-    lengths = obs[:, obs_base               : obs_base + n_dof]
-    mask_off = obs_base + n_dof
-    raw_mask = (obs[:, mask_off : mask_off + n_dof] if obs.shape[1] >= mask_off + n_dof
+    root = obs[:, 0:ROOT_DIM_P2]
+
+    dm = lambda x, w: x.reshape(B, max_len, n_limbs, w)           # depth-major [B, d, n, w]; slot-major flat
+    o, parts = ROOT_DIM_P2, []
+    for _, w in _MOD_BLOCKS:
+        parts.append(dm(obs[:, o:o + w * n_dof], w)); o += w * n_dof
+    sin_d, cos_d, vel_d, act_d, relpos_d, relrot_d, relvel_d = parts
+
+    mask_off = obs_base + d["len_dim"]                            # skip the lengths block
+    raw_mask = (obs[:, mask_off:mask_off + n_dof] if obs.shape[1] >= mask_off + n_dof
                 else torch.ones(B, n_dof, device=dev))
+    mask_d = raw_mask.reshape(B, max_len, n_limbs)               # (B, d, n)
 
-    dm = lambda x: x.view(B, max_len, n_limbs)                     # depth-major [B, d, n]
-    pos_d, vel_d, act_d, len_d, mask_d = dm(dof_pos), dm(dof_vel), dm(acts), dm(lengths), dm(raw_mask)
-
-    enc = (limb_enc(n_limbs) if enc is None else enc).to(dev)      # (n_limbs, 2)
-    # per-module gate: sin/cos ride only on ACTIVE modules (inactive slots stay fully zero)
-    enc_dn = enc.view(1, 1, n_limbs, 2) * (mask_d > 0).unsqueeze(-1).float()   # (B, d, n, 2)
-
-    count = mask_d.sum(dim=1)                                      # (B, n_limbs) chain length
+    count = mask_d.sum(dim=1)                                     # (B, n_limbs) chain length
     depth0 = torch.arange(max_len, device=dev).view(1, max_len, 1)
     is_terminal = (mask_d > 0) & (depth0 == (count.unsqueeze(1) - 1))   # (B, d, n) last active module
-    sens = sensors.view(B, n_limbs, 6)
+    sens = obs[:, sens_off:sens_off + n_limbs * 6].view(B, n_limbs, 6)
     cfrc = torch.where(is_terminal.unsqueeze(-1),
                        sens.unsqueeze(1).expand(B, max_len, n_limbs, 6),
-                       torch.zeros(B, max_len, n_limbs, 6, device=dev))
+                       torch.zeros(B, max_len, n_limbs, 6, device=dev))   # (B, d, n, 6)
 
-    module = torch.cat([pos_d.unsqueeze(-1), vel_d.unsqueeze(-1), act_d.unsqueeze(-1),
-                        enc_dn, len_d.unsqueeze(-1), cfrc], dim=-1)     # (B, d, n, 12)
-    module_tokens = module.reshape(B, n_dof, MODULE_DIM)          # depth-major slot order
+    module = torch.cat([sin_d, cos_d, vel_d, act_d, cfrc, relpos_d, relrot_d, relvel_d], dim=-1)
+    module_tokens = module.reshape(B, n_dof, MODULE_DIM)         # (B, n_dof, 25) depth-major slot order
     active_mask   = (mask_d > 0).reshape(B, n_dof).float()
     return root, module_tokens, active_mask

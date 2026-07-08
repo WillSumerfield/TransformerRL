@@ -28,16 +28,22 @@ _N_DOFS_FULL  = _N_LIMBS * _MAX_LEN            # 32 = 8 limbs x 4 modules, 1 DOF
 # slot = (d-1)*8 + (n-1). Depth d in [1..4]; d=1 is the swing module, d>=2 the knee chain. Length-2
 # bodies occupy depths 1,2 -> the [0:16] band. Aligns with the eff0(pos1)/eff1(pos2+) token blocks.
 _N_SENSOR    = _N_LIMBS * 6                     # 48: one terminal contact sensor per limb, 6 comps
-# obs layout (offsets): root | dofpos | dofvel | lastact | sensors | lengths | dofmask
-_O_ROOT      = 11                               # y(1)+quat(4)+linvel(3)+angvel(3)
-_O_DOFPOS    = _O_ROOT                           # 11
-_O_DOFVEL    = _O_DOFPOS + _N_DOFS_FULL          # 43
-_O_LASTACT   = _O_DOFVEL + _N_DOFS_FULL          # 75
-_O_SENSOR    = _O_LASTACT + _N_DOFS_FULL         # 107
-_OBS_BASE    = _O_SENSOR + _N_SENSOR             # 155  (end of physical obs)
-_LEN_DIM     = _N_DOFS_FULL                      # 32 module lengths (raw; RMS-normalized by policy)
+# Phase-2 (2a) obs layout (offsets), must match transformer_rl/tokenize.token_dims:
+#   root(13) | sin cos vel act (n_dof each) | relpos(3nd) relrot(6nd) relvel(6nd) | sensors(48)
+#   | lengths(32) | dofmask(32).  Rotations are 6D; per-module geometry is relative-to-parent.
+_O_ROOT      = 13                               # y(1) + rot6d(6) + linvel(3) + angvel(3)
+_O_SIN       = _O_ROOT                           # 13  joint sin(theta)
+_O_COS       = _O_SIN + _N_DOFS_FULL             # 45  joint cos(theta)
+_O_VEL       = _O_COS + _N_DOFS_FULL             # 77  joint velocity
+_O_ACT       = _O_VEL + _N_DOFS_FULL             # 109 last action
+_O_RELPOS    = _O_ACT + _N_DOFS_FULL             # 141 rel-pos (3/module)
+_O_RELROT    = _O_RELPOS + 3 * _N_DOFS_FULL      # 237 rel-rot 6D (6/module)
+_O_RELVEL    = _O_RELROT + 6 * _N_DOFS_FULL      # 429 rel-vel lin+ang (6/module)
+_O_SENSOR    = _O_RELVEL + 6 * _N_DOFS_FULL      # 621 per-limb terminal contact (48)
+_OBS_BASE    = _O_SENSOR + _N_SENSOR             # 669  (end of physical obs; start of lengths)
+_LEN_DIM     = _N_DOFS_FULL                      # 32 module lengths (kept for diversity harness)
 _MASK_DIM    = _N_DOFS_FULL                      # 32
-_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 219
+_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 733
 
 
 def _slot(n: int, d: int) -> int:
@@ -49,6 +55,21 @@ def _parse_joint(name: str) -> tuple:
     """'joint_{n}_{d}' -> (n, d)."""
     _, ns, ds = name.split("_")
     return int(ns), int(ds)
+
+
+def _quat_to_rotmat(q: torch.Tensor) -> torch.Tensor:
+    """(...,4) quaternion (x,y,z,w, normalized) -> (...,3,3) rotation matrix (columns = body axes
+    in world frame). Used for the 6D rotation (first two columns) + relative-geometry obs (2a)."""
+    x, y, z, w = q.unbind(-1)
+    xx, yy, zz = x * x, y * y, z * z
+    xy, xz, yz = x * y, x * z, y * z
+    wx, wy, wz = w * x, w * y, w * z
+    R = torch.stack([
+        1 - 2 * (yy + zz), 2 * (xy - wz),     2 * (xz + wy),
+        2 * (xy + wz),     1 - 2 * (xx + zz), 2 * (yz - wx),
+        2 * (xz - wy),     2 * (yz + wx),     1 - 2 * (xx + yy),
+    ], dim=-1).reshape(*q.shape[:-1], 3, 3)
+    return R
 
 # Empty grid cells of padding between adjacent morphology sets (in units of `spacing`).
 _SET_GAP_CELLS = 4
@@ -349,11 +370,13 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         #   _motor_src_idx[p]    : index into act.view(-1) feeding flat-motor slot p
         #   _sensor_gather_idx / _sensor_mask : the same for the 48 force-sensor slots
         n_sensors_per = [g["art_def"].get_num_force_sensor_defs() for g in self.groups]
-        dof_off, sen_off, d, s = [], [], 0, 0
+        n_links_per   = [g["art_def"].get_num_link_defs() for g in self.groups]  # 1 torso + 1/module
+        dof_off, sen_off, link_off, d, s, L = [], [], [], 0, 0, 0
         for gi, g in enumerate(self.groups):
             dof_off.append(d); d += EPM * g["n_dofs"]
             sen_off.append(s); s += EPM * n_sensors_per[gi] * 6
-        FLAT_DOF, FLAT_SEN = d, s
+            link_off.append(L); L += EPM * n_links_per[gi]   # in ROWS (1 row = one link's pose/vel)
+        FLAT_DOF, FLAT_SEN, FLAT_LINK = d, s, L
 
         self._flat_get_dof_pos = torch.zeros(FLAT_DOF, dtype=torch.float32, device=self.device)
         self._flat_get_dof_vel = torch.zeros(FLAT_DOF, dtype=torch.float32, device=self.device)
@@ -363,13 +386,22 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self._flat_dof_init    = torch.zeros(FLAT_DOF, dtype=torch.float32, device=self.device)
         self._flat_sensor      = torch.zeros(FLAT_SEN, dtype=torch.float32, device=self.device)
         self._has_sensors      = FLAT_SEN > 0
+        # Per-link pose (7 = quat xyzw + pos xyz) / velocity (6 = ang xyz + lin xyz) in ENV frame, one
+        # ROW per (env, link), groups concatenated. Feeds the relative-to-parent geometry obs (2a).
+        self._flat_get_link_pose = torch.zeros(FLAT_LINK * 7, dtype=torch.float32, device=self.device)
+        self._flat_get_link_vel  = torch.zeros(FLAT_LINK * 6, dtype=torch.float32, device=self.device)
 
         self._dof_gather_idx    = torch.zeros((N, _N_DOFS_FULL), dtype=torch.long, device=self.device)
         self._motor_src_idx     = torch.zeros(FLAT_DOF, dtype=torch.long, device=self.device)
         self._sensor_gather_idx = torch.zeros((N, _N_LIMBS * 6), dtype=torch.long, device=self.device)
         self._sensor_mask       = torch.zeros((N, _N_LIMBS * 6), dtype=torch.float32, device=self.device)
+        # Canonical module slot -> flat link ROW for the module's own link (_link_gather_idx) and its
+        # PARENT link (_parent_gather_idx; parent of depth-1 = torso). Inactive slots gather row 0 and
+        # are zeroed by _global_dof_mask. gather via _flat_get_link_pose.view(-1,7)[idx].
+        self._link_gather_idx   = torch.zeros((N, _N_DOFS_FULL), dtype=torch.long, device=self.device)
+        self._parent_gather_idx = torch.zeros((N, _N_DOFS_FULL), dtype=torch.long, device=self.device)
 
-        all_motor_cmds, all_sensor_cmds, all_get_cmds, all_set_cmds = [], [], [], []
+        all_motor_cmds, all_sensor_cmds, all_get_cmds, all_set_cmds, all_get_link_cmds = [], [], [], [], []
         ar_epm = torch.arange(EPM, device=self.device)
         zero_l = torch.zeros((), dtype=torch.long, device=self.device)
 
@@ -428,6 +460,19 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 g["arti_handle"], link_index_range=(0, 1),
                 transform_type=v.TransformType.MODEL, frame_type=v.FrameType.ENVIRONMENT,
             ))
+            # Separate ALL-link GET for the relative-geometry obs (root path above stays untouched).
+            # dof buffers are required args but re-fetch the same values (harmless); we only read the
+            # link pose/vel slices. Rows [lo : lo+EPM*n_links) of the flat link buffers.
+            nl = n_links_per[gi]
+            lo = link_off[gi]
+            all_get_link_cmds.append(g["env_group"].create_articulation_kinematic_state_command(
+                v.wrap_gpu_buffer(chunk(self._flat_get_dof_pos, doff, n_dofs)),
+                v.wrap_gpu_buffer(chunk(self._flat_get_dof_vel, doff, n_dofs)),
+                v.wrap_gpu_buffer(self._flat_get_link_pose[lo * 7:(lo + EPM * nl) * 7].view(EPM, nl * 7)),
+                v.wrap_gpu_buffer(self._flat_get_link_vel[lo * 6:(lo + EPM * nl) * 6].view(EPM, nl * 6)),
+                g["arti_handle"], link_index_range=(0, nl),
+                transform_type=v.TransformType.MODEL, frame_type=v.FrameType.ENVIRONMENT,
+            ))
             all_set_cmds.append(g["env_group"].create_articulation_kinematic_state_command(
                 v.wrap_gpu_buffer(chunk(self._flat_set_dof_pos, doff, n_dofs)),
                 v.wrap_gpu_buffer(chunk(self._flat_set_dof_vel, doff, n_dofs)),
@@ -449,6 +494,29 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             )
             motor_block = (start + ar_epm).unsqueeze(1) * _N_DOFS_FULL + dof_idx.unsqueeze(0)
             self._motor_src_idx[doff:doff + EPM * n_dofs] = motor_block.reshape(-1)
+
+            # Link gather (canonical module slot -> flat link ROW) + parent-link gather (parent of a
+            # depth-1 module = torso). Link k named 'mod_{n}_{d}' -> slot(n,d); 'torso' -> root.
+            names   = [g["art_def"].get_link_def_name(k) for k in range(nl)]
+            torso_k = names.index("torso")
+            slot_to_k = torch.full((_N_DOFS_FULL,), -1, dtype=torch.long, device=self.device)
+            for k, nm in enumerate(names):
+                if nm == "torso":
+                    continue
+                _, ns, ds = nm.split("_")                       # 'mod_{n}_{d}'
+                slot_to_k[_slot(int(ns), int(ds))] = k
+            parent_k = torch.full((_N_DOFS_FULL,), torso_k, dtype=torch.long, device=self.device)
+            for c in range(_N_DOFS_FULL):
+                if slot_to_k[c] < 0:
+                    continue
+                depth = c // _N_LIMBS + 1                       # inverse of _slot (depth-major)
+                if depth > 1:
+                    parent_k[c] = slot_to_k[_slot(c % _N_LIMBS + 1, depth - 1)]
+            active_c   = (slot_to_k >= 0).unsqueeze(0)
+            child_row  = lo + ar_epm.unsqueeze(1) * nl + slot_to_k.clamp(min=0).unsqueeze(0)  # (EPM, n_dof)
+            parent_row = lo + ar_epm.unsqueeze(1) * nl + parent_k.unsqueeze(0)
+            self._link_gather_idx[start:end]   = torch.where(active_c, child_row,  zero_l)
+            self._parent_gather_idx[start:end] = torch.where(active_c, parent_row, zero_l)
 
             # Force-sensor commands (one per sensor) + sensor gather index.
             env_def      = self.gym.get_environment_def(g["env_def_handle"])
@@ -478,6 +546,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         # Batch commands across all groups into single GPU arrays.
         self.all_motor_cmd_array  = self.gym.create_gpu_array(all_motor_cmds)
         self._get_cmd_array       = self.gym.create_gpu_array(all_get_cmds)
+        self._get_link_cmd_array  = self.gym.create_gpu_array(all_get_link_cmds)
         self._set_cmd_array       = self.gym.create_gpu_array(all_set_cmds)
         self.all_sensor_cmd_array = self.gym.create_gpu_array(all_sensor_cmds) \
             if all_sensor_cmds else None
@@ -500,20 +569,47 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self.compute_reward_termination_truncation(self._act_buf)
 
     def compute_observations(self, actions: torch.Tensor):
-        self.gym.get_articulation_kinematic_states(self._get_cmd_array)
+        self.gym.get_articulation_kinematic_states(self._get_cmd_array)       # root pose/vel
+        self.gym.get_articulation_kinematic_states(self._get_link_cmd_array)  # all-link pose/vel
         if self.all_sensor_cmd_array is not None:
             self.gym.get_sensor_forces(self.all_sensor_cmd_array)
 
         obs = self._obs_buf
-        # DOF/sensor gathers pull each padded obs slot from its flat source; inactive slots gather
-        # index 0 and are zeroed by the mask. _dof_gather_idx serves both pos and vel.
-        obs[:, 0:1]  = self._get_root_pose[:, 5:6]   # y position
-        obs[:, 1:5]  = self._get_root_pose[:, 0:4]   # quaternion
-        obs[:, 5:8]  = self._get_root_vel[:, 3:6]    # linear velocity
-        obs[:, 8:11] = self._get_root_vel[:, 0:3]    # angular velocity
-        obs[:, _O_DOFPOS:_O_DOFVEL] = self._flat_get_dof_pos[self._dof_gather_idx] * self._global_dof_mask
-        obs[:, _O_DOFVEL:_O_LASTACT] = self._flat_get_dof_vel[self._dof_gather_idx] * self._global_dof_mask
-        obs[:, _O_LASTACT:_O_SENSOR] = self._act_buf   # last actions (already masked)
+        m = self._global_dof_mask                                   # (N, n_dof) active mask
+        # ── Root token: y + 6D rotation (first two cols of R) + lin/ang velocity (world frame) ──
+        Rr = _quat_to_rotmat(self._get_root_pose[:, 0:4])           # (N,3,3)
+        obs[:, 0:1]   = self._get_root_pose[:, 5:6]                 # y (up-axis)
+        obs[:, 1:7]   = torch.cat([Rr[..., 0], Rr[..., 1]], dim=-1)  # rot6d: col0, col1
+        obs[:, 7:10]  = self._get_root_vel[:, 3:6]                  # linear velocity
+        obs[:, 10:13] = self._get_root_vel[:, 0:3]                  # angular velocity
+
+        # ── Per-module DOF handle: joint sin/cos + velocity + last action (inactive slots -> 0) ──
+        dof_pos = self._flat_get_dof_pos[self._dof_gather_idx] * m
+        obs[:, _O_SIN:_O_COS] = torch.sin(dof_pos) * m
+        obs[:, _O_COS:_O_VEL] = torch.cos(dof_pos) * m             # cos(0)=1 gated to 0 for inactive
+        obs[:, _O_VEL:_O_ACT] = self._flat_get_dof_vel[self._dof_gather_idx] * m
+        obs[:, _O_ACT:_O_RELPOS] = self._act_buf                   # last actions (already masked)
+
+        # ── Relative-to-parent geometry (parent-local frame), from the all-link pose/vel buffers ──
+        lp = self._flat_get_link_pose.view(-1, 7)                  # (FLAT_LINK, 7) [quat xyzw, pos]
+        lv = self._flat_get_link_vel.view(-1, 6)                   # (FLAT_LINK, 6) [ang, lin]
+        Pc, Pp = lp[self._link_gather_idx], lp[self._parent_gather_idx]   # (N, n_dof, 7)
+        Vc, Vp = lv[self._link_gather_idx], lv[self._parent_gather_idx]   # (N, n_dof, 6)
+        Rc, Rp = _quat_to_rotmat(Pc[..., 0:4]), _quat_to_rotmat(Pp[..., 0:4])
+        RpT = Rp.transpose(-1, -2)                                 # world -> parent frame
+        pc, pp = Pc[..., 4:7], Pp[..., 4:7]
+        wc, vc = Vc[..., 0:3], Vc[..., 3:6]
+        wp, vp = Vp[..., 0:3], Vp[..., 3:6]
+        rel_R = RpT @ Rc                                           # child orientation in parent frame
+        rel_rot = torch.cat([rel_R[..., 0], rel_R[..., 1]], dim=-1)                  # 6D (N,n_dof,6)
+        rel_pos = (RpT @ (pc - pp).unsqueeze(-1)).squeeze(-1)                        # (N,n_dof,3)
+        rel_ang = (RpT @ (wc - wp).unsqueeze(-1)).squeeze(-1)                        # joint ang vel
+        rel_lin = (RpT @ (vc - vp - torch.cross(wp, pc - pp, dim=-1)).unsqueeze(-1)).squeeze(-1)
+        mm = m.unsqueeze(-1)
+        obs[:, _O_RELPOS:_O_RELROT] = (rel_pos * mm).reshape(obs.shape[0], -1)       # slot-major
+        obs[:, _O_RELROT:_O_RELVEL] = (rel_rot * mm).reshape(obs.shape[0], -1)
+        obs[:, _O_RELVEL:_O_SENSOR] = (torch.cat([rel_lin, rel_ang], dim=-1) * mm).reshape(obs.shape[0], -1)
+
         if self._has_sensors:
             obs[:, _O_SENSOR:_OBS_BASE] = self._flat_sensor[self._sensor_gather_idx] * self._sensor_mask
         else:
@@ -608,7 +704,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 print(f"[rebuild-drain] {_fn}() skipped: {_e!r}", flush=True)
         # Drop every gym-backed reference so delete_gym frees cleanly, then recreate the scene
         # exactly as __init__ does after gym creation.
-        self._get_cmd_array = self._set_cmd_array = None
+        self._get_cmd_array = self._set_cmd_array = self._get_link_cmd_array = None
         self.all_motor_cmd_array = self.all_sensor_cmd_array = None
         self.groups = []
         self.env_groups = []

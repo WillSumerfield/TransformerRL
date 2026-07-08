@@ -7,13 +7,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_dims, limb_enc,
-                       ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM)
+                       ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM, ROOT_DIM_P2)
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
 # codesign token type / mode ids (see CONTEXT.md "Codesign tokens")
 _T_ROOT, _T_START, _T_MODULE = 0, 1, 2            # uniform module token (Phase 1) — no eff0/eff1 split
 _MODE_LIVE, _MODE_COMMITTED, _MODE_STOP = 0, 1, 2
+_N_TYPE, _N_MODE = 3, 3     # type / mode vocab sizes — one-hot CONCATENATED into token content (2a)
 _GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action ids {continue, stop}
 
 
@@ -21,23 +22,6 @@ def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
     idx = torch.arange(2 * n_limbs, dtype=torch.long)
     return idx // 2 + n_limbs * (idx % 2)
 
-
-class MatmulEmbedding(nn.Embedding):
-    """Drop-in `nn.Embedding` whose forward is `one_hot(ids) @ weight` instead of a row gather.
-
-    Forward output is identical (bit-for-bit). The only difference is the BACKWARD. A gather's
-    backward is a scatter-accumulate into the weight rows; `torch.use_deterministic_algorithms(True)`
-    (which we enable whenever `--seed` is passed) forces that scatter onto a serialized deterministic
-    kernel. That is catastrophically slow when a *tiny* table is indexed by a *huge* batch -- our
-    3-row mode table hit by B*n_dof tokens made its backward ~60% of GPU time and seeded codesign
-    ~2.4x slower. The matmul form's backward is `one_hotᵀ @ grad`, a GEMM: deterministic AND fast.
-
-    Use ONLY for small categorical markers (a handful of rows). For real vocabularies keep
-    `nn.Embedding` -- the one-hot would waste memory. Basic lookup only (no padding_idx / max_norm).
-    Full rationale: docs/deterministic_embedding.md.
-    """
-    def forward(self, ids: torch.Tensor) -> torch.Tensor:
-        return F.one_hot(ids, self.num_embeddings).to(self.weight.dtype) @ self.weight
 
 
 class LimbTransformer(nn.Module):
@@ -75,19 +59,18 @@ class LimbTransformer(nn.Module):
             # _OBS_* constants, which derive from the SAME (n_limbs, max_limb_length)).
             self.tdims = token_dims(n_limbs, max_limb_length)
             self.n_module_tokens = self.tdims["n_module_tokens"]        # n*max_len
-            self.embed_module = nn.Linear(MODULE_DIM, d_model)
-            self.register_buffer("_enc", limb_enc(n_limbs), persistent=False)  # (n,2) sin/cos
+            # 2a: type + mode one-hots are CONCATENATED into each token's content (not additive), so
+            # each content projection is widened by the one-hot dims. type disambiguates token kind
+            # (constant per projection today; the discriminator once module SUBTYPES share embed_module
+            # at Phase 5). mode (LIVE/COMMITTED/STOP) rides embed_module only.
+            self.embed_root   = nn.Linear(ROOT_DIM_P2 + _N_TYPE, d_model)           # override root dim
+            self.embed_module = nn.Linear(MODULE_DIM + _N_TYPE + _N_MODE, d_model)
+            self.angle_proj   = nn.Linear(2 + _N_TYPE, d_model)
 
-            # additive learned embeddings summed onto the projected base tokens:
-            #   type {root,start,module}; pos = limb slot; depth = swing(0)/knee(1..); mode.
-            self.type_emb  = nn.Embedding(3, d_model)
+            # additive learned embeddings (still summed on top): pos = limb slot (SHARED across start +
+            # module), depth = swing(0)/knee(1..). type/mode are NOT additive anymore (see above).
             self.pos_emb   = nn.Embedding(1 + n_limbs, d_model)
             self.depth_emb = nn.Embedding(max_limb_length, d_model)     # per within-limb depth
-            # LIVE / COMMITTED / STOP mode. MatmulEmbedding (not nn.Embedding): a 3-row table indexed
-            # by B*n_dof tokens has a scatter backward ~2.4x slower under deterministic algorithms
-            # (--seed) + torch.compile. See MatmulEmbedding / docs/deterministic_embedding.md.
-            self.mode_emb   = MatmulEmbedding(3, d_model)
-            self.angle_proj = nn.Linear(2, d_model)
             angle_enc = torch.tensor(
                 [[math.sin(i * math.pi / 4), math.cos(i * math.pi / 4)] for i in range(n_limbs)],
                 dtype=torch.float32)                                    # matches tokenize.limb_enc
@@ -96,6 +79,8 @@ class LimbTransformer(nn.Module):
             type_ids = torch.tensor(
                 [_T_ROOT] + [_T_START] * n_limbs + [_T_MODULE] * self.n_module_tokens,
                 dtype=torch.long)
+            # constant per-token type one-hot, concatenated into content per projection (sliced below).
+            self.register_buffer("type_oh", F.one_hot(type_ids, _N_TYPE).float(), persistent=False)
             pos_ids  = torch.tensor(
                 [0] + list(range(1, n_limbs + 1)) + list(range(1, n_limbs + 1)) * max_limb_length,
                 dtype=torch.long)
@@ -196,22 +181,24 @@ class LimbTransformer(nn.Module):
     def _encode_codesign(self, root, module_tok, active_mask, B, mask_pos=None):
         """Fixed (1+n+n*max_len)-token live-mode pass: inactive module slots become STOP tokens
         (never masked, state embed zeroed), real modules carry LIVE mode; plus persistent start
-        anchors + CLS. Depth/type/pos are additive. See CONTEXT.md.
-        mask_pos (B, n_tokens) bool (JEPA): swap the pre-additive latent for the learned [MASK] at
-        masked positions BEFORE additive type/pos/depth/mode (which still disambiguate the slot)."""
-        n, d = self.n_limbs, self._d_model
-        m = self.embed_module(module_tok) * active_mask.unsqueeze(-1)   # zero inactive module state
-        cls = self.embed_root(root).unsqueeze(1)
-        start = self.angle_proj(self.angle_enc).unsqueeze(0).expand(B, -1, -1)  # (B,n,d) angle anchor
+        anchors + CLS. type + mode are CONCATENATED into content (2a); pos/depth stay additive.
+        mask_pos (B, n_tokens) bool (JEPA): swap the post-embed latent for the learned [MASK] at
+        masked positions BEFORE additive pos/depth (which still disambiguate the slot)."""
+        toh = self.type_oh                                             # (n_tokens, _N_TYPE)
+        mode_ids = torch.where(active_mask > 0, active_mask.new_full((), _MODE_LIVE),
+                               active_mask.new_full((), _MODE_STOP)).long()      # (B, n_dof)
+        mode_oh = F.one_hot(mode_ids, _N_MODE).to(module_tok.dtype)             # (B, n_dof, _N_MODE)
+        module_in = torch.cat(                                         # [physical, type_MODULE, mode]
+            [module_tok, toh[self._content_start:].expand(B, -1, -1), mode_oh], dim=-1)
+        m = self.embed_module(module_in) * active_mask.unsqueeze(-1)   # zero inactive module state
+        cls = self.embed_root(torch.cat([root, toh[0:1].expand(B, -1)], dim=-1)).unsqueeze(1)
+        start_in = torch.cat([self.angle_enc, toh[1:1 + self.n_limbs]], dim=-1)  # (n, 2+_N_TYPE)
+        start = self.angle_proj(start_in).unsqueeze(0).expand(B, -1, -1)         # (B, n, d) anchor
         x = torch.cat([cls, start, m], dim=1)                          # (B, 1+n+n_dof, d)
         if mask_pos is not None:
             x = torch.where(mask_pos.unsqueeze(-1), self.mask_token.to(x.dtype), x)
-        x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids) + self._depth_add()
-
-        mode_ids = torch.where(active_mask > 0, active_mask.new_full((), _MODE_LIVE),
-                               active_mask.new_full((), _MODE_STOP)).long()      # (B,n_dof)
-        mode = torch.cat([x.new_zeros(B, 1 + n, d), self.mode_emb(mode_ids)], dim=1)
-        return self.encoder(x + mode)                                  # all tokens real -> no padding
+        x = x + self.pos_emb(self.pos_ids) + self._depth_add()
+        return self.encoder(x)                                         # all tokens real -> no padding
 
     def codesign_forward(self, obs: torch.Tensor, return_hidden: bool = False):
         """Live pass returning ContAct mu, ContCrit V0.98, and GenCrit/V1.0 in ONE trunk encode
@@ -268,8 +255,9 @@ class LimbTransformer(nn.Module):
         """Encode a designed prefix. count (M,n) long = committed modules per limb; stopped (M,n)
         bool = limb finalized (explicit stop or reached max_len). Per module slot (n,d):
           COMMITTED if d<=count; STOP marker if d==count+1 and stopped; else PENDING (masked).
-        CLS uses the learned design content; module tokens carry no physical state (type+pos+depth
-        +mode only). Returns H (M, n_tokens, d)."""
+        CLS uses the learned design content; module tokens carry NO physical state — their content is
+        zeros(MODULE_DIM) with the type + mode one-hots concatenated (same embed_module path as live
+        mode), so type/mode enter via content while pos/depth stay additive. Returns H (M,n_tokens,d)."""
         M, n = count.shape
         d, max_len = self._d_model, self.max_limb_length
         dev = count.device
@@ -282,14 +270,18 @@ class LimbTransformer(nn.Module):
         mode_ids = mode_slot.reshape(M, self.n_module_tokens)          # depth-major slot order
         pad_mod  = pad_slot.reshape(M, self.n_module_tokens)
 
+        toh = self.type_oh
+        mode_oh = F.one_hot(mode_ids, _N_MODE).float()                 # (M, n_dof, _N_MODE)
+        phys = mode_oh.new_zeros(M, self.n_module_tokens, MODULE_DIM)  # no physical state in design
+        module_in = torch.cat([phys, toh[self._content_start:].expand(M, -1, -1), mode_oh], dim=-1)
+        m = self.embed_module(module_in)
         cls = self.cls_design.view(1, 1, -1).expand(M, 1, -1)
-        start = self.angle_proj(self.angle_enc).unsqueeze(0).expand(M, -1, -1)  # (M,n,d) angle only
-        content = cls.new_zeros(M, self.n_module_tokens, d)            # no state in design mode
-        x = torch.cat([cls, start, content], dim=1)
-        x = x + self.type_emb(self.type_ids) + self.pos_emb(self.pos_ids) + self._depth_add()
-        mode = torch.cat([x.new_zeros(M, 1 + n, d), self.mode_emb(mode_ids)], dim=1)
+        start_in = torch.cat([self.angle_enc, toh[1:1 + n]], dim=-1)
+        start = self.angle_proj(start_in).unsqueeze(0).expand(M, -1, -1)  # (M,n,d) angle anchor
+        x = torch.cat([cls, start, m], dim=1)
+        x = x + self.pos_emb(self.pos_ids) + self._depth_add()
         pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool), pad_mod], dim=1)
-        return self.encoder(x + mode, src_key_padding_mask=pad)
+        return self.encoder(x, src_key_padding_mask=pad)
 
     @torch.no_grad()
     def sample(self, N: int) -> dict[str, torch.Tensor]:
