@@ -7,8 +7,11 @@ The architecture is **robot-agnostic by design**; the ant is its current (only) 
 ## Language
 
 **Token**:
-One transformer input vector per body part. The general pattern: one **root token** for the body, plus one token per actuated module of each repeating **limb**. Ant instance: a root token, plus a proximal- and distal-**effector** token per limb (1 + 2·n_limbs total). Inactive-limb tokens are zeroed and excluded from attention. Effector token dims include limb geometry: the proximal-effector token is 6D (adds proximal length), the distal-effector token is 12D (adds distal length).
-_Avoid_: part-token (retired generic gloss)
+One transformer input vector per body part. The general pattern: one **root token** for the body, plus one **module token** per actuated module of each repeating **limb**. Codesign (Phase 1, variable-length): a root/CLS token + `n_limbs` **start tokens** + up to `max_limb_length` module tokens per limb = **41 tokens** at 8 limbs × max_len 4 (`1 + 8 + 32`). Inactive module slots become STOP tokens (state zeroed); inactive-limb tokens are excluded from attention. (Baseline ant kept the older split: a proximal-effector 6D + distal-effector 12D token per limb, `1 + 2·n_limbs` total.)
+_Avoid_: part-token (retired); proximal/distal-**effector token** (superseded by the uniform module token in codesign)
+
+**Module token**:
+The codesign content token — one per actuated module, a uniform **12-D** vector `[pos, vel, last_action, sin, cos, module_len, cfrc(6)]` (`MODULE_DIM`, `tokenize_modules`). Contact (`cfrc`) rides **only** on a limb's **terminal** module. Same schema at every within-limb depth (no proximal/distal split) — depth is carried by the separate **depth embedding**, not by the token dims. Distinct from the generator's **grow/stop decision** (below).
 
 **Root token** (ant: the central torso body):
 The single non-repeating body token. Always active, never masked, attends to all parts; its encoder output feeds the value head (CLS-style whole-body aggregator). Reused as the **CLS token** in codesign.
@@ -22,18 +25,25 @@ _Avoid_: leg, "structural unit" (retired)
 The architecture: a transformer encoder over body-part tokens, shared across morphologies because limbs are tokens rather than fixed input slots. `LimbTransformer(n_limbs)`. The 8-limb / 3-layer instance is its multi-morphology config.
 _Avoid_: leg transformer, dynamic leg transformer. The 8-limb factory is `MultiMorphLimbTransformer`; registration key `multimorph_limb_transformer`.
 
-**Token types** (reserved — Phase 5, only Effector built):
-The kind of module a token carries. **Effector** — an actuated module (today's two per limb). **Link** — a passive module (Phase 5). **Cap** — a terminal token; **stop** = a morphology-less Cap (Phase 5). **Connector** — a semantic pre-marker before each link/effector; **start** = a special Connector (Phase 5). Only Effector (and the implicit start/stop) exists before Phase 5; the rest are reserved vocabulary. See [ADR-0014](../docs/adr/0014-generalized-construction-vocabulary.md).
+**Token role** (built — the `type_emb` axis):
+A token's **structural** slot in the sequence: **root** (the CLS aggregator), **start** (a limb's persistent anchor), or **module** (an actuated-module content token). The 3-row `type_emb` (`architectures.py`). Distinct from **module type** below; Phase 5 refines the `module` role into module types.
+
+**Module type** (reserved — Phase 5, only Effector built):
+The **semantic** kind a module token carries. **Effector** — an actuated module (today every module). **Link** — a passive module (Phase 5). **Cap** — a terminal token; **stop** = a morphology-less Cap that ends a limb and adds nothing (Phase 5). **Connector** — a semantic pre-marker before each link/effector; **start** = a special Connector (Phase 5). Only Effector (+ the implicit start/stop) exists before Phase 5; the rest are reserved. See [ADR-0014](../docs/adr/0014-generalized-construction-vocabulary.md).
+_Avoid_: conflating **module type** (effector/link/cap — semantic) with **token role** (root/start/module — structural).
 
 **Limb encoding**:
 The sin/cos of a limb's physical placement angle, concatenated into that limb's effector token features. Encodes *where* the limb is on the body; zeroed for inactive limbs.
 _Avoid_: leg encoding; positional embedding (that's the separate learned scheme below)
 
-**Positional embedding**:
-A learned `nn.Embedding` added to each token by slot index (limb number; a limb's two effector tokens share an index). Distinct from limb encoding — this is a learned per-slot vector, not body geometry.
+**Positional embedding** (`pos_emb`):
+A learned `nn.Embedding` added to each token by **limb-slot** index (limb number; all of a limb's module tokens share the one slot index). A learned per-slot vector. Distinct from **limb encoding** (body geometry) and from **depth embedding** (within-limb depth).
 
-**Type embedding**:
-A learned embedding marking a token's kind — currently **root / effector** (the two built types). Reserved to extend to link / cap / connector at Phase 5.
+**Depth embedding** (`depth_emb`):
+A learned `nn.Embedding` added to each module token by its **within-limb depth** (`0..max_limb_length−1`) — *which* module along the chain. New in Phase 1; disambiguates the up-to-4 module tokens that share a limb slot. Ant instance: depth 0 = **swing** joint (hip axis), depth 1+ = **knee** (ankle axis) — *swing/knee are ant-specific*; the general concept is just depth.
+
+**Type embedding** (`type_emb`):
+A learned embedding marking a token's **role** — **root / start / module** (the 3 built rows; see *Token role*). Phase 5 refines the `module` row into module types (effector / link / cap).
 
 **Token mask**:
 The attention-level masking of inactive limbs: their token embeddings are zeroed and they're set as padding keys (`src_key_padding_mask`) so active tokens never attend to them. Distinct from the DOF mask (the raw input vector it derives from).
@@ -54,7 +64,7 @@ Generalized roles, used when control and generator live on **one network** as fo
 
 **ContAct** — control **actor**: emits per-DOF **actions** for the current body. Trained per rollout (PPO).
 **ContCrit** — control **critic**: the **V0.98** value head driving ContAct's advantages (γ=0.98). Trained per rollout.
-**GenAct** — generator **actor**: emits **limb/stop** morphology tokens (sequential, random order). Trained per **resample**.
+**GenAct** — generator **actor**: emits per-tip **grow/stop** decisions along the limb frontier (sequential, random tip order), designing each limb's **module count**. Trained per **resample**.
 **GenCrit** — generator **critic** = **the V1.0 body-quality head, merged**. One value head, evaluable on **live** full-state tokens *and* on **partial designed-token prefixes**. Yields the marginal-value advantage `V1.0(prefix+token) − V1.0(prefix)`. Trained per **resample** (needs true returns).
 
 The merge: GenCrit and the old separate V1.0 head are now **one function**, not a distill pair. It's fit on two data sources toward the same body-quality target — rollout states (per-step return-to-go) and generation-token prefixes (toward the body's realized `R`). At resample the trunk learns **only** the generator side (GenAct + GenCrit/V1.0); **both** control heads are held by a clone term — **KL[ContAct_old, ContAct]** for the actor, **MSE(ContCrit, ContCrit_old)** for the critic. Per-step, control trains as **plain combined PPO** (trunk moves freely).
@@ -89,8 +99,8 @@ _Avoid_: conflating with the control **actor** (emits per-DOF actions). Also _av
 **Generation MDP**:
 The small MDP the generator solves: **state** = the committed token prefix, **action** = the next token, **reward** = the scalar body quality `R`, γ=1. GenCrit/V1.0 regresses **every** prefix toward `R`, and a token's advantage is the marginal difference of consecutive prefix values (below). Slots are decided in random order. The generator is an actor-critic (GenAct/GenCrit) on this MDP.
 
-**Token** (generator) — **limb token** / **stop token**:
-The per-slot decision the generator emits: **limb** (the slot's limb exists) or **stop** (the slot is off). The body's **presence** is the set of limb decisions. (stop is the pre-Phase-5 seed of the reserved **Cap** type.)
+**Grow / stop decision** (generator):
+The per-step decision the generator emits at a **growable tip**: **grow** (add one module to the limb) or **stop** (end the limb). Each limb's **module count** = how many grows before a stop; **presence** is derived (present iff count > 0). The **stop token** is retained terminology — a morphology-less **Cap** that ends the limb and adds nothing (pre-Phase-5 seed of the reserved Cap type). Distinct from the control **module token** (the 12-D obs token).
 
 **Marginal-value advantage**:
 A committed token's advantage = `v(prefix+token) − v(prefix)`, the token's marginal contribution to body quality. Because order is randomized and every prefix regresses to the same `R`, it is a Shapley-style estimate; being a **difference** of body-conditioned values, it avoids the body-agnostic-baseline trap (see ADR-0012).
@@ -110,7 +120,37 @@ The deterministic body the generator is warmed up around (`[1,4,6]` — a 3-limb
 **Full token / Attribute token / Designed token** (nested views of a token):
 - **Full token** — every feature the control policy consumes: physical state (pos, vel, sensors, last action) + limb encoding + morphology lengths. What the **limb transformer** reads.
 - **Attribute token** — the morphology-defining subset only: **presence**, module **length**, limb **angle**. The body properties that *could* be designed; excludes physical state. `Attribute ⊆ Full`.
-- **Designed token** — the attributes a given codesign run actually generates and optimizes. The v1 ant designs **presence only**; module lengths and angle stay fixed (deferred), so `Designed ⊊ Attribute` for v1. The framework permits any subset. `Designed ⊆ Attribute ⊆ Full`.
+- **Designed token** — the attributes a given codesign run actually generates and optimizes. Phase 1 designs each limb's **module count** (variable length via count; presence emergent as count > 0); per-module continuous length and angle stay fixed (deferred), so `Designed ⊊ Attribute`. The framework permits any subset. `Designed ⊆ Attribute ⊆ Full`.
 
 **Presence** (p):
-A limb's existence, emitted by the generator as a per-slot **limb/stop token** decided in random order. The completed body is **built** for the resample window and its **discrete** presence is fed into obs. A **≥1-limb guard** masks the stop token on the forced last slot. (Retired: the per-limb Bernoulli-bandit and the continuous-`p` value-ascent framings.)
+A limb's existence — now a **derived** property (present iff its **module count** > 0), not a directly-emitted decision. The generator grows limbs from a frontier; a limb that stops at depth 0 is absent. A **≥1-limb guard** masks stop on the last all-empty tip. (Retired: presence as a per-slot bit; the per-limb Bernoulli-bandit and continuous-`p` value-ascent framings.)
+
+**Module count** (counts):
+The per-limb integer `0..max_limb_length` the generator designs (`from_counts`, `bodies_from_counts`); env `set_next` takes counts `(N, n_limbs)`. The Phase-1 replacement for the presence bit — **presence** derives from it (count > 0).
+
+**Frontier / growable tip**:
+The generation MDP's state = the set of still-growable limb tips. Each step picks a **random** growable tip and emits **grow/stop**; a tip drops when it stops or hits `max_limb_length`. Random tip order preserves the Shapley marginal-value credit. Fixed `n_limbs·max_limb_length` (=32) steps, no-op-masked when no tip is growable.
+
+**Canonical slot** (depth-major):
+The single token/DOF ordering `slot(n,d) = (d−1)·n_limbs + (n−1)` — depth-major over limb `n`, depth `d`. Module tokens are emitted in this order, which **is** the env action/DOF order, so the old `nat_to_dof` remap is gone. (vsim assigns DOF order per-limb depth-ascending regardless of XML order, so the scatter **queries** joint names `joint_{n}_{d}`.)
+
+**`tdims`**:
+The obs-layout descriptor `token_dims(n_limbs, max_limb_length)` carried on the net — single source of truth for obs offsets/sizes. `models.py`, `rollout.py`, and the codesign agent all read it; no hardcoded `219` offsets.
+
+## Reserved (upcoming phases)
+
+**Aux head** (Phase 2): a self-supervised prediction head on the shared control trunk, fused into the PPO loss (rl_games `get_aux_loss` hook — 0 extra trunk passes; disabled ⇒ baseline-identical). Two instances:
+- **Forward Dynamics (FD)** — *temporal*: each active module token predicts its **own next-timestep parent-relative state** (rel-pos+rot+vel+cfrc, 21) from its post-trunk hidden + its **own** sampled action. Normalized-space MSE.
+- **Forward Kinematics (FK)** — *spatial, same-timestep*: each active module token predicts its **own pose fully in the torso's frame** (pos + rot6D + vel, 15). Pos/rot are the torso-relative composition; vel is the torso-riding-observer velocity `R_root⁻¹(v−v_root−ω_root×(p−p_root))`. All are exact **pure limb-chain compositions** of the parent-relative obs (root terms cancel / are implicit in the chain, so CLS is inert). Verified against sim to ~1e-8. Target composed agent-side from the obs, per-depth normalized.
+
+(A JEPA / masked-latent aux is committed but being reframed toward FD/FK — see the stale-marked `temp/Phase2_JEPA_plan.md`; its `[MASK]`/predictor/repr-anchor terms are deliberately **not** glossary vocabulary until Phase 2 settles.)
+
+**6D rotation** (Phase 2): obs rotation representation, quaternion → 6D.
+
+**Action token** (Phase 4): a per-token action emitted **sequentially** (one level at a time) so a token conditions on the actions chosen below it.
+
+**Constrained decoder** (Phase 5a): a token-type transition matrix — previous type → valid/invalid next tokens — masking the generator's illegal options.
+
+**Starting-position head** (Phase 7b): a generator head predicting a valid, good start pose (per-effector start value + CLS start-offset).
+
+**Elite morphologies** (Phase 8b): saved high-quality bodies retained (e.g. reserved envs) to promote population diversity.

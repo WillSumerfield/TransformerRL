@@ -1,6 +1,6 @@
 # Context Map
 
-Research repo for **codesign**: jointly optimizing a robot's *morphology* (currently an ant) and a transformer *control* policy. The transformer must generalize across morphologies so the controller keeps working as the body changes during codesign. Attention is the intended future bridge between the control policy and a (planned) generative morphology policy.
+Research repo for **codesign**: jointly optimizing a robot's *morphology* (currently an ant) and a transformer *control* policy. The transformer must generalize across morphologies so the controller keeps working as the body changes during codesign. Attention is the bridge between the control policy and the generative morphology policy — both now realized as a single shared-trunk codesign network.
 
 ## Structure
 
@@ -26,7 +26,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ├── transformer_rl/                   ← Control context
 │   ├── CONTEXT.md
 │   ├── architectures.py              (LimbTransformer, MultiMorphLimbTransformer)
-│   ├── tokenize.py                   (obs → root/effector tokens)
+│   ├── tokenize.py                   (obs → root/module tokens; codesign uniform module tokens)
 │   ├── models.py                     (rl_games model/network builders)
 │   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
@@ -49,13 +49,13 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ## Contexts
 
 - [Morphology](./envs/CONTEXT.md) — the ant body design space: vsim physics builds, the morphology set, active/inactive DOFs, the DOF mask
-- [Control](./transformer_rl/CONTEXT.md) — the transformer policy that controls any morphology: tokenization, leg encoding, token masking, rl_games integration
+- [Control](./transformer_rl/CONTEXT.md) — the transformer policy that controls any morphology: tokenization, limb encoding, token masking, rl_games integration
 - [Training](./scripts/CONTEXT.md) — PPO training, Optuna tuning, play/render orchestration
 - [Analysis](./experiments/CONTEXT.md) — attention studies over trained policies
 
 ## Relationships
 
-- **Morphology → Control**: Morphology emits a 139-D observation (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask); Control tokenizes it and reads the DOF mask to decide which limb tokens exist.
+- **Morphology → Control**: Morphology emits the observation — **139-D baseline** (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask) or **219-D codesign** (variable-length `module_lengths` + 32 DOF mask, layout from `tdims`); Control tokenizes it and reads the DOF mask to decide which limb/module tokens exist.
 - **Control → Training**: Control registers networks/models with rl_games under names Training selects via config `model.name` / `network.name`.
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
 - **Shared kernel** (below): Robot, Morphology, Limb, Module, Root, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign, Task — defined once here, used identically across all contexts.
@@ -81,35 +81,35 @@ Our local [`docs/vsim_geometry_api.md`](./docs/vsim_geometry_api.md) covers the 
 The generic body being built and controlled — a **root** plus repeating **limbs**. "Robot" is the primary word in code and docs; **"ant" is reserved for env identity only** (the `Ant*` classes, env keys, `.vsim` assets, `ppo_ant*.yaml` configs, `train_ant_*.py` scripts). The ant is the current (only) robot instance. See [ADR-0014](docs/adr/0014-generalized-construction-vocabulary.md).
 
 **Codesign**:
-Jointly optimizing the robot's morphology and its transformer controller in one loop. The repo's end goal — **not yet implemented**; a generative morphology policy is planned to pair with the control policy. Reserve this word for that future loop; the present envs only *train a controller to generalize across* a fixed morphology set, which is the prerequisite.
-_Avoid_: using "codesign" for the multi-morphology env `AntMultiMorphEnv` (it does no codesign; see Morphology context)
+Jointly optimizing the robot's morphology and its transformer controller in one loop. **Implemented** as a single shared-trunk network — a **GenAct/GenCrit** morphology generator + **ContAct/ContCrit** controller — in `AntCodesignEnv`: the generator emits a body per resample window, the controller earns the reward that trains both. See the Control glossary's *Codesign heads / tokens*.
+_Avoid_: using "codesign" for the multi-morphology env `AntMultiMorphEnv` (it does no codesign — it trains a controller across a *fixed* morphology set; see Morphology context)
 
 **Morphology** (morph):
 A specific robot body — which limbs exist, where, and (full ant) each limb's module lengths (today two modules per limb: the ant's hip- and ankle-segment lengths). Either drawn from a fixed enumerated set (classic ant) or sampled with continuous lengths (full ant); each maps to one vsim build / EnvironmentGroup. The full ant **resamples** its set mid-training, one full sim rebuild per draw (see the Morphology glossary and [ADR-0005](docs/adr/0005-runtime-morphology-resampling-via-gym-rebuild.md)). "Morph" is an accepted shorthand.
 
 **Limb** (was leg):
-One repeating appendage — a chain of **modules** attached to the root. Up to 8 limbs, placed at multiples of 45° around the ant's root. Today each limb has exactly 2 actuated modules (**effectors**) → 2 DOFs. Adding/removing a limb adds/removes tokens (the source of the architecture's count-invariance).
+One repeating appendage — a chain of **modules** attached to the root. Up to 8 limbs, placed at multiples of 45° around the ant's root. The **codesign** env spans **1–4 modules per limb** (variable-length; ADR-0014 collapse); the classic/multimorph ant stays at exactly 2 actuated modules (**effectors**) → 2 DOFs. Adding/removing a limb — or a module — adds/removes tokens (the source of the architecture's count-invariance).
 _Avoid_: leg (retired), "structural unit"/"part-token" (retired generic glosses)
 
 **Module**:
-The physical body-part a generator **token** realizes: an actuated segment (**effector**), a passive segment (**link**), or a terminal (**cap**). The unit the generator minimizes (Phase 3). Detailed token-type vocabulary lives in [Control](./transformer_rl/CONTEXT.md).
-_Avoid_: segment (retired for module)
+The physical body-part a generator **token** realizes; one actuated module = one token = one DOF. Its **module type** (semantic kind) is an actuated **effector**, a passive **link**, or a terminal **cap** — only effector is built (types = Phase 5). The unit the generator minimizes (**Phase 8a, Limb Costs**). Module-token layout + the *token-role* vs *module-type* axes live in [Control](./transformer_rl/CONTEXT.md).
+_Avoid_: segment (retired for module); conflating **module type** (effector/link/cap — semantic) with **token role** (root/start/module — structural; see Control)
 
 **Root** (was torso):
 The single non-repeating body token = the **CLS** aggregator; its encoder output feeds the value heads. The ant's root is its central torso body (the sole surviving use of "torso": a physical-build name).
 
 **DOF**:
-One actuated joint. 2 per limb today (the ant's two effectors), 16 max. The unit of action and of the DOF mask.
+One actuated joint = one actuated module. Classic/multimorph ant: 2 per limb, 16 max. **Codesign: up to 4 per limb, 32 max** (variable-length limbs). The unit of action and of the DOF mask.
 _Avoid_: joint (informal only)
 
 **Active / Inactive**:
-A limb or DOF is *active* if it exists in the current morphology, *inactive* if it's a padded-out slot (always padded to 8 limbs / 16 DOFs). Inactive actions are zeroed; inactive DOF values are 0.
+A limb or DOF is *active* if it exists in the current morphology, *inactive* if it's a padded-out slot (padded to 8 limbs / **16 DOFs baseline, 32 DOFs codesign**). Inactive actions are zeroed; inactive DOF values are 0.
 
 **Stable morphology**:
 A morphology that is dynamically viable as a walker: ≥3 limbs and no circular gap between adjacent limbs > 135°.
 
 **DOF mask**:
-The 16-bit `{0,1}` vector (obs `[123:139]`) marking which DOFs are active. Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.
+The `{0,1}` vector marking which DOFs are active — **16-bit at obs `[123:139]` (baseline); 32-bit in codesign** (all obs offsets derive from the net's `tdims`, not hardcoded). Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.
 _Avoid_: limb_mask (old code identifier; per-DOF not per-limb), bare "mask"
 
 **EnvironmentGroup** (group):
