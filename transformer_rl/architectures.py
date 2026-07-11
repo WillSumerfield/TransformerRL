@@ -15,7 +15,23 @@ _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 _T_ROOT, _T_START, _T_MODULE = 0, 1, 2            # uniform module token (Phase 1) — no eff0/eff1 split
 _MODE_LIVE, _MODE_COMMITTED, _MODE_STOP = 0, 1, 2
 _N_TYPE, _N_MODE = 3, 3     # type / mode vocab sizes — one-hot CONCATENATED into token content (2a)
+_FD_MODULE_DIM = 21         # FD raw module target: relpos(3)+relrot6d(6)+relvel(6)+cfrc(6) (2b)
+_FK_MODULE_DIM = 15         # FK torso-frame target: pos(3)+rot6d(6)+vel(6, lin+ang) (2b)
 _GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action ids {continue, stop}
+
+
+def _sixd_to_R(x6: torch.Tensor) -> torch.Tensor:
+    """6D rotation (..., 6) = two columns -> orthonormal R (..., 3, 3) via Gram-Schmidt (Zhou 2019)."""
+    a1, a2 = x6[..., 0:3], x6[..., 3:6]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = F.normalize(a2 - (b1 * a2).sum(-1, keepdim=True) * b1, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack([b1, b2, b3], dim=-1)                       # columns
+
+
+def _R_to_sixd(R: torch.Tensor) -> torch.Tensor:
+    """R (..., 3, 3) -> 6D = first two columns concatenated (matches 2a rel-rot layout)."""
+    return torch.cat([R[..., :, 0], R[..., :, 1]], dim=-1)
 
 
 def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
@@ -135,6 +151,36 @@ class LimbTransformer(nn.Module):
                 nn.Linear(d_model, d_model), nn.LayerNorm(d_model),
                 nn.GELU(), nn.Linear(d_model, d_model),
             )
+            # Forward Dynamics (2b, raw variant): per-ACTIVE-MODULE next-step prediction from post-trunk
+            # H[t] + OWN sampled action (1 dim, concat at head). No distal/CLS aggregation — module
+            # targets are parent-relative so own joint action is the first-order driver (grill 2026-07-09;
+            # CLS/root DROPPED, world-absolute target would need whole-body action). -> next parent-
+            # relative relpos(3)+relrot(6)+relvel(6)+cfrc(6)=21. Inert unless fd_loss_raw is called.
+            self.fd_module_head = nn.Sequential(
+                nn.Linear(d_model + 1, d_model), nn.GELU(), nn.Linear(d_model, _FD_MODULE_DIM))
+            self._fd_armed = False           # agent arms this per PPO minibatch (fused aux loss)
+            # _enabled: fixed per-run compile-time gate (agent sets from config before torch.compile);
+            # forward runs the head iff enabled, so a feature-off run never compiles it in (baseline-
+            # identical). _armed is the per-minibatch runtime toggle -> only touches get_aux_loss.
+            self._fd_enabled = self._fk_enabled = False
+            self._fd_pred = self._fd_active = None
+            # Forward Kinematics (2b, same-timestep): each active module token predicts its OWN pose
+            # FULLY in the torso frame (pos(3)+rot6D(6)+vel(6)=15) from post-trunk H[t] alone (no action,
+            # no mask — self-prediction leaks nothing so full-attention H is fine; grill 2026-07-10).
+            # Target = pure limb-chain composition of rel-pos/rel-rot/rel-vel (root terms cancel), built
+            # agent-side from RAW obs, per-DEPTH normalized. Inert unless fk_arm'd.
+            self.fk_module_head = nn.Sequential(
+                nn.Linear(d_model, d_model), nn.GELU(), nn.Linear(d_model, _FK_MODULE_DIM))
+            self._fk_armed = False
+            self._fk_pred = None
+            self._fk_tgt = self._fk_active = None
+            self.register_buffer('fk_mean', torch.zeros(max_limb_length, _FK_MODULE_DIM))
+            self.register_buffer('fk_var', torch.ones(max_limb_length, _FK_MODULE_DIM))
+            self.register_buffer('fk_count', torch.full((max_limb_length,), 1e-4))
+            # Compile the aux loss math (head-forward already rides forward's compile). default mode
+            # fuses the launch-bound elementwise+reduction kernels; dynamic=False -> one static graph.
+            self._fd_loss_c = torch.compile(self._fd_loss_impl, dynamic=False)
+            self._fk_loss_c = torch.compile(self._fk_loss_impl, dynamic=False)
         self._xavier_init()
 
     def _xavier_init(self) -> None:
@@ -249,6 +295,127 @@ class LimbTransformer(nn.Module):
         tgt = H_full[mask_pos]                                         # already no-grad
         loss = (2 - 2 * (F.normalize(pred, dim=-1) * F.normalize(tgt, dim=-1)).sum(-1)).mean()
         return loss
+
+    # ---- Forward Dynamics (2b): per-active-module next-step prediction (raw variant) -------------
+    def fd_predict(self, H, actions):
+        """module_pred (B, n_dof, 21) from post-trunk H[t] + OWN sampled action. `actions` (B, n_dof)
+        align 1:1 with the module tokens H[:, content_start:] (both depth-major slot order; mu is one
+        tanh action per module token, architectures.py:222). Own action only — no aggregation."""
+        mod_in = torch.cat([H[:, self._content_start:, :], actions.unsqueeze(-1)], dim=-1)
+        return self.fd_module_head(mod_in)
+
+    def _fd_loss_impl(self, mod_pred, next_obs, active_mask, valid):
+        """Raw FD MSE in NORMALIZED space over ACTIVE modules. mod_pred (B, n_dof, 21) = the head output
+        computed in forward (fused PPO pass, over obs[t]'s H + own action). next_obs = model-normalized
+        obs[t+1]. Target order = relpos(3)+relrot(6)+relvel(6)+cfrc(6). geom (15) supervised on active
+        modules; cfrc (6) on TERMINAL modules only. Masks + terminal computed from obs[t] active_mask
+        (morphology constant within episode; next_obs's normalized mask tail is unusable). valid (B,)
+        masks last-horizon-step + `done`. torch.compiled -> fuses the target-derivation + masked MSE."""
+        B, n, D = next_obs.shape[0], self.n_limbs, self.max_limb_length
+        # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
+        _, mod_t, _ = tokenize_modules(next_obs, n, D)
+        geom_tgt = mod_t[..., 10:25]                                    # relpos3+relrot6+relvel6 (15)
+        # cfrc target: per-limb sensor block of next_obs, broadcast to each depth slot of that limb
+        so = token_dims(n, D)["sens_off"]
+        cfrc_tgt = (next_obs[:, so:so + n * 6].view(B, 1, n, 6)
+                    .expand(B, D, n, 6).reshape(B, D * n, 6))           # (B, n_dof, 6)
+        # terminal mask from obs[t] active_mask (depth-major slot -> (B, D, n))
+        m = active_mask.view(B, D, n)
+        depth0 = torch.arange(D, device=next_obs.device).view(1, D, 1)
+        term = ((m > 0) & (depth0 == m.sum(1, keepdim=True) - 1)).reshape(B, D * n).float()
+        v = valid.float().unsqueeze(-1)
+        geom_mm, cfrc_mm = active_mask * v, term * v                    # (B, n_dof) each
+        geom_mse = (((mod_pred[..., :15] - geom_tgt) ** 2).mean(-1) * geom_mm).sum() / geom_mm.sum().clamp(min=1)
+        cfrc_mse = (((mod_pred[..., 15:] - cfrc_tgt) ** 2).mean(-1) * cfrc_mm).sum() / cfrc_mm.sum().clamp(min=1)
+        return geom_mse + cfrc_mse
+
+    def fd_arm(self, next_obs, valid, coef):
+        """Agent arms the loss targets right before the PPO forward (the head reads its own action from
+        forward's prev_actions, so no action plumbing here); get_aux_loss() consumes it after."""
+        self._fd_armed, self._fd_coef = True, coef
+        self._fd_next_obs, self._fd_valid = next_obs, valid
+
+    def fd_disarm(self):
+        self._fd_armed = False
+        self._fd_pred = self._fd_active = None
+        self._fd_next_obs = self._fd_valid = None
+
+    # ---- Forward Kinematics (2b): per-active-module OWN torso-frame pose (same-timestep) ---------
+    def fk_compose_target(self, obs):
+        """(B, n_dof, 15) torso-frame FK target + (B, n_dof) active_mask, composed from RAW obs
+        geometry. Pure limb-chain composition (NO root term -> CLS inert): with P_d = prod of the
+        chain's rel-rots up to depth d, pos_d = pos_{d-1} + P_{d-1}@relpos_d, vel likewise, rot_d =
+        P_d (as 6D). Depth-major slot order == module tokens. Grill 2026-07-10."""
+        _, mod, active = self._tokenize_modules(obs)                    # mod (B, n_dof, 25)
+        B, n, D = obs.shape[0], self.n_limbs, self.max_limb_length
+        md = mod.view(B, D, n, MODULE_DIM)                             # depth-major -> (B, D, n, 25)
+        P = torch.eye(3, device=obs.device, dtype=mod.dtype).expand(B, n, 3, 3).contiguous()
+        pos = mod.new_zeros(B, n, 3); vlin = mod.new_zeros(B, n, 3); vang = mod.new_zeros(B, n, 3)
+        out = mod.new_zeros(B, D, n, _FK_MODULE_DIM)
+        for d in range(D):
+            rp, r6 = md[:, d, :, 10:13], md[:, d, :, 13:19]
+            rvl, rva = md[:, d, :, 19:22], md[:, d, :, 22:25]
+            dpos = torch.einsum('bnij,bnj->bni', P, rp)               # P = P_{d-1}: torso-frame step
+            # env rel_lin carries -w_p x dp (rotating parent frame, ant_multimorph.py:607); add it back
+            # so vlin telescopes to the clean world-velocity R_root^-1(v_d - v_root) (still pure chain:
+            # uses composed vang_{d-1} + dpos, no root token). vang/pos are plain difference chains.
+            vlin = vlin + torch.einsum('bnij,bnj->bni', P, rvl) + torch.cross(vang, dpos, dim=-1)
+            pos = pos + dpos
+            vang = vang + torch.einsum('bnij,bnj->bni', P, rva)
+            P = P @ _sixd_to_R(r6)                                     # now P_d
+            out[:, d] = torch.cat([pos, _R_to_sixd(P), vlin, vang], dim=-1)
+        return out.reshape(B, D * n, _FK_MODULE_DIM), active
+
+    def fk_update_stats(self, tgt, active):
+        """Per-DEPTH parallel (Welford) update of the FK target normalizer over ACTIVE modules only.
+        Called once per rollout window (agent prepare_dataset); NOT touched in the loss."""
+        M, _, Fd = tgt.shape
+        D, n = self.max_limb_length, self.n_limbs
+        t, a = tgt.view(M, D, n, Fd), active.view(M, D, n)
+        for d in range(D):
+            x = t[:, d].reshape(-1, Fd)[a[:, d].reshape(-1) > 0]       # (k, 15) active at depth d
+            k = x.shape[0]
+            if k == 0:
+                continue
+            bm, bv = x.mean(0), x.var(0, unbiased=False)
+            c = self.fk_count[d]; nk = c + k; delta = bm - self.fk_mean[d]
+            self.fk_mean[d] = self.fk_mean[d] + delta * (k / nk)
+            self.fk_var[d] = (self.fk_var[d] * c + bv * k + delta ** 2 * (c * k / nk)) / nk
+            self.fk_count[d] = nk
+
+    def fk_normalize(self, tgt):
+        """(M, n_dof, 15) raw target -> per-depth standardized (eval-only; reads buffers, no update)."""
+        M = tgt.shape[0]
+        t = tgt.view(M, self.max_limb_length, self.n_limbs, -1)
+        t = (t - self.fk_mean[None, :, None, :]) / torch.sqrt(self.fk_var[None, :, None, :] + 1e-5)
+        return t.reshape(M, -1, tgt.shape[-1])
+
+    def fk_arm(self, tgt, active, coef):
+        self._fk_armed, self._fk_coef = True, coef
+        self._fk_tgt, self._fk_active = tgt, active
+
+    def fk_disarm(self):
+        self._fk_armed = False
+        self._fk_pred = None
+        self._fk_tgt = self._fk_active = None
+
+    def _fk_loss_impl(self, pred, tgt, active):
+        """Masked FK MSE over active modules. pred (B, n_dof, 15) = head output from forward. torch.
+        compiled -> fuses the elementwise diff + masked reduction."""
+        return (((pred - tgt) ** 2).mean(-1) * active).sum() / active.sum().clamp(min=1)
+
+    def get_aux_loss(self):
+        """rl_games hook (a2c_continuous.py:194): each term summed into the single PPO loss, inside
+        autocast. Eager dispatcher -- reads the head preds stashed by forward + armed targets, calls
+        the compiled loss fns. No head armed -> None -> bit-identical to the phase-1 baseline."""
+        aux = {}
+        if getattr(self, '_fd_armed', False):
+            l = self._fd_loss_c(self._fd_pred, self._fd_next_obs, self._fd_active, self._fd_valid)
+            self._fd_last = l.detach().float(); aux['fd'] = self._fd_coef * l
+        if getattr(self, '_fk_armed', False):
+            l = self._fk_loss_c(self._fk_pred, self._fk_tgt, self._fk_active)
+            self._fk_last = l.detach().float(); aux['fk'] = self._fk_coef * l
+        return aux or None
 
     # ---- design mode: morphology-only generation pass (no physical state) ------------------------
     def _encode_design(self, count, stopped):
@@ -379,12 +546,19 @@ class LimbTransformer(nn.Module):
         return logits, v, active_hist
 
     def forward(self, obs: torch.Tensor, compute_value: bool = True,
-                detach_value: bool = False) -> dict[str, torch.Tensor]:
+                detach_value: bool = False, actions: torch.Tensor = None) -> dict[str, torch.Tensor]:
         B = obs.shape[0]
         out: dict[str, torch.Tensor] = {}
         if self.codesign_tokens:
             root, module_tok, active_mask = self._tokenize_modules(obs)
             x = self._encode_codesign(root, module_tok, active_mask, B)
+            # Fused FD/FK aux (2b): run the heads here so they ride this pass's H[t] + the forward
+            # compile (0 extra trunk passes). Fixed _enabled gate -> off-run never compiles them in.
+            # FD also needs the own action (from prev_actions); absent in rollout -> skipped there.
+            if self._fk_enabled and self.training:
+                self._fk_pred = self.fk_module_head(x[:, self._content_start:, :])
+            if self._fd_enabled and actions is not None:
+                self._fd_pred, self._fd_active = self.fd_predict(x, actions), active_mask
             if self.has_policy_head:
                 modules = x[:, self._content_start:, :]
                 out['mu'] = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask

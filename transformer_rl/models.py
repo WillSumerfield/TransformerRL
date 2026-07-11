@@ -87,7 +87,8 @@ class MultiMorphLimbTransformerBuilder(NetworkBuilder):
         def forward(self, obs_dict):
             obs = obs_dict['obs']
             out = self.net(obs, compute_value=obs_dict.get('compute_value', True),
-                           detach_value=obs_dict.get('detach_value', False))
+                           detach_value=obs_dict.get('detach_value', False),
+                           actions=obs_dict.get('prev_actions'))   # FD head sources its own action here
             mu, value = out['mu'], out.get('value')  # value None when aux head skipped
             if obs.shape[-1] >= self._mask_off + self._mask_dim:
                 mask_dof = (obs[..., self._mask_off : self._mask_off + self._mask_dim] > 0).float()
@@ -100,6 +101,9 @@ class MultiMorphLimbTransformerBuilder(NetworkBuilder):
             else:
                 log_std = self.log_std_param.expand(obs.shape[0], -1)
             return mu, log_std, value, None
+
+        def get_aux_loss(self):
+            return self.net.get_aux_loss()      # fused FD aux (2b); None when disarmed
 
         def is_rnn(self):
             return False

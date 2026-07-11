@@ -21,6 +21,9 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 
+from rl_games.algos_torch import torch_ext
+from rl_games.common.a2c_common import swap_and_flatten01
+
 from .architectures import _GEN_ON, _GEN_STOP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 
@@ -99,6 +102,27 @@ class CodesignAgent(LoggingA2CAgent):
         self._jepa_anchor_states = int(jc.get('anchor_snapshot_states', 16384))  # <=0 or >=HN -> full
         self._jepa_losses = []
 
+        # Forward Dynamics aux (Phase 2b): per-active-module next-step prediction, FUSED into the PPO
+        # step (0 extra trunk passes; reuses H[t]). Disabled -> behaviour == phase-1 baseline (A/B).
+        # M1 (here): rollout plumbing only -- next_obs + valid injected into the shuffled dataset.
+        fc = self.config.get('fd', {})
+        self._fd_enabled = bool(fc.get('enabled', False))
+        self._fd_coef = float(fc.get('coef', 1.0))
+        self._fd_losses = []
+
+        # Forward Kinematics aux (Phase 2b): each active module token predicts its OWN torso-frame
+        # pose (pos+rot6D+vel, 15), same-timestep, FUSED into the PPO step (0 extra passes). Target
+        # composed agent-side from RAW obs (no rollout injection -- 'obs' is already in the dataset);
+        # per-depth normalizer updated once/window in prepare_dataset. Disabled -> baseline.
+        kc = self.config.get('fk', {})
+        self._fk_enabled = bool(kc.get('enabled', False))
+        self._fk_coef = float(kc.get('coef', 1.0))
+        self._fk_losses = []
+
+        # Fixed compile-time gate on the net (set before torch_runner compiles the model): the aux
+        # heads run in forward iff enabled, so an off-run never traces them in (baseline-identical).
+        net._fd_enabled, net._fk_enabled = self._fd_enabled, self._fk_enabled
+
         # R_i accumulator: true completed-episode return per env over the window (gamma=1).
         self._ep_ret = torch.zeros(N, device=dev)
         self._win_ret_sum = torch.zeros(N, device=dev)
@@ -110,9 +134,122 @@ class CodesignAgent(LoggingA2CAgent):
     def _net(self):
         return self.model.a2c_network.net
 
+    def prepare_dataset(self, batch_dict):
+        # Build the shuffled minibatch dataset as usual, then (FD only) inject the per-sample
+        # next_obs + valid so calc_gradients can supervise the (obs[t] -> obs[t+1]) transition.
+        super().prepare_dataset(batch_dict)
+        if self._fk_enabled:
+            # FK target: compose ONCE/window over the whole rollout (raw obs), update per-depth
+            # stats, normalize, and inject into the dataset (FD pattern) so calc_gradients just
+            # reads it per-minibatch instead of recomposing ~5x/window (was fk_compose ~61ms/epoch).
+            # Stored target is already normalized (eval space); fk_loss reads it directly.
+            with self._prof('prep_fk'):
+                net = self._net()
+                obses = self.experience_buffer.tensor_dict['obses']     # (H, N, obs)
+                H, N = obses.shape[0], obses.shape[1]
+                with torch.no_grad():
+                    tgt, act = net.fk_compose_target(obses.reshape(-1, obses.shape[-1]))
+                    net.fk_update_stats(tgt, act)
+                    tgt = net.fk_normalize(tgt)                          # normalize w/ updated stats
+                vd = self.dataset.values_dict
+                vd['fk_target'] = swap_and_flatten01(tgt.view(H, N, *tgt.shape[1:]))
+                vd['fk_active'] = swap_and_flatten01(act.view(H, N, *act.shape[1:]))
+        if not self._fd_enabled:
+            return
+        with self._prof('prep_fd'):
+            obses = self.experience_buffer.tensor_dict['obses']          # (H, N, obs), raw
+            dones = self.experience_buffer.tensor_dict['dones']          # (H, N[,1]) bool/byte
+            if dones.dim() > 2:
+                dones = dones.squeeze(-1)
+            next_obs = torch.empty_like(obses)
+            next_obs[:-1] = obses[1:]
+            next_obs[-1] = obses[-1]                                 # last horizon step: dummy (valid=0)
+            valid = torch.zeros(dones.shape, dtype=torch.bool, device=obses.device)   # (H, N)
+            valid[:-1] = dones[1:] == 0        # transition t valid iff obs[t+1] is NOT a reset-initial obs
+            vd = self.dataset.values_dict
+            vd['fd_next_obs'] = swap_and_flatten01(next_obs)        # (H*N, obs), shuffled with the rest
+            vd['fd_valid'] = swap_and_flatten01(valid)              # (H*N,)
+
+    def _calc_gradients_prof(self, input_dict):
+        """Region-instrumented copy of rl_games A2CAgent.calc_gradients: identical math, with
+        self._prof around forward / losses / getaux / backward / opt. Assumes our config
+        (non-RNN, single-GPU). Used only under timing/mem_profile; stock path otherwise."""
+        assert not self.is_rnn and not self.multi_gpu, "prof path assumes non-RNN single-GPU"
+        old_logp = input_dict['old_logp_actions']
+        advantage = input_dict['advantages']
+        old_mu, old_sigma = input_dict['mu'], input_dict['sigma']
+        old_values, returns = input_dict['old_values'], input_dict['returns']
+        actions = input_dict['actions']
+        obs = self._preproc_obs(input_dict['obs'])
+        curr_e_clip = self.e_clip
+        batch_dict = {'is_train': True, 'prev_actions': actions, 'obs': obs}
+
+        with torch.amp.autocast('cuda', enabled=self.mixed_precision, dtype=torch.bfloat16):
+            with self._prof('forward'):
+                res = self.model(batch_dict)
+            with self._prof('losses'):
+                loss, a_loss, c_loss, entropy, b_loss, _ = self.calc_losses(
+                    self.actor_loss_func, old_logp, res['prev_neglogp'], advantage, curr_e_clip,
+                    old_values, res['values'], returns, res['mus'], res['entropy'], None)
+            with self._prof('getaux'):
+                aux_loss = self.model.get_aux_loss()
+                self.aux_loss_dict = {}
+                if aux_loss is not None:
+                    for k, v in aux_loss.items():
+                        loss = loss + v
+                        self.aux_loss_dict[k] = [v.detach()]
+            for param in self.model.parameters():
+                param.grad = None
+        with self._prof('backward'):
+            self.scaler.scale(loss).backward()
+        with self._prof('opt'):
+            self.trancate_gradients_and_step()
+
+        with torch.no_grad():
+            kl_dist = torch_ext.policy_kl(res['mus'].detach(), res['sigmas'].detach(),
+                                          old_mu, old_sigma, True)
+        self.diagnostics.mini_batch(self, {
+            'values': old_values, 'returns': returns, 'new_neglogp': res['prev_neglogp'],
+            'old_neglogp': old_logp, 'masks': None}, curr_e_clip, 0)
+        self.train_result = (a_loss, c_loss, entropy, kl_dist, self.last_lr, 1.0,
+                             res['mus'].detach(), res['sigmas'].detach(), b_loss)
+        self._log_action_sat()
+
     def calc_gradients(self, input_dict):
-        # PPO control step (+ saturation logging) first, untouched -> control stays clean.
-        super().calc_gradients(input_dict)
+        # FD (2b): arm the loss targets; the head runs in the PPO forward (rides its compile) and
+        # rl_games' get_aux_loss() hook (a2c_continuous.py:194) adds fd_coef*fd_loss into the SAME
+        # loss/backward -> 0 extra trunk passes. Disabled -> get_aux_loss() None -> baseline-identical.
+        net = self._net()
+        if self._fd_enabled:
+            with self._prof('fd_target'):
+                rms = getattr(self.model, 'running_mean_std', None)   # don't let target update stats
+                was_train = rms.training if rms is not None else False
+                if rms is not None:
+                    rms.eval()
+                with torch.no_grad():
+                    next_obs = self.model.norm_obs(input_dict['fd_next_obs'])
+                if rms is not None:
+                    rms.train(was_train)
+                net.fd_arm(next_obs, input_dict['fd_valid'], self._fd_coef)
+        if self._fk_enabled:
+            # FK target precomputed + normalized once/window (prepare_dataset), injected into the
+            # dataset; just read + arm here (no per-minibatch recompose).
+            with self._prof('fk_arm'):
+                net.fk_arm(input_dict['fk_target'], input_dict['fk_active'], self._fk_coef)
+
+        # PPO control step (+ saturation logging), untouched -> control stays clean. Profiling
+        # runs take an instrumented copy that times/mem-probes forward/losses/getaux/backward/opt.
+        if self._timing or self._mem_profile:
+            self._calc_gradients_prof(input_dict)
+        else:
+            super().calc_gradients(input_dict)
+
+        if self._fd_enabled:
+            self._fd_losses.append(net._fd_last)
+            net.fd_disarm()
+        if self._fk_enabled:
+            self._fk_losses.append(net._fk_last)
+            net.fk_disarm()
         if not self._jepa_enabled:
             return
         # Separate JEPA forward+backward+step on the SAME rollout obs (own step; PPO already stepped).
@@ -454,6 +591,12 @@ class CodesignAgent(LoggingA2CAgent):
         if self._jepa_losses:
             w.add_scalar('losses/jepa', torch.stack(self._jepa_losses).mean().item(), frame)
             self._jepa_losses = []
+        if self._fd_losses:
+            w.add_scalar('losses/fd', torch.stack(self._fd_losses).mean().item(), frame)
+            self._fd_losses = []
+        if self._fk_losses:
+            w.add_scalar('losses/fk', torch.stack(self._fk_losses).mean().item(), frame)
+            self._fk_losses = []
         if self._gen_log is None:
             return
         g = self._gen_log
