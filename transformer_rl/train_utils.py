@@ -929,6 +929,10 @@ def run_training(
     parser.add_argument("--video", action="store_true")
     parser.add_argument("--timing", action="store_true", default=False,
                         help="Enable synced cuda phase timers (perf/*); adds cuda.synchronize overhead.")
+    parser.add_argument("--mem_profile", action="store_true", default=False,
+                        help="Enable per-node memory profiling (perf/mem_*); adds syncs + reset_peak.")
+    parser.add_argument("--minibatch_size", type=int, default=None,
+                        help="Override params.config.minibatch_size (e.g. 16384 to fit aux heads).")
     parser.add_argument("--train-pct", type=float, default=None, dest="train_pct",
                         help="Fraction of morphologies for training (rest = test set).")
     parser.add_argument("--test-set", action="store_true", default=None, dest="test_set",
@@ -1031,6 +1035,10 @@ def run_training(
     # --- CLI overrides ---
     if args.timing:
         config["params"]["config"]["timing"] = True
+    if args.mem_profile:
+        config["params"]["config"]["mem_profile"] = True
+    if args.minibatch_size is not None:
+        config["params"]["config"]["minibatch_size"] = args.minibatch_size
     if args.num_envs is not None:
         config["params"]["config"]["num_actors"] = args.num_envs
     elif mode == "play":

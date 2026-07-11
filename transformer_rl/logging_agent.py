@@ -11,6 +11,7 @@ which gives diagnostics/exp_var, diagnostics/clip_frac/*, diagnostics/rms_value/
 Registered globally over 'a2c_continuous' in train_utils, so every continuous PPO
 run (transformer or MLP) gets these. Metrics are generic; nothing transformer-specific.
 """
+import contextlib
 import time
 
 import torch
@@ -46,6 +47,14 @@ class LoggingA2CAgent(A2CAgent):
         self._timing = self.config.get('timing', False)
         self._timings = {}
         self._tics = {}
+        # opt-in per-node memory profiling (config.mem_profile); own flag, own syncs -> kept
+        # independent of timing so fps and peak are each measured without the other's perturbation.
+        # Records, per _prof region: persist Delta (memory held past the region) + peak Delta
+        # (transient spike). reset_peak per region clobbers the global peak stat, so track the
+        # epoch peak ourselves (self._peak_running, absolute bytes) for perf/peak_mem_mib.
+        self._mem_profile = self.config.get('mem_profile', False)
+        self._mems = {}         # key -> [persist_sum_bytes, count, peakdelta_max_bytes]
+        self._peak_running = 0
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()   # perf/peak_mem_mib measured from train start
 
@@ -60,6 +69,38 @@ class LoggingA2CAgent(A2CAgent):
         if self._timing:
             torch.cuda.synchronize()
             self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - self._tics[key])
+
+    @contextlib.contextmanager
+    def _prof(self, key):
+        """Region profiler: accumulates synced time (perf/t_<key>) and, under mem_profile,
+        persist Delta + peak Delta for the cost tree. Zero overhead when both flags are off."""
+        if not (self._timing or self._mem_profile):
+            yield
+            return
+        a0 = 0
+        if self._mem_profile:
+            torch.cuda.synchronize()
+            a0 = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+        t0 = 0.0
+        if self._timing:
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self._timing:
+                torch.cuda.synchronize()
+                tk = 'perf/t_' + key
+                self._timings[tk] = self._timings.get(tk, 0.0) + (time.perf_counter() - t0)
+            if self._mem_profile:
+                torch.cuda.synchronize()
+                peak = torch.cuda.max_memory_allocated()
+                m = self._mems.setdefault(key, [0.0, 0, 0.0])
+                m[0] += torch.cuda.memory_allocated() - a0   # persist Delta (held past region)
+                m[1] += 1
+                m[2] = max(m[2], peak - a0)                   # peak Delta (transient spike)
+                self._peak_running = max(self._peak_running, peak)
 
     def _to_dev(self, t):
         """to(device) with optional transfer timing (perf/t_aux_transfer)."""
@@ -167,8 +208,7 @@ class LoggingA2CAgent(A2CAgent):
             self._adv_std = adv.std().item()
         return super().prepare_dataset(batch_dict)
 
-    def calc_gradients(self, input_dict):
-        super().calc_gradients(input_dict)
+    def _log_action_sat(self):
         # train_result = (a_loss, c_loss, entropy, kl, lr, lr_mul, mu, sigma, b_loss)
         with torch.no_grad():
             mu = self.train_result[6]
@@ -177,6 +217,10 @@ class LoggingA2CAgent(A2CAgent):
             # dims (and is all dims for an MLP) -> saturation measured over active dims only.
             active = (mu.abs() > 1e-6).float().sum().clamp(min=1.0)
             self._action_sats.append((saturated / active).item())
+
+    def calc_gradients(self, input_dict):
+        super().calc_gradients(input_dict)
+        self._log_action_sat()
 
     def trancate_gradients_and_step(self):
         if self.truncate_grads and not self.multi_gpu:
@@ -222,10 +266,20 @@ class LoggingA2CAgent(A2CAgent):
             for k, v in self._timings.items():
                 w.add_scalar(k, v, frame)
             self._timings = {}
+        # per-node memory (mem_profile): mean persist Delta + max peak Delta, MiB.
+        if self._mems:
+            for k, (psum, cnt, pkd) in self._mems.items():
+                w.add_scalar(f'perf/mem_persist_{k}', psum / max(cnt, 1) / 1e6, frame)
+                w.add_scalar(f'perf/mem_peakd_{k}', pkd / 1e6, frame)
+            self._mems = {}
         # peak GPU mem: passive read (no cuda.synchronize) -> always logged, no --timing needed.
+        # Under mem_profile the global peak stat is reset per-region, so use our own running max.
         # Throughput comes free from rl_games' performance/step_inference_rl_update_fps.
         if torch.cuda.is_available():
-            w.add_scalar('perf/peak_mem_mib', torch.cuda.max_memory_allocated() / 1e6, frame)
+            peak = self._peak_running if (self._mem_profile and self._peak_running) \
+                else torch.cuda.max_memory_allocated()
+            w.add_scalar('perf/peak_mem_mib', peak / 1e6, frame)
+            self._peak_running = 0
 
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
