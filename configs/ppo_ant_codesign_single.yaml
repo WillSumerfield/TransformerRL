@@ -3,9 +3,13 @@
 # optimizer. value_size=1 (V1.0 is the gencrit_head, not a value column). Per step: plain combined
 # PPO on control. At each resample: fit GenCrit (rollout states + designed prefixes -> R), GenAct
 # PPO, and clone control (beta*KL + lam*MSE). See temp/codesign_single_network_plan.md, CONTEXT.md.
+#
+# ALSO THE CODESIGN BASE CONFIG: every other codesign arm `extends:` this file and declares ONLY
+# its aux block, so the arms cannot drift in anything but the thing under test. (They used to be
+# copy-pasted; the JEPA arm silently ran generator.entropy_coef 0.01 while its siblings ran 0.1.)
 env:
   sample_morphs: true       # unlocks resample(); AntCodesignEnv overrides _draw_morphs (rng unused)
-  base_legs: [1, 4, 6]      # initial build + warmup center (must match generator.base_legs)
+  base_legs: [1, 4, 6]      # initial build + warmup SEED (must match generator.base_legs)
 
 params:
   seed: 42
@@ -45,12 +49,20 @@ params:
 
     generator:               # generator heads share the trunk/optimizer (no separate net/lr)
       base_legs: [1, 4, 6]
-      desirable_flip_prob: 0.05
-      n_pretrain: 8          # warmup windows (BC toward built body + value fit, ramp gen-frac 0->1)
-      epochs: 4
+      # Warmup teacher = the generator's post-warmup PRIOR (it is behaviour-cloned onto it).
+      # parts-copy: each slot copies a limb template from the seed, then takes a length offset;
+      # unstable draws are rejection-resampled but kept w.p. prob_invalid (GenCrit needs negatives).
+      # vs the old 'flip' teacher (seed +- per-token noise): 49% of flip draws were LITERALLY the
+      # base ant and 0% had >=6 limbs -- an edit-distance ball whose cheap edits are degenerate.
+      teacher: parts
+      copy_prob: 0.6         # p: slot keeps its OWN seed limb template (else copies another slot's)
+      len_keep_prob: 0.6     # q: P(per-limb length offset == 0); sets the Gaussian sigma
+      prob_invalid: 0.1      # keep an UNSTABLE body w.p. this
+      n_pretrain: 8          # warmup windows (BC toward the teacher draw + value fit; ramp gen-frac 0->1)
+      epochs: 16             # BC epochs/window; each REDRAWS the teacher, so 16 = 4x fresh data, not 4x passes
       minibatches: 4
       clip: 0.2              # GenAct PPO-clip
-      entropy_coef: 0.01
+      entropy_coef: 0.1      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
       gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
       beta: 1.0             # control-actor KL clone coefficient
       lam: 1.0             # control-critic MSE clone coefficient

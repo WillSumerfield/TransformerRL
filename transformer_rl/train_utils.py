@@ -9,6 +9,8 @@ import threading
 from datetime import datetime
 from pathlib import Path
 
+import yaml
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEOS_DIR = _PROJECT_ROOT / "videos"
 
@@ -255,6 +257,18 @@ def _deep_merge(base: dict, over: dict) -> dict:
         else:
             out[k] = v
     return out
+
+
+def _load_config(path: Path) -> dict:
+    """Load a config, resolving its `extends:` parent chain (parent merged UNDER child).
+
+    Lets a family of configs (e.g. the codesign arms) share ONE copy of the blocks they don't
+    vary -- an arm that never names `generator:` cannot silently drift from its siblings' copy.
+    """
+    with open(path) as f:
+        cfg = yaml.safe_load(f)
+    parent = cfg.pop("extends", None)
+    return cfg if parent is None else _deep_merge(_load_config(path.parent / parent), cfg)
 
 
 def _adjust_minibatch(cfg: dict, n_envs: int, h_len: int) -> None:
@@ -875,7 +889,6 @@ def run_training(
     post_config_fn=None,
     morphology_set: list | None = None,
 ) -> None:
-    import yaml
     import torch
     import gymnasium.spaces
     from argparse import ArgumentParser
@@ -946,6 +959,9 @@ def run_training(
     parser.add_argument("--num-samples", type=int, default=1, dest="num_samples",
                         help="Test/full: number of fresh morphology draws (resample between). "
                              "Requires env sample_morphs=True when > 1.")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VAL", dest="set_keys",
+                        help="Override any config key by dotted path, repeatable. VAL is YAML-parsed. "
+                             "e.g. --set params.config.generator.entropy_coef=0.3")
     if extra_args_fn is not None:
         extra_args_fn(parser)
     args = parser.parse_args()
@@ -981,17 +997,21 @@ def run_training(
     # --- Config loading ---
     config_path = args.config if args.config is not None \
         else _PROJECT_ROOT / "configs" / default_config
-    with open(config_path) as f:
-        config = yaml.safe_load(f)
 
-    # Merge shared rl_games boilerplate (configs/defaults/base.yaml) UNDER the
-    # config so per-config values win; then pin the identity fields the training
-    # script already owns (env_name, network/model name) so they can't drift from
-    # what's registered, and the experiment yaml holds only config.name + knobs.
-    # See ADR-0006.
+    # Merge shared rl_games boilerplate (configs/defaults/base.yaml) UNDER the config
+    # (resolved through its `extends:` chain) so per-config values win; then pin the
+    # identity fields the training script already owns (env_name, network/model name) so
+    # they can't drift from what's registered. See ADR-0006.
     with open(_PROJECT_ROOT / "configs" / "defaults" / "base.yaml") as f:
         base = yaml.safe_load(f)
-    config = _deep_merge(base, config)
+    config = _deep_merge(base, _load_config(config_path))
+    for kv in args.set_keys:                          # --set params.config.x.y=VAL
+        key, _, val = kv.partition("=")
+        *path, leaf = key.split(".")
+        d = config
+        for p in path:
+            d = d.setdefault(p, {})
+        d[leaf] = yaml.safe_load(val)                 # YAML-parse: 0.3 -> float, true -> bool
     params = config["params"]
     params["config"]["env_name"] = env_name
     params["config"]["name"] = name        # experiment-family label (drives train_dir)
@@ -1190,6 +1210,15 @@ def run_training(
     mb_module.register_model('transformer_masked_value', TransformerMaskedValue)
 
     # --- Run ---
+    if mode == "train":
+        # Stamp the RESOLVED config (extends chain + base.yaml + every --set/CLI override applied)
+        # into the run dir. `extends` and `--set` both resolve at load, so the yaml on disk no
+        # longer answers "what knobs did this run use?" -- this file does.
+        stamp = Path(cfg["train_dir"], run_name)
+        stamp.mkdir(parents=True, exist_ok=True)
+        with open(stamp / "config.yaml", "w") as f:
+            yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
+
     runner = Runner()
     # Swap in the metrics-logging agent for all continuous PPO runs (see logging_agent.py).
     from .logging_agent import LoggingA2CAgent
