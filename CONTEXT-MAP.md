@@ -106,7 +106,13 @@ _Avoid_: joint (informal only)
 A limb or DOF is *active* if it exists in the current morphology, *inactive* if it's a padded-out slot (padded to 8 limbs / **16 DOFs baseline, 32 DOFs codesign**). Inactive actions are zeroed; inactive DOF values are 0.
 
 **Stable morphology**:
-A morphology that is dynamically viable as a walker: ≥3 limbs and no circular gap between adjacent limbs > 135°.
+A morphology that is dynamically viable as a walker: **≥3 limbs**, **no circular gap between adjacent limbs > 135°**, and **≥2 limbs of length ≥2 modules** (a body standing only on 1-module stubs cannot walk). The length clause is *vacuous* for the classic/multimorph ant — every limb there is exactly 2 modules — so the enumerated 131-morph set is unchanged by it; it only bites on the **variable-length** codesign morphologies (phase-1 onward), where it is the admission rule for the **generalization suite**. Presence-only enumeration: `_stable_morphologies()`. The generator is *not* constrained to stable bodies (it has only a ≥1-limb guard) — stability filters what we *evaluate on*, not what it may *emit*.
+
+**Warmup** (pretrain):
+The first `n_pretrain` generator windows, in which the generator is trained by **supervised** behavior-cloning — *not* RL. Its imitation target is a **warmup teacher** draw; the entropy bonus does not apply here (it is an RL-only term), since BC is a max-likelihood fit and the teacher, not an entropy bonus, is the intended source of body diversity. GenCrit (V1.0) still fits the *built* body → R throughout, because R is measured on the body that actually ran. Warmup's job is to **install the generator's prior**; RL is the phase that moves off it.
+
+**Warmup teacher**:
+The sampler that draws bodies during warmup — it *defines the generator's post-warmup prior*, because the generator is behavior-cloned onto it. Two teachers exist (`generator.teacher`): **flip** (the seed body ± per-token noise — an edit-distance ball, so mass at radius *r* decays like `flip^r` and the cheap edits are degenerate: sprouting a limb costs one flip, a *useful-length* limb costs three) and **parts** (seed-relative parts-copy: each slot copies a limb template from the seed, then takes a per-limb length offset; unstable draws are rejection-resampled but kept with probability `prob_invalid`). The teacher shapes *geometry*; entropy supplies *pressure* — see the Phase-8b note in the escalation plan.
 
 **DOF mask**:
 The `{0,1}` vector marking which DOFs are active — **16-bit at obs `[123:139]` (baseline); 32-bit in codesign** (all obs offsets derive from the net's `tdims`, not hardcoded). Written once at allocation, constant per env. Read by the tokenizer and policy via a `> 0` test. Code identifier `dof_mask`.

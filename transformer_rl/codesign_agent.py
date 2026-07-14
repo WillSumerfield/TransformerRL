@@ -14,6 +14,7 @@ Two training regimes, both on self.optimizer:
 
 R_i = the body's true mean completed-episode return over the window (gamma=1), accumulated in
 env_step. Requires codesign_tokens (the gen/critic heads). Supersedes the SeqGenerator path."""
+import math
 import os
 
 import numpy as np
@@ -57,6 +58,17 @@ class CodesignAgent(LoggingA2CAgent):
         env = self._env()                                  # base_legs from the ENV -> window-0 match
         self._base_legs = tuple(sorted(getattr(env, '_base_legs', cd.get('base_legs', (1, 4, 6)))))
         self._flip = float(cd.get('desirable_flip_prob', 0.10))    # per-token continue/stop flip prob
+        # Warmup teacher. 'flip' = base +- per-token noise (original). 'parts' = seed-relative
+        # PARTS-COPY: per-token flip has the wrong geometry -- mass at edit-radius r decays like
+        # flip^r, and the CHEAP edits are the degenerate ones (sprouting a limb costs 1 flip, a limb
+        # of USEFUL length costs 3), so it only ever reaches base +- stubs. Parts-copy instead makes
+        # each slot COPY a limb template from the seed, so a sprouted limb arrives full-length.
+        self._teacher = str(cd.get('teacher', 'flip'))
+        self._copy_prob = float(cd.get('copy_prob', 0.6))          # p: slot keeps its OWN base template
+        self._len_keep = float(cd.get('len_keep_prob', 0.6))       # q: P(length offset == 0)
+        self._prob_invalid = float(cd.get('prob_invalid', 0.1))    # keep an UNSTABLE body w.p. this
+        # sigma solved from q = P(round(N(0,sigma)) == 0) = erf(0.5/(sigma*sqrt2))
+        self._len_sigma = 0.5 / (math.sqrt(2) * torch.erfinv(torch.tensor(self._len_keep)).item())
         bset = set(self._base_legs)
         # base morph = base_legs @ count-2 (1 swing + 1 knee). Per-token flip noise around this target
         # length gives P(limb differs by +-1 token)=flip, +-2=flip^2, ... (presence + length unified).
@@ -316,8 +328,53 @@ class CodesignAgent(LoggingA2CAgent):
         return slots, actions, active_step, count
 
     @torch.no_grad()
+    def _is_stable(self, counts):
+        """Stable = walkable: >=3 limbs, >=2 limbs of length >=2, no circular gap > 135deg (i.e. no
+        run of >=3 empty slots on the 8-slot ring). Used ONLY to weight the warmup teacher's draws
+        (see _draw_parts_counts); the generator itself is never masked by it."""
+        pres = counts > 0
+        ok = (pres.sum(1) >= 3) & ((counts >= 2).sum(1) >= 2)
+        pad = torch.cat([pres, pres], 1)                              # wrap the ring
+        for r in range(_N_LIMBS):
+            ok &= (pad[:, r] | pad[:, r + 1] | pad[:, r + 2])
+        return ok
+
+    @torch.no_grad()
+    def _draw_parts_counts(self, N):
+        """Seed-relative PARTS-COPY teacher -> body counts (N, n). Uses only the seed body + the
+        token MDP (no morphology oracle beyond the stability WEIGHT below), so it survives Phase-5's
+        tree vocabulary. Two stages:
+          1. presence+template: each slot copies a limb template from the base -- its OWN w.p.
+             copy_prob, else uniform over the other slots (absent templates included, so presence is
+             inherited from the seed's density). A sprouted slot therefore arrives FULL-LENGTH.
+          2. length: per-limb integer offset ~ round(N(0, sigma)), applied to PRESENT templates only
+             (an absent slot never sprouts here). Offsets may delete a limb.
+        Unstable draws are rejected and resampled, except kept w.p. prob_invalid -- so GenCrit still
+        sees some bad bodies (that is how it learns 'bad' without an oracle)."""
+        dev = self._base_target.device
+        ar = torch.arange(_N_LIMBS, device=dev)
+        out = torch.zeros(N, _N_LIMBS, dtype=torch.long, device=dev)
+        filled = 0
+        while filled < N:
+            m = max(N, 2 * (N - filled))                              # over-draw; rejection is cheap
+            own = torch.rand(m, _N_LIMBS, device=dev) < self._copy_prob
+            other = torch.randint(0, _N_LIMBS - 1, (m, _N_LIMBS), device=dev)
+            other = other + (other >= ar).long()                      # uniform over the OTHER slots
+            tmpl = self._base_target[torch.where(own, ar.expand(m, -1), other)]
+            off = torch.round(torch.randn(m, _N_LIMBS, device=dev) * self._len_sigma).long()
+            c = torch.where(tmpl > 0, (tmpl + off).clamp(0, self._max_len), torch.zeros_like(tmpl))
+            c[c.sum(1) == 0, 0] = 2                                   # >=1-limb guard
+            keep = c[self._is_stable(c) | (torch.rand(m, device=dev) < self._prob_invalid)]
+            take = min(keep.shape[0], N - filled)
+            out[filled:filled + take] = keep[:take]
+            filled += take
+        return out
+
+    @torch.no_grad()
     def _draw_base_counts(self, N):
-        """Base +- per-token flip noise -> body counts (N, n)."""
+        """Warmup teacher draw -> body counts (N, n). See self._teacher."""
+        if self._teacher == 'parts':
+            return self._draw_parts_counts(N)
         return self._frontier_rollout(self._base_target.view(1, _N_LIMBS).expand(N, _N_LIMBS),
                                       self._flip)[3]
 
@@ -394,8 +451,10 @@ class CodesignAgent(LoggingA2CAgent):
                     H_old[s:s + self.minibatch_size] = H.to(torch.bfloat16)
 
         pretrain = self._in_pretrain()
-        if pretrain:                                       # BC toward the built body (frontier tokens)
-            # reconstruct a valid token sequence that yields _cur_counts (random tip order, no flip)
+        # NOTE: (slots, actions) here is always the BUILT body -- GenCrit's prefix fit must stay on it
+        # because R was measured on the body that actually ran. In pretrain, GenAct's BC target is a
+        # separate, freshly-drawn TEACHER body (see the epoch loop).
+        if pretrain:
             slots, actions, valid, _ = self._frontier_rollout(self._cur_counts, 0.0)
             old_logp, adv, raw_adv = None, None, None
         else:                                              # RL: PPO over the sampled trace
@@ -411,6 +470,14 @@ class CodesignAgent(LoggingA2CAgent):
         mb_size = max(1, min(N // self._gen_minibatches, self._gen_max_prefixes // L1))
         logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn', 'anchor')}
         for _ in range(self._gen_epochs):
+            if pretrain:
+                # GenAct's BC target: a FRESH teacher draw (+ fresh random tip ordering) each epoch.
+                # The teacher is a cheap GPU sampler, so BC fits the teacher DISTRIBUTION rather than
+                # re-fitting one finite 4096-body sample of it. Deliberately NOT the built body: that
+                # is (1-frac) teacher + frac generator-samples with frac -> ~1 across the ramp, so
+                # cloning it makes the generator imitate ITSELF in the late windows -- a feedback loop
+                # that compounds fit error instead of correcting it.
+                bc_slots, bc_actions, _, _ = self._frontier_rollout(self._draw_base_counts(N), 0.0)
             perm = torch.randperm(N, device=dev)
             for s in range(0, N, mb_size):
                 mb = perm[s:s + mb_size]
@@ -419,17 +486,23 @@ class CodesignAgent(LoggingA2CAgent):
                 # GenAct losses over valid steps only so no-op frontier steps don't dilute the signal.
                 logits, v, vm = net.gen_replay(slots[mb], actions[mb])   # (m,L,2), (m,L+1), (m,L)
                 vf = vm.float()
-                nval = vf.sum().clamp(min=1.0)
-                dist = torch.distributions.Categorical(logits=logits)
-                if pretrain:
-                    gen_pg = -(dist.log_prob(actions[mb]) * vf).sum() / nval
-                else:
+                v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
+
+                if pretrain:                       # BC: separate replay on the teacher tokens
+                    bl, _, bm = net.gen_replay(bc_slots[mb], bc_actions[mb])
+                    bf = bm.float()
+                    nval = bf.sum().clamp(min=1.0)
+                    dist = torch.distributions.Categorical(logits=bl)
+                    gen_pg = -(dist.log_prob(bc_actions[mb]) * bf).sum() / nval
+                    ent = (dist.entropy() * bf).sum() / nval
+                else:                              # RL: PPO-clip on the sampled trace
+                    nval = vf.sum().clamp(min=1.0)
+                    dist = torch.distributions.Categorical(logits=logits)
                     ratio = (dist.log_prob(actions[mb]) - old_logp[mb]).exp()
                     a = adv[mb]
                     per = torch.min(ratio * a, ratio.clamp(1 - self._gen_clip, 1 + self._gen_clip) * a)
                     gen_pg = -(per * vf).sum() / nval
-                ent = (dist.entropy() * vf).sum() / nval
-                v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
+                    ent = (dist.entropy() * vf).sum() / nval
 
                 # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
                 # Anchor on: sample from the snapshot SUBSET so H_full_new reuses this single forward
@@ -450,7 +523,12 @@ class CodesignAgent(LoggingA2CAgent):
                 crit = (v098_n - v098_old[ridx]).pow(2).mean()
                 v_roll = (v1_n.squeeze(-1) - R_roll[ridx]).pow(2).mean()
 
-                loss = (gen_pg - self._gen_ent * ent
+                # entropy is an RL-only term: pretrain is supervised (gen_pg is plain NLL) and the
+                # TEACHER is the entropy source, so a bonus here only fights the fit -- at 0.1 it
+                # drove the token policy to 86% of ln2 (near coin-flip), i.e. geometric limb
+                # lengths, and cut the parts teacher's 87% stable bodies down to 41%.
+                ent_coef = 0.0 if pretrain else self._gen_ent
+                loss = (gen_pg - ent_coef * ent
                         + self._gencrit_coef * (v_prefix + v_roll)
                         + self._beta * kl + self._lam * crit
                         + self._jepa_anchor_coef * anchor)
