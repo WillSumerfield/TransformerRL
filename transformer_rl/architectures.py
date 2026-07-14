@@ -55,6 +55,7 @@ class LimbTransformer(nn.Module):
         value_head: bool = True,
         codesign_tokens: bool = False,
         max_limb_length: int = 1,
+        fd_variant: str = 'raw',
     ):
         super().__init__()
         self.n_limbs = n_limbs
@@ -62,6 +63,7 @@ class LimbTransformer(nn.Module):
         self.has_value_head = value_head
         self.codesign_tokens = codesign_tokens
         self.max_limb_length = max_limb_length
+        self.fd_variant = fd_variant                # 'raw' (21-D obs-space) | 'latent' (content embed)
         self._d_model = d_model
 
         self.embed_root = nn.Linear(root_dim, d_model)
@@ -156,8 +158,11 @@ class LimbTransformer(nn.Module):
             # targets are parent-relative so own joint action is the first-order driver (grill 2026-07-09;
             # CLS/root DROPPED, world-absolute target would need whole-body action). -> next parent-
             # relative relpos(3)+relrot(6)+relvel(6)+cfrc(6)=21. Inert unless fd_loss_raw is called.
+            # latent variant: head instead predicts the content-only embed of next_obs (d_model), a
+            # JEPA target anchored by embed_module (RL-pinned -> no collapse); cosine loss (grill 2026-07-12).
+            _fd_out = d_model if fd_variant == 'latent' else _FD_MODULE_DIM
             self.fd_module_head = nn.Sequential(
-                nn.Linear(d_model + 1, d_model), nn.GELU(), nn.Linear(d_model, _FD_MODULE_DIM))
+                nn.Linear(d_model + 1, d_model), nn.GELU(), nn.Linear(d_model, _fd_out))
             self._fd_armed = False           # agent arms this per PPO minibatch (fused aux loss)
             # _enabled: fixed per-run compile-time gate (agent sets from config before torch.compile);
             # forward runs the head iff enabled, so a feature-off run never compiles it in (baseline-
@@ -314,6 +319,14 @@ class LimbTransformer(nn.Module):
         B, n, D = next_obs.shape[0], self.n_limbs, self.max_limb_length
         # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
         _, mod_t, _ = tokenize_modules(next_obs, n, D)
+        if self.fd_variant == 'latent':
+            # JEPA target = content-only embed of next physical state: next_phys @ W_phys.T (drop the
+            # constant type/mode one-hot cols + bias -> the fixed offset c the head could trivially fit).
+            # stop-grad (embed_module is RL-pinned, can't collapse -> no EMA). cosine 2-2cos, active*valid.
+            tgt = (mod_t @ self.embed_module.weight[:, :MODULE_DIM].t()).detach()   # (B, n_dof, d_model)
+            mm = (active_mask * valid.float().unsqueeze(-1)).unsqueeze(-1)          # (B, n_dof, 1)
+            cos = F.cosine_similarity(mod_pred, tgt, dim=-1, eps=1e-6).unsqueeze(-1)  # (B, n_dof, 1)
+            return ((2.0 - 2.0 * cos) * mm).sum() / mm.sum().clamp(min=1)
         geom_tgt = mod_t[..., 10:25]                                    # relpos3+relrot6+relvel6 (15)
         # cfrc target: per-limb sensor block of next_obs, broadcast to each depth slot of that limb
         so = token_dims(n, D)["sens_off"]
