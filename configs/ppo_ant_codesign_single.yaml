@@ -42,7 +42,7 @@ params:
     e_clip: 0.15
     resample_interval: 1     # one generator window per ~62-epoch rebuild window
     horizon_length: 16
-    minibatch_size: 32768
+    minibatch_size: 16384
     mini_epochs: 4
     critic_coef: 3.25
     bounds_loss_coef: 0.0005
