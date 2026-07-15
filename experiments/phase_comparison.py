@@ -21,6 +21,7 @@ import sys
 import shutil
 import argparse
 import subprocess
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
@@ -33,12 +34,12 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from experiments.diversity import within_run_metrics, between_seed_metrics, counts_to_repr
 
 # ---- phase identity (the ONE block a future phase edits) -------------------------
-PHASE = "phase1_longer_limbs"
-BRANCH = "phase-1"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
+PHASE = "phase2_forward_aux"
+BRANCH = "phase-2"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
 SCRIPT = "scripts/train_ant_codesign_single.py"
-CONFIG = "configs/ppo_ant_codesign_single.yaml"
-RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase1_s{seed}
-NAME = lambda seed: f"phase1_s{seed}"
+CONFIG = "configs/ppo_ant_codesign_single.yaml"   # FD(latent)+FK aux ON + generator warmup changes
+RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase2_s{seed}
+NAME = lambda seed: f"phase2_s{seed}"
 
 
 def _git(args):
@@ -64,7 +65,8 @@ PLATEAU_TAIL = 5                  # windows averaged for the "final" plateau val
 # curves stored per-seed for the notebook to overlay (step + val)
 _FPS_TAG = "performance/step_inference_rl_update_fps"   # rl_games native throughput (env-steps/sec)
 CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "build/modulecount",
-              "rewards/step", _FPS_TAG, "perf/peak_mem_mib"]
+              "rewards/step", _FPS_TAG, "perf/peak_mem_mib",
+              "losses/fd", "losses/fk"]        # phase-2 aux diagnostics (absent on phase-0/1 overlays)
 
 
 # ---- 1. training -----------------------------------------------------------------
@@ -72,10 +74,10 @@ CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "build/modul
 def train_all(seeds, max_epochs, num_envs):
     for seed in seeds:
         name = NAME(seed)
-        assert name.startswith("phase1_"), "safety: only ever delete phase1_* run dirs"
+        assert name.startswith("phase2_"), "safety: only ever delete phase2_* run dirs"
         run_dir = _ROOT / RUN.format(name=name)
         if run_dir.exists():
-            shutil.rmtree(run_dir)                      # always retrain (only this exact phase0_ dir)
+            shutil.rmtree(run_dir)                      # always retrain (only this exact phase2_ dir)
         # NB: no --timing -- it inserts cuda.synchronize()/epoch that kills GPU pipelining (~2x
         # slower). Throughput comes from rl_games' native performance/* tag; peak-mem logs passively.
         cmd = [sys.executable, str(_ROOT / SCRIPT), "train", "--headless", "True",
@@ -84,7 +86,17 @@ def train_all(seeds, max_epochs, num_envs):
         if num_envs is not None:
             cmd += ["--num_envs", str(num_envs)]
         print(f"\n[phase] TRAIN {name}: {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True, cwd=_ROOT)
+        # Retry the known intermittent gym-rebuild crash (docs/resample_rebuild_crash.md) so one bad
+        # resample doesn't abort a multi-hour multi-seed sweep. rmtree between attempts = fresh run.
+        for attempt in range(1, 4):
+            if subprocess.run(cmd, cwd=_ROOT).returncode == 0:
+                break
+            print(f"[phase] {name} attempt {attempt} FAILED", flush=True)
+            if attempt == 3:
+                raise RuntimeError(f"{name} failed 3x")
+            if run_dir.exists():
+                shutil.rmtree(run_dir)
+            time.sleep(30)                                 # let the dying process release VRAM
 
 
 # ---- 2. eval pass: converged generator -> 3 performance views + diversity ---------

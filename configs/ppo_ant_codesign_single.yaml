@@ -4,9 +4,10 @@
 # PPO on control. At each resample: fit GenCrit (rollout states + designed prefixes -> R), GenAct
 # PPO, and clone control (beta*KL + lam*MSE). See temp/codesign_single_network_plan.md, CONTEXT.md.
 #
-# ALSO THE CODESIGN BASE CONFIG: every other codesign arm `extends:` this file and declares ONLY
-# its aux block, so the arms cannot drift in anything but the thing under test. (They used to be
-# copy-pasted; the JEPA arm silently ran generator.entropy_coef 0.01 while its siblings ran 0.1.)
+# THE PHASE-2 CONFIG: Forward Dynamics (latent) + Forward Kinematics aux heads ON (fused into the PPO
+# loss, 0 extra passes; config.fd/fk). Aux is still gated -- `--set params.config.fd.enabled=false`
+# (and fk) reproduces the phase-1 baseline. Generator warmup = parts teacher, entropy RL-only, BC on
+# the teacher draw (see the generator block). Override any knob with --set (e.g. fd_variant=raw).
 env:
   sample_morphs: true       # unlocks resample(); AntCodesignEnv overrides _draw_morphs (rng unused)
   base_legs: [1, 4, 6]      # initial build + warmup SEED (must match generator.base_legs)
@@ -25,6 +26,7 @@ params:
       ffn: 640
       codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
       max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
+      fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target
 
   config:
     num_actors: 4096
@@ -66,3 +68,11 @@ params:
       gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
       beta: 1.0             # control-actor KL clone coefficient
       lam: 1.0             # control-critic MSE clone coefficient
+
+    fd:                      # Phase 2b Forward Dynamics aux, FUSED into the PPO loss (0 extra passes)
+      enabled: true          # false == phase-1 baseline (get_aux_loss -> None)
+      coef: 1.0              # cosine loss in [0,4] (latent variant); may retune vs raw-FD MSE scale
+
+    fk:                      # Phase 2b Forward Kinematics aux, FUSED (0 extra passes); own torso-frame
+      enabled: true          # pose (pos+rot6D+vel, 15). Stays RAW (latent FK is degenerate).
+      coef: 1.0              # weight on the FK MSE (per-depth normalized target space)
