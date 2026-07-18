@@ -34,12 +34,12 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from experiments.diversity import within_run_metrics, between_seed_metrics, counts_to_repr
 
 # ---- phase identity (the ONE block a future phase edits) -------------------------
-PHASE = "phase2_forward_aux"
-BRANCH = "phase-2"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
+PHASE = "phase3_substrate"
+BRANCH = "phase-3"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
 SCRIPT = "scripts/train_ant_codesign_single.py"
-CONFIG = "configs/ppo_ant_codesign_single.yaml"   # FD(latent)+FK aux ON + generator warmup changes
-RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase2_s{seed}
-NAME = lambda seed: f"phase2_s{seed}"
+CONFIG = "configs/ppo_ant_codesign_single.yaml"   # +RoPE +AdamW-WD +short LR-warmup baked; FD+FK aux ON
+RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase3_s{seed}
+NAME = lambda seed: f"phase3_s{seed}"
 
 
 def _git(args):
@@ -74,7 +74,7 @@ CURVE_TAGS = ["quality/R_mean", "quality/R_std", "build/limbcount", "build/modul
 def train_all(seeds, max_epochs, num_envs):
     for seed in seeds:
         name = NAME(seed)
-        assert name.startswith("phase2_"), "safety: only ever delete phase2_* run dirs"
+        assert name.startswith("phase3_"), "safety: only ever delete phase3_* run dirs"
         run_dir = _ROOT / RUN.format(name=name)
         if run_dir.exists():
             shutil.rmtree(run_dir)                      # always retrain (only this exact phase2_ dir)
