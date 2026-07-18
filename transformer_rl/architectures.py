@@ -39,6 +39,84 @@ def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
     return idx // 2 + n_limbs * (idx % 2)
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = x.chunk(2, dim=-1)
+    return torch.cat([-x2, x1], dim=-1)
+
+
+class _CustomEncoderLayer(nn.Module):
+    """Pre-norm block: manual QKV + SDPA, so both depth-only RoPE (3a) and attention-weight dropout
+    (3b AttentionDrop) can hook in — stock nn.MultiheadAttention only exposes ONE shared dropout
+    float, which can't be split from the post-block dropout (3b Dropout). Mirrors
+    nn.TransformerEncoderLayer(norm_first=True, activation='gelu') otherwise. attn_dropout/
+    block_dropout are mutually exclusive in practice (LimbTransformer's reg_mode gate) but the layer
+    itself doesn't assume that."""
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int,
+                 attn_dropout: float = 0.0, block_dropout: float = 0.0):
+        super().__init__()
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        self.attn_dropout = attn_dropout
+        self.block_dropout = block_dropout
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward), nn.GELU(), nn.Linear(dim_feedforward, d_model))
+
+    def forward(self, x, cos, sin, attn_mask=None):
+        B, T, D = x.shape
+        h = self.norm1(x)
+        qkv = self.qkv_proj(h).view(B, T, 3, self.nhead, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]                          # (B, nhead, T, head_dim)
+        q = q * cos + _rotate_half(q) * sin
+        k = k * cos + _rotate_half(k) * sin
+        p = self.attn_dropout if self.training else 0.0
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=p)
+        attn = attn.transpose(1, 2).reshape(B, T, D)
+        attn = F.dropout(self.out_proj(attn), self.block_dropout, self.training)
+        x = x + attn
+        ffn_out = F.dropout(self.ffn(self.norm2(x)), self.block_dropout, self.training)
+        x = x + ffn_out
+        return x
+
+
+class _CustomEncoder(nn.Module):
+    """Drop-in stand-in for nn.TransformerEncoder when LimbTransformer needs RoPE and/or split
+    dropout (use_rope=True or reg_mode != 'none'): same call signature
+    (`forward(x, src_key_padding_mask=None)`) so call sites don't branch. depth_ids=None -> identity
+    rotation (cos=1/sin=0, broadcasts over T) for the reg-only/no-RoPE case; otherwise cos/sin are
+    precomputed once from the FIXED per-token depth id (CLS/start = phase 0, matching depth_emb's
+    zero-pad convention) since the token layout is constant for a given (n_limbs, max_limb_length)."""
+    def __init__(self, d_model: int, nhead: int, n_layers: int, dim_feedforward: int,
+                 depth_ids: torch.Tensor = None, attn_dropout: float = 0.0,
+                 block_dropout: float = 0.0, base: float = 10000.0):
+        super().__init__()
+        head_dim = d_model // nhead
+        if depth_ids is not None:
+            assert head_dim % 2 == 0, "RoPE needs an even head_dim (d_model // n_heads)"
+            inv_freq = 1.0 / (base ** (torch.arange(0, head_dim, 2).float() / head_dim))
+            angles = depth_ids.float()[:, None] * inv_freq[None, :]        # (T, head_dim/2)
+            cos = torch.cat([angles.cos(), angles.cos()], dim=-1)          # (T, head_dim)
+            sin = torch.cat([angles.sin(), angles.sin()], dim=-1)
+            cos, sin = cos.view(1, 1, -1, head_dim), sin.view(1, 1, -1, head_dim)
+        else:
+            cos, sin = torch.ones(1, 1, 1, head_dim), torch.zeros(1, 1, 1, head_dim)
+        self.register_buffer("cos", cos, persistent=False)
+        self.register_buffer("sin", sin, persistent=False)
+        self.layers = nn.ModuleList(
+            [_CustomEncoderLayer(d_model, nhead, dim_feedforward, attn_dropout, block_dropout)
+             for _ in range(n_layers)])
+
+    def forward(self, x, src_key_padding_mask=None):
+        attn_mask = None
+        if src_key_padding_mask is not None:
+            attn_mask = ~src_key_padding_mask[:, None, None, :]        # (B,1,1,T) True=allowed
+        for layer in self.layers:
+            x = layer(x, self.cos, self.sin, attn_mask=attn_mask)
+        return x
+
 
 class LimbTransformer(nn.Module):
     def __init__(
@@ -56,14 +134,23 @@ class LimbTransformer(nn.Module):
         codesign_tokens: bool = False,
         max_limb_length: int = 1,
         fd_variant: str = 'raw',
+        use_rope: bool = False,
+        reg_mode: str = 'none',
+        dropout: float = 0.1,
     ):
         super().__init__()
+        if use_rope and not codesign_tokens:
+            raise ValueError("use_rope needs codesign_tokens (depth-only rotary needs limb-chain depth)")
+        if reg_mode not in ('none', 'dropout', 'attention_drop'):
+            raise ValueError(f"reg_mode must be 'none'|'dropout'|'attention_drop', got {reg_mode!r}")
         self.n_limbs = n_limbs
         self.has_policy_head = policy_head
         self.has_value_head = value_head
         self.codesign_tokens = codesign_tokens
         self.max_limb_length = max_limb_length
         self.fd_variant = fd_variant                # 'raw' (21-D obs-space) | 'latent' (content embed)
+        self.use_rope = use_rope                    # depth-only RoPE vs additive depth_emb (3a)
+        self.reg_mode = reg_mode                    # 'none'|'dropout'|'attention_drop' (3b, mutex)
         self._d_model = d_model
 
         self.embed_root = nn.Linear(root_dim, d_model)
@@ -120,12 +207,24 @@ class LimbTransformer(nn.Module):
         self.register_buffer("type_ids", type_ids, persistent=False)
         self.register_buffer("pos_ids",  pos_ids,  persistent=False)
 
-        layer = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=n_heads, dim_feedforward=ffn,
-            dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
-                                             enable_nested_tensor=False)
+        if use_rope or reg_mode != 'none':
+            depth_ids_full = None
+            if use_rope:
+                # full-token depth id: CLS + start tokens get phase 0 (identity rotation), matching
+                # depth_emb's existing zero-pad convention; module tokens get module_depth_ids.
+                depth_ids_full = torch.cat(
+                    [torch.zeros(1 + n_limbs, dtype=torch.long), module_depth_ids])
+            attn_dropout = dropout if reg_mode == 'attention_drop' else 0.0
+            block_dropout = dropout if reg_mode == 'dropout' else 0.0
+            self.encoder = _CustomEncoder(d_model, n_heads, n_layers, ffn, depth_ids_full,
+                                          attn_dropout=attn_dropout, block_dropout=block_dropout)
+        else:
+            layer = nn.TransformerEncoderLayer(
+                d_model=d_model, nhead=n_heads, dim_feedforward=ffn,
+                dropout=0.0, activation="gelu", batch_first=True, norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
+                                                 enable_nested_tensor=False)
 
         if policy_head:
             self.joint_head = nn.Linear(d_model, 1)
@@ -248,7 +347,9 @@ class LimbTransformer(nn.Module):
         x = torch.cat([cls, start, m], dim=1)                          # (B, 1+n+n_dof, d)
         if mask_pos is not None:
             x = torch.where(mask_pos.unsqueeze(-1), self.mask_token.to(x.dtype), x)
-        x = x + self.pos_emb(self.pos_ids) + self._depth_add()
+        x = x + self.pos_emb(self.pos_ids)                             # limb slot: always additive
+        if not self.use_rope:
+            x = x + self._depth_add()                                 # depth: additive unless RoPE
         return self.encoder(x)                                         # all tokens real -> no padding
 
     def codesign_forward(self, obs: torch.Tensor, return_hidden: bool = False):
@@ -459,7 +560,9 @@ class LimbTransformer(nn.Module):
         start_in = torch.cat([self.angle_enc, toh[1:1 + n]], dim=-1)
         start = self.angle_proj(start_in).unsqueeze(0).expand(M, -1, -1)  # (M,n,d) angle anchor
         x = torch.cat([cls, start, m], dim=1)
-        x = x + self.pos_emb(self.pos_ids) + self._depth_add()
+        x = x + self.pos_emb(self.pos_ids)                             # limb slot: always additive
+        if not self.use_rope:
+            x = x + self._depth_add()                                 # depth: additive unless RoPE
         pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool), pad_mod], dim=1)
         return self.encoder(x, src_key_padding_mask=pad)
 

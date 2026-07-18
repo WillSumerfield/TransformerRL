@@ -40,7 +40,7 @@ _Avoid_: leg encoding; positional embedding (that's the separate learned scheme 
 A learned `nn.Embedding` added to each token by **limb-slot** index (limb number; all of a limb's module tokens share the one slot index). A learned per-slot vector. Distinct from **limb encoding** (body geometry) and from **depth embedding** (within-limb depth).
 
 **Depth embedding** (`depth_emb`):
-A learned `nn.Embedding` added to each module token by its **within-limb depth** (`0..max_limb_length−1`) — *which* module along the chain. New in Phase 1; disambiguates the up-to-4 module tokens that share a limb slot. Ant instance: depth 0 = **swing** joint (hip axis), depth 1+ = **knee** (ankle axis) — *swing/knee are ant-specific*; the general concept is just depth.
+A learned `nn.Embedding` added to each module token by its **within-limb depth** (`0..max_limb_length−1`) — *which* module along the chain. New in Phase 1; disambiguates the up-to-4 module tokens that share a limb slot. Ant instance: depth 0 = **swing** joint (hip axis), depth 1+ = **knee** (ankle axis) — *swing/knee are ant-specific*; the general concept is just depth. Phase 3a reserves a rotary alternative — see **Depth rotary embedding** below.
 
 **Type embedding** (`type_emb`):
 A learned embedding marking a token's **role** — **root / start / module** (the 3 built rows; see *Token role*). Phase 5 refines the `module` row into module types (effector / link / cap).
@@ -146,6 +146,10 @@ The obs-layout descriptor `token_dims(n_limbs, max_limb_length)` carried on the 
 (A JEPA / masked-latent aux is committed but being reframed toward FD/FK — see the stale-marked `temp/Phase2_JEPA_plan.md`; its `[MASK]`/predictor/repr-anchor terms are deliberately **not** glossary vocabulary until Phase 2 settles.)
 
 **6D rotation** (Phase 2): obs rotation representation, quaternion → 6D.
+
+**Depth rotary embedding** (Phase 3a): a reserved alternative to the additive `depth_emb` — rotates attention Q/K by within-limb-depth phase instead of adding a learned per-depth vector. `pos_emb` (limb slot) stays additive alongside it; limb identity isn't a distance axis the way depth is.
+
+**z_model** (Phase 3c): the FD-latent aux head's target dimensionality, reserved to be independent of `d_model`. Distinct from reusing `embed_module`'s own output space (today's FD-latent target) — a decoupled `z_model` needs its own (frozen/random) projection so the target isn't just "whatever size the trunk happens to be."
 
 **Action token** (Phase 4): a per-token action emitted **sequentially** (one level at a time) so a token conditions on the actions chosen below it.
 

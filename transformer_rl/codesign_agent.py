@@ -24,11 +24,50 @@ from torch.nn.utils import clip_grad_norm_
 
 from rl_games.algos_torch import torch_ext
 from rl_games.common.a2c_common import swap_and_flatten01
+from rl_games.common.schedulers import RLScheduler, AdaptiveScheduler
 
 from .architectures import _GEN_ON, _GEN_STOP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 
 _N_LIMBS = 8                                 # obs mask offset / n_dof derive from the net's tdims
+# embedding-like matrices excluded from weight decay despite being nn.Linear (3b, grill 2026-07-15):
+# pos_emb/depth_emb are nn.Embedding tables; embed_module/embed_root are content projections treated
+# the same way (their weight rows behave like per-token/per-slot embeddings, not a generic FFN map).
+_NO_DECAY_NAMES = ('pos_emb', 'depth_emb', 'embed_module', 'embed_root')
+
+
+def _adamw_param_groups(model, weight_decay):
+    """decay: weight matrices (Linear/attention/FFN, dim>=2, not embedding-like); no-decay: biases,
+    LayerNorm weight/bias, bare vector Parameters (dim<2, catches mask_token/cls_design for free),
+    and the embedding-like 2D matrices in _NO_DECAY_NAMES."""
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.dim() < 2 or any(n in name for n in _NO_DECAY_NAMES):
+            no_decay.append(p)
+        else:
+            decay.append(p)
+    return [{'params': decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.0}]
+
+
+class _WarmupThenAdaptiveScheduler(RLScheduler):
+    """3c warmup: linear LR warmup 0->peak over `warmup_epochs`, then hand off to rl_games'
+    AdaptiveScheduler (KL-reactive) for the rest of training, continuing from the LR warmup ended
+    at (== peak by construction). No cosine annealing (considered, dropped). Span default was the
+    n_pretrain BC-toward-teacher window (grill 2026-07-15) but that ran pretrain cold -> now
+    decoupled via config `warmup_epochs` (grill 2026-07-17)."""
+    def __init__(self, peak_lr: float, warmup_epochs: int, kl_threshold: float):
+        super().__init__()
+        self.peak_lr = peak_lr
+        self.warmup_epochs = max(1, warmup_epochs)
+        self._adaptive = AdaptiveScheduler(kl_threshold)
+
+    def update(self, current_lr, entropy_coef, epoch, frames, kl_dist, **kwargs):
+        if epoch < self.warmup_epochs:
+            return self.peak_lr * (epoch + 1) / self.warmup_epochs, entropy_coef
+        return self._adaptive.update(current_lr, entropy_coef, epoch, frames, kl_dist, **kwargs)
 
 
 def _gauss_kl(mu_old, ls_old, mu_new, ls_new):
@@ -45,6 +84,12 @@ class CodesignAgent(LoggingA2CAgent):
         net = self.model.a2c_network.net
         assert getattr(net, 'codesign_tokens', False), \
             "single-network codesign requires transformer.codesign_tokens=true"
+        # 3b: AdamW w/ decoupled weight decay (rl_games' base builds plain Adam, one param group,
+        # config['weight_decay'] fused into the gradient -- NOT decoupled). Two groups so decay only
+        # touches real weight matrices; weight_decay=0 (rl_games default) reproduces base Adam exactly.
+        self.optimizer = torch.optim.AdamW(
+            _adamw_param_groups(self.model, self.weight_decay), float(self.last_lr),
+            eps=1e-08, fused=True)
         cd = self.config.get('generator', {})
         dev = self.ppo_device
         N = self.num_actors * self.num_agents
@@ -78,6 +123,21 @@ class CodesignAgent(LoggingA2CAgent):
 
         # generator hyperparameters (shared optimizer; the heads live on self.model)
         self._n_pretrain = cd.get('n_pretrain', 8)
+        # 3c: LR warmup over the SAME n_pretrain window (not a new span). warmup_epochs is derived,
+        # not swept directly -- one epoch == one _maybe_resample() call, so the epoch count spanning
+        # n_pretrain resamples is fixed by (resample_interval * max_episode_length / horizon_length).
+        # Off by default (config.lr_warmup) -> self.scheduler stays rl_games' plain AdaptiveScheduler.
+        interval = self.config.get('resample_interval', 0)
+        if bool(self.config.get('lr_warmup', False)) and interval and env is not None:
+            epochs_per_window = max(1, math.ceil(interval * env.max_episode_length / self.horizon_length))
+            # 3c sweep: DECOUPLE the LR-ramp span from pretrain. `warmup_epochs` (config) overrides;
+            # unset (0) => n_pretrain*epochs_per_window (the old pretrain-coupled 504-epoch ramp that
+            # ran the whole BC pretrain cold). A short ramp reaches peak within a window, then pretrain
+            # runs hot. Peak stays == learning_rate; only the ramp DURATION changes.
+            warmup_epochs = int(self.config.get('warmup_epochs', 0)) or self._n_pretrain * epochs_per_window
+            self.scheduler = _WarmupThenAdaptiveScheduler(
+                peak_lr=float(self.last_lr), warmup_epochs=warmup_epochs,
+                kl_threshold=getattr(self, 'kl_threshold', self.config.get('kl_threshold', 0.008)))
         self._gen_epochs = cd.get('epochs', 4)
         self._gen_minibatches = cd.get('minibatches', 4)
         # gen_replay encodes M = mb_size*(L+1) designed prefixes in ONE grad forward; L grew from 8

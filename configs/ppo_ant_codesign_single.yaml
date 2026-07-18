@@ -27,6 +27,9 @@ params:
       codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
       max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
       fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target
+      use_rope: true            # 3a WINNER (rew 2366 vs 1998 base): depth-only RoPE on module Q/K
+      reg_mode: none            # 3b: none|dropout|attention_drop (mutually exclusive)
+      dropout: 0.1              # 3b: prob used by whichever reg_mode is active (ignored if none)
 
   config:
     num_actors: 4096
@@ -34,6 +37,10 @@ params:
       scale_value: 0.01
     gamma: 0.98
     tau: 0.95
+    weight_decay: 0.01        # 3b WINNER: AdamW (CodesignAgent), 2 param groups; 0 == plain Adam
+    lr_warmup: true           # 3c WINNER (short ramp): linear 0->peak over warmup_epochs, then AKL.
+    warmup_epochs: 64         # 3c: ramp DURATION in epochs. 64 (~1 window) beat control; the old
+                              # derived span (n_pretrain*63=504) ran pretrain cold -> 465 collapse.
     learning_rate: 1.0e-3
     kl_threshold: 0.0083
     max_epochs: 3000
