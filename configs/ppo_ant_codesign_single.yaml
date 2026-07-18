@@ -64,7 +64,7 @@ params:
       epochs: 16             # BC epochs/window; each REDRAWS the teacher, so 16 = 4x fresh data, not 4x passes
       minibatches: 4
       clip: 0.2              # GenAct PPO-clip
-      entropy_coef: 0.1      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
+      entropy_coef: 0.6      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
       gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
       beta: 1.0             # control-actor KL clone coefficient
       lam: 1.0             # control-critic MSE clone coefficient
