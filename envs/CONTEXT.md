@@ -39,12 +39,3 @@ _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
 **Morphology resampling**:
 Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
 
-**Morphology split**:
-A stratified partition of a morphology set into *train morphologies* and *test morphologies*, derived deterministically from the config seed. Stratified by limb count — each limb-count stratum is split independently at `train_pct` so both halves see proportional coverage. Requires a seed; errors if `train_pct < 1.0` and no seed is set.
-_Parameters_: `train_pct: float` (fraction kept for training, default `1.0` = no split), `test_set: bool` (use test morphologies instead of train).
-
-**Train morphologies**:
-The `floor(|stratum| * train_pct)` morphologies per limb-count stratum used for training when a split is active. The default (no split) is the full morphology set.
-
-**Test morphologies**:
-The held-out morphologies not seen during training. Selected via `--test-set` in `play` or `test` mode to evaluate out-of-distribution generalization. Not applied in `random` mode (that mode bypasses the split block entirely).

@@ -1,5 +1,12 @@
 # Test mode owns its rollout loop (reuse the player for loading only)
 
+> **OBSOLETE (2026-07-26):** `test` mode, `--data-type`/`--num-samples`, the morph-value sweep, and
+> `transformer_rl/rollout.py` have all been removed. Headless checkpoint evaluation now lives in a
+> standalone `eval.py` (not a run mode). The **own-the-loop decision below still stands as the design
+> eval.py inherits** — build the player, `restore()` only, drive a custom loop reading `(mu, value)`
+> directly — but the `test`-specific specifics (`_TestDone`, `--data-type`, per-Sample resample flags)
+> are historical.
+
 Supersedes the loop half of [ADR-0003](0003-test-mode-via-env-wrapper-exception.md).
 
 ADR-0003 made `test` mode reuse rl_games' player *loop* (`runner.run({play:True})`), with a
