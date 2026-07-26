@@ -27,12 +27,6 @@ os.environ.setdefault("SDL_VIDEO_X11_WMCLASS", "vsim_render")
 # Title/class fragments used to identify the vsim render window.
 _VSIM_WINDOW_TITLES = ["vsim_render", "vsim", "vlearn"]
 
-_LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
-
-
-def _morph_label(limbs) -> str:
-    return "·".join(_LIMB_CODE[n] for n in sorted(limbs))
-
 
 class _PlayLimiter:
     """Wraps env; stops play after max_steps total steps."""
@@ -51,197 +45,6 @@ class _PlayLimiter:
         if self._count >= self._max:
             self._env.render_finished = True
         return result
-
-
-def _print_and_save_test_results(
-    scores: list[list[float]],
-    groups: list[dict],
-    checkpoint_path,
-    split_labels: dict[int, str] | None = None,
-) -> None:
-    import numpy as np
-    import matplotlib
-    matplotlib.use('Agg', force=False)
-    import matplotlib.pyplot as plt
-    import csv as _csv
-    from matplotlib.patches import Patch
-
-    morphs = [sorted(g['morph'].legs) for g in groups]
-    labels = [_morph_label(m) for m in morphs]
-    limb_counts = [len(m) for m in morphs]
-    has_split = split_labels is not None
-
-    rows = []
-    for gi, ep_scores in enumerate(scores):
-        if not ep_scores:
-            continue
-        arr = np.array(ep_scores, dtype=np.float32)
-        row = {
-            'gi': gi, 'morph': labels[gi], 'limbs': limb_counts[gi],
-            'n': len(arr), 'mean': float(arr.mean()),
-            'median': float(np.median(arr)), 'std': float(arr.std()),
-            'min': float(arr.min()), 'max': float(arr.max()),
-        }
-        if has_split:
-            row['split'] = split_labels.get(gi, 'train')
-        rows.append(row)
-    rows.sort(key=lambda r: r['mean'], reverse=True)
-
-    all_scores = np.array([s for ep in scores for s in ep], dtype=np.float32)
-
-    def _stats(arr):
-        a = np.array(arr, dtype=np.float32)
-        return {'n': len(a), 'mean': a.mean(), 'median': float(np.median(a)),
-                'std': a.std(), 'min': a.min(), 'max': a.max()}
-
-    # Per-limb group summaries, optionally broken down by split
-    by_limbs: dict[tuple, list[float]] = {}  # key = (split, limbs) or (limbs,)
-    for r in rows:
-        key = (r.get('split', ''), r['limbs']) if has_split else (r['limbs'],)
-        by_limbs.setdefault(key, []).extend(scores[r['gi']])
-    limb_rows = {k: _stats(v) for k, v in sorted(by_limbs.items())}
-
-    # Split-level summaries
-    split_rows: dict[str, dict] = {}
-    if has_split:
-        by_split: dict[str, list[float]] = {}
-        for r in rows:
-            by_split.setdefault(r['split'], []).extend(scores[r['gi']])
-        split_rows = {sp: _stats(v) for sp, v in sorted(by_split.items())}
-
-    # Console
-    W = 20
-    hdr = f"{'morph':<{W}} {'limbs':>4} {'n':>5} {'mean':>8} {'med':>8} {'std':>8} {'min':>8} {'max':>8}"
-    sep = '-' * len(hdr)
-    print(f"\n{'='*len(hdr)}\n{hdr}\n{sep}")
-    for r in rows:
-        print(f"{r['morph']:<{W}} {r['limbs']:>4} {r['n']:>5} {r['mean']:>8.2f} "
-              f"{r['median']:>8.2f} {r['std']:>8.2f} {r['min']:>8.2f} {r['max']:>8.2f}")
-    print(sep)
-    for key, s in limb_rows.items():
-        lbl = f"{key[0]} {key[1]}L" if has_split else f"{key[0]}L group"
-        print(f"{lbl:<{W}} {key[-1]:>4} {s['n']:>5} {s['mean']:>8.2f} "
-              f"{s['median']:>8.2f} {s['std']:>8.2f} {s['min']:>8.2f} {s['max']:>8.2f}")
-    print(sep)
-    if has_split:
-        for sp, s in split_rows.items():
-            print(f"{sp.upper():<{W}} {'':>4} {s['n']:>5} {s['mean']:>8.2f} "
-                  f"{s['median']:>8.2f} {s['std']:>8.2f} {s['min']:>8.2f} {s['max']:>8.2f}")
-        print(sep)
-    a = all_scores
-    print(f"{'GLOBAL':<{W}} {'':>4} {len(a):>5} {a.mean():>8.2f} "
-          f"{np.median(a):>8.2f} {a.std():>8.2f} {a.min():>8.2f} {a.max():>8.2f}")
-    print('=' * len(hdr), '\n')
-
-    if checkpoint_path is None:
-        return
-
-    out_dir = Path(checkpoint_path).parent.parent / "results"
-    out_dir.mkdir(exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stem = f"test_{timestamp}"
-
-    def _f(v): return f"{v:.2f}"
-
-    # Markdown summary
-    def _md_stats_row(prefix, s):
-        return f"| {prefix} | {s['n']} | {_f(s['mean'])} | {_f(s['median'])} | {_f(s['std'])} | {_f(s['min'])} | {_f(s['max'])} |"
-
-    md_lines = [
-        f"# Test Results — {timestamp}",
-        f"",
-        f"**Checkpoint**: `{checkpoint_path}`",
-        f"",
-        f"## Summary",
-        f"",
-        f"| group | n | mean | median | std | min | max |",
-        f"|:------|--:|-----:|-------:|----:|----:|----:|",
-    ]
-    if has_split:
-        for sp, s in split_rows.items():
-            md_lines.append(_md_stats_row(sp, s))
-    md_lines.append(_md_stats_row("**global**", _stats(all_scores)))
-    limb_hdr = "| split | limbs |" if has_split else "| limbs |"
-    limb_sep = "|:------|-----:|" if has_split else "|-----:|"
-    md_lines += [
-        f"",
-        f"## By Limb Count",
-        f"",
-        f"{limb_hdr} n | mean | median | std | min | max |",
-        f"{limb_sep}--:|-----:|-------:|----:|----:|----:|",
-    ]
-    for key, s in limb_rows.items():
-        prefix = f"{key[0]} | {key[1]}" if has_split else str(key[0])
-        md_lines.append(_md_stats_row(prefix, s))
-    split_col = " split |" if has_split else ""
-    split_sep = ":------:|" if has_split else ""
-    md_lines += [
-        f"",
-        f"## Per Morphology",
-        f"",
-        f"| morph | limbs |{split_col} n | mean | median | std | min | max |",
-        f"|:------|-----:|{split_sep}--:|-----:|-------:|----:|----:|----:|",
-    ]
-    for r in rows:
-        sc = f" {r['split']} |" if has_split else ""
-        md_lines.append(
-            f"| {r['morph']} | {r['limbs']} |{sc} {r['n']} | {_f(r['mean'])} |"
-            f" {_f(r['median'])} | {_f(r['std'])} | {_f(r['min'])} | {_f(r['max'])} |"
-        )
-    md_path = out_dir / f"{stem}.md"
-    md_path.write_text("\n".join(md_lines) + "\n")
-    print(f"[test] MD   → {md_path}")
-
-    # CSV
-    csv_path = out_dir / f"{stem}.csv"
-    fields = ['morph', 'limbs', 'split', 'n', 'mean', 'median', 'std', 'min', 'max'] if has_split \
-        else ['morph', 'limbs', 'n', 'mean', 'median', 'std', 'min', 'max']
-    with open(csv_path, 'w', newline='') as f:
-        w = _csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
-        w.writeheader()
-        w.writerows(rows)
-    print(f"[test] CSV  → {csv_path}")
-
-    # Bar chart
-    png_path = out_dir / f"{stem}.png"
-    n = len(rows)
-    fig, ax = plt.subplots(figsize=(max(10, n * 0.45), 5))
-
-    if not has_split:
-        unique_limbs = sorted(set(r['limbs'] for r in rows))
-        cmap = plt.cm.get_cmap('tab10', len(unique_limbs))
-        limb_color = {l: cmap(i) for i, l in enumerate(unique_limbs)}
-        colors = [limb_color[r['limbs']] for r in rows]
-        legend_handles = [Patch(color=limb_color[l], label=f'{l} limbs') for l in unique_limbs]
-    else:
-        def _shade(i, n): return 0.45 + 0.4 * (i / max(1, n - 1))
-        train_limbs = sorted(set(r['limbs'] for r in rows if r.get('split') == 'train'))
-        test_limbs  = sorted(set(r['limbs'] for r in rows if r.get('split') == 'test'))
-        train_color = {l: plt.cm.Blues(_shade(i, len(train_limbs)))   for i, l in enumerate(train_limbs)}
-        test_color  = {l: plt.cm.Oranges(_shade(i, len(test_limbs)))  for i, l in enumerate(test_limbs)}
-        colors = [
-            train_color.get(r['limbs'], plt.cm.Blues(0.6)) if r.get('split') == 'train'
-            else test_color.get(r['limbs'], plt.cm.Oranges(0.6))
-            for r in rows
-        ]
-        legend_handles = (
-            [Patch(color=train_color[l], label=f'train {l}L') for l in train_limbs] +
-            [Patch(color=test_color[l],  label=f'test {l}L')  for l in test_limbs]
-        )
-
-    means = [r['mean'] for r in rows]
-    stds  = [r['std']  for r in rows]
-    ax.bar(range(n), means, yerr=stds, color=colors, capsize=3, alpha=0.85)
-    ax.set_xticks(range(n))
-    ax.set_xticklabels([r['morph'] for r in rows], rotation=45, ha='right', fontsize=7)
-    ax.set_ylabel('mean episode reward ± std')
-    suffix = ' (train vs test)' if has_split else ''
-    ax.set_title(f'test results{suffix}  ({n} morphs, {len(a)} total episodes)')
-    ax.legend(handles=legend_handles)
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=150)
-    plt.close(fig)
-    print(f"[test] Chart → {png_path}")
 
 
 def _str_to_bool(s: str) -> bool:
@@ -887,7 +690,6 @@ def run_training(
     model: str = "continuous_a2c_logstd",
     extra_args_fn=None,
     post_config_fn=None,
-    morphology_set: list | None = None,
 ) -> None:
     import torch
     import gymnasium.spaces
@@ -928,7 +730,7 @@ def run_training(
 
     # --- Arg parsing ---
     parser = ArgumentParser()
-    parser.add_argument("mode", nargs="?", choices=["train", "play", "random", "test"], default="train")
+    parser.add_argument("mode", nargs="?", choices=["train", "play", "random"], default="train")
     parser.add_argument("checkpoint", nargs="?", default=None)
     parser.add_argument("--num-episodes", type=int, default=None, dest="num_episodes")
     parser.add_argument("--seed", type=int)
@@ -946,19 +748,6 @@ def run_training(
                         help="Enable per-node memory profiling (perf/mem_*); adds syncs + reset_peak.")
     parser.add_argument("--minibatch_size", type=int, default=None,
                         help="Override params.config.minibatch_size (e.g. 16384 to fit aux heads).")
-    parser.add_argument("--train-pct", type=float, default=None, dest="train_pct",
-                        help="Fraction of morphologies for training (rest = test set).")
-    parser.add_argument("--test-set", action="store_true", default=None, dest="test_set",
-                        help="Use held-out test morphologies (play/test only).")
-    parser.add_argument("--compare", action="store_true", default=False,
-                        help="Test mode: run on full morph set, chart train vs test morphs.")
-    parser.add_argument("--data-type", choices=["summary", "full"], default="summary",
-                        dest="data_type",
-                        help="Test mode: 'summary' = per-morph score table; "
-                             "'full' = per-step value/reward traces + per-env CSV (morph-value sweep).")
-    parser.add_argument("--num-samples", type=int, default=1, dest="num_samples",
-                        help="Test/full: number of fresh morphology draws (resample between). "
-                             "Requires env sample_morphs=True when > 1.")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VAL", dest="set_keys",
                         help="Override any config key by dotted path, repeatable. VAL is YAML-parsed. "
                              "e.g. --set params.config.generator.entropy_coef=0.3")
@@ -989,10 +778,6 @@ def run_training(
     if mode == "random":
         _run_random(env_class, args, video_path=video_path, num_episodes=args.num_episodes or 1)
         return
-
-    if mode == "test" and not checkpoint:
-        print("Error: checkpoint required for test mode")
-        sys.exit(1)
 
     # --- Config loading ---
     config_path = args.config if args.config is not None \
@@ -1072,57 +857,6 @@ def run_training(
     if post_config_fn is not None:
         post_config_fn(args, config)
 
-    # --- Morph split (multi-morph envs only) ---
-    compare_labels_ref: list[dict | None] = [None]
-    if morphology_set is not None:
-        from envs.ant_envs.ant_multimorph import morph_split
-        env_cfg = config.setdefault("env", {})
-        train_pct = args.train_pct if args.train_pct is not None else env_cfg.get("train_pct", 1.0)
-        test_set = args.test_set if args.test_set is not None else env_cfg.get("test_set", False)
-
-        if args.compare and mode != "test":
-            raise SystemExit("--compare is only valid in test mode")
-        if args.compare and test_set:
-            raise SystemExit("--compare is incompatible with --test-set")
-        if args.compare and train_pct >= 1.0:
-            raise SystemExit("--compare requires --train-pct < 1.0")
-
-        if train_pct < 1.0:
-            seed = config["params"].get("seed") or args.seed
-            if seed is None:
-                raise SystemExit("--seed is required when --train-pct < 1.0")
-            if args.compare:
-                train_morphs = set(morph_split(morphology_set, train_pct, seed, False))
-                compare_labels_ref[0] = {
-                    gi: ('train' if morphology_set[gi] in train_morphs else 'test')
-                    for gi in range(len(morphology_set))
-                }
-                effective = morphology_set
-                env_cfg["train_pct"] = 1.0
-                env_cfg["test_set"] = False
-            else:
-                effective = morph_split(morphology_set, train_pct, seed, test_set)
-        else:
-            effective = morphology_set
-
-        if not args.compare:
-            env_cfg["train_pct"] = train_pct
-            env_cfg["test_set"] = test_set
-
-        n_total = len(morphology_set)
-        n_morphs = len(effective)
-        n_train = n_total - n_morphs if test_set else n_morphs
-        n_test = n_total - n_train
-        label = "compare (train+test)" if args.compare else ("test" if test_set else "train")
-        print(f"[morphs] {label} set: {n_morphs}/{n_total}  "
-              f"(train={n_train}, test={n_test}, train_pct={train_pct:.2f})")
-        if test_set and mode == "train":
-            print("[WARNING] Training on test morphologies — omit --test-set when evaluating to measure generalization.")
-
-        n_envs = config["params"]["config"]["num_actors"]
-        epm = max(1, n_envs // n_morphs)
-        config["params"]["config"]["num_actors"] = n_morphs * epm
-
     # --- Minibatch adjustment ---
     ppo_cfg = config["params"]["config"]
     if "horizon_length" in ppo_cfg:
@@ -1139,7 +873,6 @@ def run_training(
         args.headless = "False"
     elif args.headless is None:
         args.headless = "False" if mode == "play" else "True"
-        # test is headless by default (already covered by "True" above)
     rendering = not _str_to_bool(args.headless)
 
     resolved_seed = args.seed if args.seed is not None else config["params"].get("seed")
@@ -1162,17 +895,13 @@ def run_training(
 
     # --- Env + vecenv registration ---
     num_episodes = args.num_episodes
-    env_ref: list = [None]   # test mode owns the rollout loop; keep a handle to the real env
 
     def create_envs(n, **kw):
         assert torch.cuda.is_available()
         device = torch.device("cuda:0")
         envs = env_class(n, device, **env_kwargs)
-        if mode in ("play", "test"):
+        if mode == "play":
             envs.inference_mode_post_init_callback()
-        if mode == "test":
-            env_ref[0] = envs
-            return NewToOldAPICompatilibity(envs)
         if switch is not None:                       # drop arch-incompatible runs (mixed-gen dirs)
             skipped = switch.filter_compatible(
                 math.prod(envs.observation_space.shape), math.prod(envs.action_space.shape))
@@ -1233,7 +962,7 @@ def run_training(
     runner.algo_factory.register_builder(
         'codesign_continuous', lambda **kwargs: CodesignAgent(**kwargs)
     )
-    # Play/test use rl_games' Player, not the agent. PPG shares the standard continuous net so the
+    # Play uses rl_games' Player, not the agent. PPG shares the standard continuous net so the
     # stock player runs it; codesign uses a custom player that samples bodies from the trained
     # generator distribution each episode (else it would just show the fixed base morph).
     # All three share SwitchMixin so play can hot-swap checkpoints (inert when switch=None).
@@ -1251,35 +980,6 @@ def run_training(
     runner.player_factory.register_builder('ppg_continuous', _mk_player(SwitchablePlayer))
     runner.player_factory.register_builder('codesign_continuous', _mk_player(CodesignPlayer))
     runner.load(config)
-
-    # test mode owns its rollout loop (ADR-0007): reuse the player only to restore the
-    # checkpoint (weights + obs/value normalizers), then drive our own loop so we can read
-    # per-step value estimates and resample the morph set between Samples.
-    if mode == "test":
-        if args.num_samples > 1 and not config.get("env", {}).get("sample_morphs", False):
-            raise SystemExit("--num-samples > 1 requires an env with sample_morphs=True (full ant)")
-        if args.data_type == "summary" and args.num_samples > 1:
-            raise SystemExit("--num-samples > 1 requires --data-type full")
-        ep = num_episodes if num_episodes is not None else 10
-        if args.data_type == "full":
-            print(f"[test] full capture: {args.num_samples} sample(s), first episode/env  "
-                  f"|  checkpoint: {checkpoint}")
-        else:
-            print(f"[test] summary: {ep} episodes per env slot  |  checkpoint: {checkpoint}")
-
-        from .rollout import run_test_rollout
-        player = runner.create_player()
-        player.restore(checkpoint)
-        reward_scale = config["params"]["config"].get("reward_shaper", {}).get("scale_value", 1.0)
-        # Output key: explicit --name, else the checkpoint's run-dir name (.../<run>/nn/<ckpt>.pth),
-        # so distinct runs don't collide on the shared checkpoint filename.
-        out_stem = args.name or Path(checkpoint).resolve().parent.parent.name
-        run_test_rollout(
-            player, env_ref[0], data_type=args.data_type, num_episodes=ep,
-            num_samples=args.num_samples, reward_scale=reward_scale, checkpoint=checkpoint,
-            out_stem=out_stem, split_labels=compare_labels_ref[0],
-        )
-        return
 
     run_args = {"train": mode == "train", "play": mode == "play"}
     if checkpoint:
