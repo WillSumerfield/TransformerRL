@@ -3,7 +3,10 @@
 Adds, per epoch, on top of rl_games' built-ins (enable via use_diagnostics=True,
 which gives diagnostics/exp_var, diagnostics/clip_frac/*, diagnostics/rms_value/*):
 
-    control/sigma_{mean,min,max} exploration std = exp(log_std); min is the log_std-collapse canary
+    control/sigma_{mean,max}     exploration std = exp(log_std), usage-weighted over ACTIVE DOF dims
+                                 only (mu!=0); dead dims -- depth > max_effectors, never an effector,
+                                 pinned at sigma=1 -- are dropped so they no longer poison mean/max
+    control/sigma_min            log_std-collapse canary (over all dims; active dims are the smallest)
     control/action_sat           frac of *active* mean-action dims pinned at the tanh rail (|mu|>0.99)
     control/grad_norm            total grad norm BEFORE clipping (clip_grad_norm_ return)
     control/adv_{mean,std}       raw advantage (returns-values) BEFORE normalization -> true scale
@@ -39,6 +42,7 @@ class LoggingA2CAgent(A2CAgent):
         super().__init__(base_name, params)
         self._grad_norms: list[float] = []   # per-minibatch, flushed per epoch
         self._action_sats: list[float] = []  # per-minibatch, flushed per epoch
+        self._dof_active = None              # per-DOF activation count (usage weights), flushed/epoch
         self._adv_mean: float | None = None  # per-epoch (set in prepare_dataset)
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
@@ -212,11 +216,15 @@ class LoggingA2CAgent(A2CAgent):
         # train_result = (a_loss, c_loss, entropy, kl, lr, lr_mul, mu, sigma, b_loss)
         with torch.no_grad():
             mu = self.train_result[6]
+            # Inactive dims are masked to exactly 0 in our nets, so |mu|>eps selects active dims
+            # (and is all dims for an MLP) -> saturation measured over active dims only.
+            active = mu.abs() > 1e-6                    # (minibatch, n_act)
             saturated = (mu.abs() > 0.99).float().sum()
-            # Inactive dims are masked to exactly 0 in our nets, so |mu|>eps selects active
-            # dims (and is all dims for an MLP) -> saturation measured over active dims only.
-            active = (mu.abs() > 1e-6).float().sum().clamp(min=1.0)
-            self._action_sats.append((saturated / active).item())
+            self._action_sats.append((saturated / active.float().sum().clamp(min=1.0)).item())
+            # per-DOF activation frequency over the batch -> usage weights for control/sigma_* (M2:
+            # a dead DOF -- depth > max_effectors, never holds an effector -> mu==0 -> weight 0).
+            cnt = active.float().sum(dim=0)             # (n_act,)
+            self._dof_active = cnt if self._dof_active is None else self._dof_active + cnt
 
     def calc_gradients(self, input_dict):
         super().calc_gradients(input_dict)
@@ -247,9 +255,17 @@ class LoggingA2CAgent(A2CAgent):
         if isinstance(logstd, torch.nn.Parameter):
             with torch.no_grad():
                 sigma = torch.exp(logstd.detach())
-            w.add_scalar('control/sigma_mean', sigma.mean().item(), frame)
-            w.add_scalar('control/sigma_min', sigma.min().item(), frame)
-            w.add_scalar('control/sigma_max', sigma.max().item(), frame)
+            wt = self._dof_active                       # per-DOF usage weights over the epoch's batch
+            if wt is not None and wt.numel() == sigma.numel() and float(wt.sum()) > 0:
+                wt = wt.to(sigma.device)
+                sig_mean = (sigma * wt).sum().item() / wt.sum().item()   # usage-weighted, active DOF
+                sig_max = sigma[wt > 0].max().item()                     # active dims only (dead=1.0)
+            else:                                        # MLP (mu never exactly 0) / pre-first-update
+                sig_mean, sig_max = sigma.mean().item(), sigma.max().item()
+            w.add_scalar('control/sigma_mean', sig_mean, frame)
+            w.add_scalar('control/sigma_min', sigma.min().item(), frame)   # active dims are smallest
+            w.add_scalar('control/sigma_max', sig_max, frame)
+        self._dof_active = None                          # flush per-epoch, like _grad_norms
 
         if self._grad_norms:
             w.add_scalar('control/grad_norm', sum(self._grad_norms) / len(self._grad_norms), frame)
