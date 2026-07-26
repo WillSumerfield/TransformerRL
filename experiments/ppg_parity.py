@@ -30,7 +30,7 @@ import yaml
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
-from transformer_rl.models import MultiMorphLimbTransformerBuilder
+from transformer_rl.models import MultiMorphLimbTransformerBuilder, _raw_tail
 from transformer_rl.tokenize import OBS_DIM_8, LEN_DIM_8, MASK_DIM_8
 from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _stable_morphologies
 
@@ -137,8 +137,10 @@ def _rollout_return(net, obs_norm, env, device, obs_base: int = _OBS_TOTAL, mask
     obs, _ = env.reset()
     for _ in range(L):
         normed = obs_norm(obs).clone()
-        _m0 = obs_base - mask_dim                           # mask = last mask_dim of the base obs
-        normed[..., _m0:obs_base] = obs[..., _m0:obs_base]  # raw mask; progress dim (value_size 2) sits past obs_base
+        # Restore the RAW {0,1} tail (DOF mask + Phase-5 is_cap/subtype one-hots) exactly as
+        # models.TransformerMaskedNorm does — derived from the net so it tracks the obs layout.
+        _t0, _td = _raw_tail(net.net)
+        normed[..., _t0:_t0 + _td] = obs[..., _t0:_t0 + _td]
         mu, _, _, _ = net({"obs": normed})
         obs, rew, term, trunc, _ = env.step(mu.clamp(-1.0, 1.0))
         rew = rew.squeeze(-1) if rew.ndim > 1 else rew
