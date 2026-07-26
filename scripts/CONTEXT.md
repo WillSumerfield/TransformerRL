@@ -1,30 +1,27 @@
 # Training
 
-PPO training, Optuna tuning, and play/render/test orchestration for the limb transformer over the ant envs. Owns `scripts/` and `configs/`. Each `train_ant_*.py` pairs with a `configs/ppo_*.yaml`; configs select the registered network/model by name and the env by `env_name`.
+PPO training, Optuna tuning, play/render orchestration, and headless checkpoint evaluation for the limb transformer over the ant envs. Owns `scripts/` and `configs/`. Each `train_ant_*.py` pairs with a `configs/ppo_*.yaml`; configs select the registered network/model by name and the env by `env_name`. `eval.py` is standalone (not paired with a config — it reads each run's stamped `config.yaml`).
 
 ## Language
 
 **Run mode**:
-The first positional arg to any `train_ant_*.py`: `train` (default), `play`, `random`, or `test`. Headless defaults: `train` and `test` are headless; `play` opens a render window. `--video` is not supported in `train` mode. In `play` the positional checkpoint arg accepts a directory (see [Controller](#) / [Policy switching](#)), not just a `.pth` file; `test` still takes a single `.pth`.
+The first positional arg to any `train_ant_*.py`: `train` (default), `play`, or `random`. Headless defaults: `train` is headless; `play` opens a render window. `--video` is not supported in `train` mode. In `play` the positional checkpoint arg accepts a directory (see [Controller](#) / [Policy switching](#)), not just a `.pth` file. Headless checkpoint evaluation is a separate concern owned by `eval.py` (not a run mode).
 
 **Run name**:
 The leaf label identifying a single training run, the last segment of its output dir (`runs/<env>/<model>/<run-name>`). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.
 
-**test mode**:
-Headless evaluation mode. Requires a checkpoint. Owns its own rollout loop (reuses the rl_games player only to restore the checkpoint; see [ADR-0007](../docs/adr/0007-test-mode-owns-rollout-loop.md)). Two `--data-type`s: `summary` (default) runs a fixed number of episodes per env slot, then prints a per-morph results table and saves a CSV, bar-chart PNG, and markdown summary to `results/` alongside the checkpoint; `full` runs the [morph-value sweep](../experiments/CONTEXT.md) — one self-contained `.npz` (per-step value/reward traces + per-env morph features) to `data/morph_value_sweep/`, keyed by the checkpoint's run-dir name or `--name`.
-_Avoid_: calling it "evaluation" (ambiguous with rl_games internal eval metrics).
-
-**`--data-type`** / **`--num-samples`** (`test` only):
-`--data-type summary|full` selects the per-morph score table vs the full per-step capture. `--num-samples N` is the number of fresh morphology draws (resample between [Samples](../experiments/CONTEXT.md)); default 1, hard-errors if `>1` unless the env has `sample_morphs=True`, and requires `--data-type full`. The sweep uses `--num-samples 5 --num-episodes 1 --data-type full`; run once per checkpoint, same `--seed`, to align the morph draws across models. The `.npz` is keyed by the checkpoint's run-dir name; pass `--name <label>` to override (the notebook's `STEMS` list these labels).
-
 **`--num-episodes`**:
-In `test` mode: episodes per env slot to collect (default 10). In `play` mode: stops the player after `num_episodes × max_episode_length` total steps (default: runs until window closed). When `--video` is set in `play` or `random` mode: bounds recording duration (default 1 episode when unset).
+In `play` mode: stops the player after `num_episodes × max_episode_length` total steps (default: runs until window closed). When `--video` is set in `play` or `random` mode: bounds recording duration (default 1 episode when unset).
 
-**`morphology_set`**:
-Optional parameter to `run_training`. When provided, enables `--train-pct`/`--test-set` CLI flags and handles morphology-count snapping of `num_actors`. Pass the full morphology list for the env; `run_training` computes the effective subset. Multi-morph scripts pass this; single-morph scripts (`mlp`, `transformer`) do not. `--test-set` works in all modes including `train`; training on the test split prints a reminder to omit `--test-set` when evaluating generalization.
+**Eval** (`scripts/eval.py`):
+Standalone headless checkpoint evaluation, decoupling a **control policy** from a **body source** so the same policy is scored across body distributions. Loads a run's checkpoint (best by default, or `--epochs`), pairs it with each body source, and rolls out `--episodes` deterministic-`mu` episodes per body over a **fixed** body population (one body per env; drawn once, held — never resampled mid-run). Reports per-body reward (mean, top-k), robustness (fall rate, episode length), generator [diversity + committance](../experiments/CONTEXT.md), and value calibration. Runs are compared **side-by-side**: one wide CSV row per (run, epoch) written to `evals/` (git-ignored). Reuses the lightweight `experiments/` load+rollout path, not the rl_games runner.
+_Avoid_: calling it a "run mode" — it is a separate script, deliberately not a `train_ant_*.py` positional mode.
 
-**`--compare`**:
-`test` mode flag. Requires `--train-pct < 1.0` and a seed. Runs the full morphology set in one env instance, then labels each morph's scores as train or test post-hoc. The Summary and By Limb Count sections of all outputs break down stats by split (train row, test row, global row). Produces a single chart with blues (train morphs, shaded by limb count) and oranges (test morphs, shaded by limb count). Incompatible with `--test-set`.
+**Body source** (eval):
+Where each evaluated body comes from, held independent of the control policy. Three, all unrolling the generator's grammar-masked MDP (`net.sample` mode): **general** — the trained generator's stochastic draw (in-distribution performance); **best morph** — greedy/argmax decode, the generator's *committed* body; **random** — uniform over the grammar-valid set, i.e. a random policy on the same MDP, doubling as the diversity reference and the baseline for **gen-advantage-over-random**.
+
+**Gen-advantage-over-random**:
+Mean control reward on the generator's bodies minus on random bodies, with the *same* control policy. The headline "did the generator learn to pick better bodies than chance" number. Co-adapted (control trained on generator bodies), so read as a paired comparison, not a pure generator score.
 
 **Follow camera**:
 The viewer's camera controller in `play`/`random`. Has three viewing states: **auto-cycle** (default — hops to a random robot each episode), **manual-follow** (locked to one operator-chosen group+env, persists across episode resets), and **free-cam** (camera detached, driven by the renderer's built-in WASD/drag). Group = morphology (`EnvironmentGroup`), env = one robot instance within it. Auto-cycle and manual-follow are mutually exclusive; free-cam is an orthogonal overlay that restores the prior state on exit.
@@ -43,7 +40,7 @@ The epoch dropdown lists a run's `nn/` checkpoints with **best** on top (the bar
 _Avoid_: calling the run dropdown the "model" dropdown in prose — it selects **runs** within one `<model>` dir; all share one architecture, which is what makes live restore shape-safe.
 
 **Episode score**:
-Cumulative raw reward over one episode (sum of `_rew_buf` across steps until termination or truncation). The unit of measurement in `test` mode results.
+Cumulative raw reward over one episode (sum of `_rew_buf` across steps until termination or truncation).
 
 **`resample_interval`**:
 Config knob (full ant only): episodes between morphology resamples. The training agent rebuilds the sim with a fresh sampled body set every `resample_interval` episodes; `0` (default elsewhere) disables it. The mechanism and cost live in the Morphology context — [Morphology resampling](../envs/CONTEXT.md) and [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
