@@ -11,19 +11,29 @@ from .tokenize import (OBS_DIM_4 as OBS_DIM, MASK_DIM_4 as MASK_DIM,
 
 def _dyn_dims(net):
     """(mask_off, mask_dim, obs_total) for a MultiMorph net, from its tdims (single source of truth,
-    parameterized by (n_limbs, max_limb_length)). Phase-1 codesign: 187 / 32 / 219. Non-codesign
-    (legacy 8-limb PPG/classic, out of scope in Phase 1) falls back to the old 107/16/16 layout."""
+    parameterized by (n_limbs, max_limb_length)). Non-codesign (legacy 8-limb PPG/classic, out of
+    scope since Phase 1) falls back to the old 107/16/16 layout."""
     d = getattr(net, "tdims", None)
     if d is None:
         return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8, OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8
-    return d["obs_base"] + d["len_dim"], d["mask_dim"], d["obs_total"]
+    return d["mask_off"], d["mask_dim"], d["obs_total"]
 
 
-def _restore_mask_tail(normed, observation, mask_off, mask_dim, normalize_input):
-    """Re-insert the raw {0,1} DOF mask after normalization (front offset [mask_off:mask_off+dim])."""
+def _raw_tail(net):
+    """(offset, dim) of the block kept UNNORMALIZED: DOF mask + (Phase 5) is_cap + subtype one-hot.
+    Every channel there is exactly {0,1} and is read back with a `> 0` threshold, which a normalized
+    channel would break (a constant channel collapses to ~0 -> misread as absent)."""
+    d = getattr(net, "tdims", None)
+    if d is None:
+        return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8
+    return d["raw_tail_off"], d["raw_tail_dim"]
+
+
+def _restore_mask_tail(normed, observation, off, dim, normalize_input):
+    """Re-insert the raw {0,1} mask/type tail after normalization ([off : off+dim])."""
     if normalize_input:
         normed = normed.clone()
-        normed[..., mask_off:mask_off + mask_dim] = observation[..., mask_off:mask_off + mask_dim]
+        normed[..., off:off + dim] = observation[..., off:off + dim]
     return normed
 
 
@@ -124,6 +134,7 @@ class TransformerMaskedNorm(ModelA2CContinuousLogStd):
         def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
             self._mask_off, self._mask_dim, exp_total = _dyn_dims(a2c_network.net)
+            self._tail_off, self._tail_dim = _raw_tail(a2c_network.net)
             obs_total = self.obs_shape[0] if isinstance(self.obs_shape, (tuple, list)) else self.obs_shape
             assert obs_total == exp_total, (
                 f"transformer_masked_a2c_logstd expects obs of {exp_total}, got {obs_total}"
@@ -131,7 +142,7 @@ class TransformerMaskedNorm(ModelA2CContinuousLogStd):
 
         def norm_obs(self, observation):
             return _restore_mask_tail(super().norm_obs(observation), observation,
-                                      self._mask_off, self._mask_dim, self.normalize_input)
+                                      self._tail_off, self._tail_dim, self.normalize_input)
 
 
 class MultiMorphValueBuilder(NetworkBuilder):
@@ -171,6 +182,7 @@ class TransformerMaskedValue(ModelA2CContinuousLogStd):
         def __init__(self, a2c_network, **kwargs):
             super().__init__(a2c_network, **kwargs)
             self._mask_off, self._mask_dim, exp_total = _dyn_dims(a2c_network.net)
+            self._tail_off, self._tail_dim = _raw_tail(a2c_network.net)
             obs_total = self.obs_shape[0] if isinstance(self.obs_shape, (tuple, list)) else self.obs_shape
             assert obs_total == exp_total, (
                 f"transformer_masked_value expects obs of {exp_total}, got {obs_total}"
@@ -178,7 +190,7 @@ class TransformerMaskedValue(ModelA2CContinuousLogStd):
 
         def norm_obs(self, observation):
             return _restore_mask_tail(super().norm_obs(observation), observation,
-                                      self._mask_off, self._mask_dim, self.normalize_input)
+                                      self._tail_off, self._tail_dim, self.normalize_input)
 
         def forward(self, input_dict):
             is_train = input_dict.get('is_train', True)

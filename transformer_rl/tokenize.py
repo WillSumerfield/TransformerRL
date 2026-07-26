@@ -1,6 +1,8 @@
 import math
 import torch
 
+from .vocab import CAP_BARE, N_SUB
+
 ROOT_DIM = 11   # y(1) + quat(4) + linvel(3) + angvel(3)
 EFF0_DIM   = 5    # pos(1) + vel(1) + last_action(1) + sin(1) + cos(1)
 EFF1_DIM = 11   # pos(1) + vel(1) + cfrc(6) + last_action(1) + sin(1) + cos(1)
@@ -80,9 +82,15 @@ def tokenize_8(obs):
 # RELATIVE-TO-PARENT (parent-local frame), computed ENV-SIDE and written into obs BEFORE the
 # RunningMeanStd normalizer (so it only ever sees already-6D features).
 #   obs: root(13) | [sin cos vel act] (n_dof each) | [relpos(3) relrot(6) relvel(6)] (per module)
-#        | sensors(n_limbs*6) | lengths(n_dof) | mask(n_dof)
+#        | sensors(n_limbs*6) | lengths(n_dof) | mask(n_dof) | is_cap(n_dof) | sub_oh(n_dof*4)
 # `lengths` stays in obs (constant per body; consumed by the diversity harness, NOT the token) — so
-# obs_base/len_dim/obs_total keep phase-1 semantics and their downstream readers are unchanged.
+# obs_base/len_dim keep phase-1 semantics and their downstream readers are unchanged.
+# Phase 5: per-module TYPE ids ride obs as the is_cap flag + subtype one-hot (constant per body,
+# like mask/lengths). They live in the RAW TAIL [mask_off : obs_total] that models._restore_mask_tail
+# re-inserts UNNORMALIZED after RunningMeanStd — every channel there is exactly {0,1}, so the
+# `> 0` threshold reads them back bit-exactly (a normalized constant channel collapses to ~0 and
+# would be misread as absent). CATEGORY is derived, not stored: effector <=> mask>0, cap <=> is_cap>0,
+# pad <=> neither.
 ROOT_DIM_P2 = 13   # y(1) + rot6d(6) + linvel(3) + angvel(3)   (quat->6D; vs phase-1 ROOT_DIM=11)
 # per-module dynamic obs blocks (SoA, depth-major slot order): (name, width). cfrc is NOT here — it
 # rides the shared per-limb sensor block, routed to each limb's terminal module below.
@@ -94,12 +102,18 @@ MODULE_DIM = 25   # token content: sin, cos, vel, act, cfrc(6), relpos(3), relro
 
 def token_dims(n_limbs: int, max_len: int) -> dict:
     """Derived obs/token dims. slot(n,d)=(d-1)*n_limbs+(n-1) depth-major; sensors stay per-limb (6).
-    obs_base = start of the lengths block (== phase-1 semantics, so mask_off = obs_base + len_dim)."""
+    obs_base = start of the lengths block (== phase-1 semantics, so mask_off = obs_base + len_dim).
+    raw_tail_off/raw_tail_dim span mask+is_cap+sub_oh — the block models.py keeps UNNORMALIZED."""
     n_dof = n_limbs * max_len
     sens_off = ROOT_DIM_P2 + MODULE_DYN * n_dof                    # start of per-limb contact sensors
     obs_base = sens_off + n_limbs * 6                             # start of lengths block
+    mask_off = obs_base + n_dof                                   # dof mask (phase-1 offset kept)
+    cap_off = mask_off + n_dof                                    # is_cap flag  (5a)
+    sub_off = cap_off + n_dof                                     # subtype one-hot, [slot][N_SUB]
+    obs_total = sub_off + N_SUB * n_dof
     return dict(n_limbs=n_limbs, max_len=max_len, n_dof=n_dof, sens_off=sens_off, obs_base=obs_base,
-                len_dim=n_dof, mask_dim=n_dof, obs_total=obs_base + 2 * n_dof,
+                len_dim=n_dof, mask_dim=n_dof, mask_off=mask_off, cap_off=cap_off, sub_off=sub_off,
+                raw_tail_off=mask_off, raw_tail_dim=obs_total - mask_off, obs_total=obs_total,
                 n_module_tokens=n_dof, n_tokens=1 + n_limbs + n_dof)  # CLS + start*n + module*n_dof
 
 
@@ -110,17 +124,47 @@ def limb_enc(n_limbs: int) -> torch.Tensor:
                         dtype=torch.float32)
 
 
+def _contact_slots(eff, cap_d, sub_d, count, depth0):
+    """(B, d, n) bool: the slot carrying each limb's contact force — its cap when that cap is a
+    morphology cap (foot/pad/ball, which is what actually touches the ground), else its terminal
+    effector (the bare cap has no body, so contact stays put == phase-1 behaviour)."""
+    morph_cap = cap_d & (sub_d[..., CAP_BARE] <= 0)               # a cap that is a real body
+    is_terminal = eff & (depth0 == (count.unsqueeze(1) - 1))
+    return torch.where(morph_cap.any(dim=1, keepdim=True), morph_cap, is_terminal)
+
+
+def contact_mask(obs, n_limbs: int, max_len: int):
+    """(B, n_dof) float contact-slot mask in depth-major slot order — the routing tokenize_modules
+    uses for cfrc, exposed so the FD aux head can supervise contact on the SAME slot that observes
+    it. Returns the phase-1 terminal-effector mask when obs predates the Phase-5 type tail."""
+    B, d = obs.shape[0], token_dims(n_limbs, max_len)
+    n_dof = d["n_dof"]
+    eff = (obs[:, d["mask_off"]:d["mask_off"] + n_dof] > 0).reshape(B, max_len, n_limbs)
+    if obs.shape[1] >= d["obs_total"]:
+        cap_d = (obs[:, d["cap_off"]:d["cap_off"] + n_dof] > 0).reshape(B, max_len, n_limbs)
+        sub_d = obs[:, d["sub_off"]:d["sub_off"] + N_SUB * n_dof].reshape(B, max_len, n_limbs, N_SUB)
+    else:
+        cap_d = torch.zeros_like(eff)
+        sub_d = torch.zeros(B, max_len, n_limbs, N_SUB, device=obs.device)
+    depth0 = torch.arange(max_len, device=obs.device).view(1, max_len, 1)
+    return _contact_slots(eff, cap_d, sub_d, eff.sum(1), depth0).reshape(B, n_dof).float()
+
+
 def tokenize_modules(obs, n_limbs: int, max_len: int, enc: torch.Tensor = None):
-    """Tokenize a depth-major relative-geometry obs into (root, module_tokens, active_mask).
+    """Tokenize a depth-major relative-geometry obs into
+    (root, module_tokens, active_mask, cap_mask, sub_oh).
       root:          (B, ROOT_DIM_P2=13) = y + rot6d(6) + linvel(3) + angvel(3).
       module_tokens: (B, n_limbs*max_len, MODULE_DIM=25) canonical depth-major slot order:
                      [sin, cos, vel, act, cfrc(6), relpos(3), relrot6d(6), relvel(6)].
-      active_mask:   (B, n_limbs*max_len) 1 for real modules. cfrc rides ONLY on each limb's
-                     terminal (last active) module. `enc` is accepted for call compat but unused
-                     (per-module limb-direction feature dropped in 2a). Inactive slots stay 0."""
+      active_mask:   (B, n_dof) 1 for real EFFECTORS (== DOFs; caps are actionless, so 0).
+      cap_mask:      (B, n_dof) 1 at each present limb's cap slot (depth == #effectors).
+      sub_oh:        (B, n_dof, N_SUB) subtype one-hot; all-zero on pad slots.
+    cfrc rides the limb's CONTACT slot: the cap when it is a morphology cap (foot/pad/ball), else
+    the terminal effector (bare cap == phase-1 behaviour). `enc` is accepted for call compat but
+    unused (per-module limb-direction feature dropped in 2a). Inactive slots stay 0."""
     B = obs.shape[0]
     d = token_dims(n_limbs, max_len)
-    n_dof, sens_off, obs_base = d["n_dof"], d["sens_off"], d["obs_base"]
+    n_dof, sens_off = d["n_dof"], d["sens_off"]
     dev = obs.device
     root = obs[:, 0:ROOT_DIM_P2]
 
@@ -130,20 +174,31 @@ def tokenize_modules(obs, n_limbs: int, max_len: int, enc: torch.Tensor = None):
         parts.append(dm(obs[:, o:o + w * n_dof], w)); o += w * n_dof
     sin_d, cos_d, vel_d, act_d, relpos_d, relrot_d, relvel_d = parts
 
-    mask_off = obs_base + d["len_dim"]                            # skip the lengths block
-    raw_mask = (obs[:, mask_off:mask_off + n_dof] if obs.shape[1] >= mask_off + n_dof
-                else torch.ones(B, n_dof, device=dev))
+    has_tail = obs.shape[1] >= d["obs_total"]
+    mask_off, cap_off, sub_off = d["mask_off"], d["cap_off"], d["sub_off"]
+    raw_mask = obs[:, mask_off:mask_off + n_dof] if has_tail else torch.ones(B, n_dof, device=dev)
     mask_d = raw_mask.reshape(B, max_len, n_limbs)               # (B, d, n)
+    eff = mask_d > 0
 
-    count = mask_d.sum(dim=1)                                     # (B, n_limbs) chain length
+    count = eff.sum(dim=1)                                        # (B, n_limbs) effector-chain length
     depth0 = torch.arange(max_len, device=dev).view(1, max_len, 1)
-    is_terminal = (mask_d > 0) & (depth0 == (count.unsqueeze(1) - 1))   # (B, d, n) last active module
+    if has_tail:
+        cap_d = (obs[:, cap_off:cap_off + n_dof] > 0).reshape(B, max_len, n_limbs)
+        sub_d = dm(obs[:, sub_off:sub_off + N_SUB * n_dof], N_SUB)        # (B, d, n, N_SUB)
+    else:                                                         # pre-phase-5 obs: canonical body
+        cap_d = torch.zeros(B, max_len, n_limbs, dtype=torch.bool, device=dev)
+        sub_d = torch.zeros(B, max_len, n_limbs, N_SUB, device=dev)
+
+    # contact slot: morphology cap if this limb has one, else the terminal effector.
+    contact = _contact_slots(eff, cap_d, sub_d, count, depth0)    # (B, d, n)
     sens = obs[:, sens_off:sens_off + n_limbs * 6].view(B, n_limbs, 6)
-    cfrc = torch.where(is_terminal.unsqueeze(-1),
+    cfrc = torch.where(contact.unsqueeze(-1),
                        sens.unsqueeze(1).expand(B, max_len, n_limbs, 6),
                        torch.zeros(B, max_len, n_limbs, 6, device=dev))   # (B, d, n, 6)
 
     module = torch.cat([sin_d, cos_d, vel_d, act_d, cfrc, relpos_d, relrot_d, relvel_d], dim=-1)
     module_tokens = module.reshape(B, n_dof, MODULE_DIM)         # (B, n_dof, 25) depth-major slot order
-    active_mask   = (mask_d > 0).reshape(B, n_dof).float()
-    return root, module_tokens, active_mask
+    active_mask   = eff.reshape(B, n_dof).float()
+    cap_mask      = cap_d.reshape(B, n_dof).float()
+    sub_oh        = sub_d.reshape(B, n_dof, N_SUB)
+    return root, module_tokens, active_mask, cap_mask, sub_oh

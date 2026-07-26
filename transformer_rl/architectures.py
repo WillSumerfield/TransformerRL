@@ -7,17 +7,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_dims, limb_enc,
+                       contact_mask,
                        ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM, ROOT_DIM_P2)
+from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
+                    GEN_EFF, GEN_CAP, N_GEN_CAT, N_EFF, N_SUB, CAP_BARE)
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
-# codesign token type / mode ids (see CONTEXT.md "Codesign tokens")
-_T_ROOT, _T_START, _T_MODULE = 0, 1, 2            # uniform module token (Phase 1) — no eff0/eff1 split
-_MODE_LIVE, _MODE_COMMITTED, _MODE_STOP = 0, 1, 2
-_N_TYPE, _N_MODE = 3, 3     # type / mode vocab sizes — one-hot CONCATENATED into token content (2a)
+# codesign token category / mode ids (see CONTEXT.md "Type embedding" / "Codesign tokens").
+# Phase 5 splits phase-1's single `module` category into effector/cap and adds a SEPARATE subtype
+# one-hot; both are CONCATENATED into token content (2a convention). Pad slots (deeper than a limb's
+# cap) carry an all-zero category AND subtype one-hot.
+# mode = STATE AVAILABILITY, not token kind (the kind is the category one-hot since Phase 5):
+#   LIVE      present, physical state attached (live control pass)
+#   COMMITTED present, no physical state (design pass over a token prefix)
+#   PAD       slot deeper than this limb's cap -- absent in both passes
+_MODE_LIVE, _MODE_COMMITTED, _MODE_PAD = 0, 1, 2
+_N_MODE = 3
 _FD_MODULE_DIM = 21         # FD raw module target: relpos(3)+relrot6d(6)+relvel(6)+cfrc(6) (2b)
 _FK_MODULE_DIM = 15         # FK torso-frame target: pos(3)+rot6d(6)+vel(6, lin+ang) (2b)
-_GEN_ON, _GEN_STOP = 0, 1                          # GenAct categorical action ids {continue, stop}
 
 
 def _sixd_to_R(x6: torch.Tensor) -> torch.Tensor:
@@ -32,6 +40,11 @@ def _sixd_to_R(x6: torch.Tensor) -> torch.Tensor:
 def _R_to_sixd(R: torch.Tensor) -> torch.Tensor:
     """R (..., 3, 3) -> 6D = first two columns concatenated (matches 2a rel-rot layout)."""
     return torch.cat([R[..., :, 0], R[..., :, 1]], dim=-1)
+
+
+def _oh(ids: torch.Tensor, n: int, dtype: torch.dtype) -> torch.Tensor:
+    """One-hot with a NULL row: ids < 0 -> an all-zero vector (pad slots, root/start subtype)."""
+    return F.one_hot(ids.clamp(min=0), n).to(dtype) * (ids >= 0).unsqueeze(-1).to(dtype)
 
 
 def _make_nat_to_dof(n_limbs: int) -> torch.Tensor:
@@ -162,15 +175,19 @@ class LimbTransformer(nn.Module):
             #   slot(n,d) = (d-1)*n + (n-1)  (== ant_multimorph._slot, == env action order).
             # tdims is the single source of truth for the derived obs layout (must match the env's
             # _OBS_* constants, which derive from the SAME (n_limbs, max_limb_length)).
+            if max_limb_length < 2:
+                raise ValueError("Phase-5 grammar forces the deepest slot to a cap -> max_limb_length "
+                                 f"must be >= 2 (got {max_limb_length}); max effectors/limb = it - 1")
             self.tdims = token_dims(n_limbs, max_limb_length)
             self.n_module_tokens = self.tdims["n_module_tokens"]        # n*max_len
-            # 2a: type + mode one-hots are CONCATENATED into each token's content (not additive), so
-            # each content projection is widened by the one-hot dims. type disambiguates token kind
-            # (constant per projection today; the discriminator once module SUBTYPES share embed_module
-            # at Phase 5). mode (LIVE/COMMITTED/STOP) rides embed_module only.
-            self.embed_root   = nn.Linear(ROOT_DIM_P2 + _N_TYPE, d_model)           # override root dim
-            self.embed_module = nn.Linear(MODULE_DIM + _N_TYPE + _N_MODE, d_model)
-            self.angle_proj   = nn.Linear(2 + _N_TYPE, d_model)
+            self.max_effectors = max_limb_length - 1   # deepest slot is grammar-forced to a cap (5a)
+            # 2a: category + subtype + mode one-hots are CONCATENATED into each token's content (not
+            # additive), so each content projection is widened by the one-hot dims. category
+            # disambiguates token kind {root, start, effector, cap}; subtype (shared index, width 4)
+            # picks the concrete kind within it; mode (LIVE/COMMITTED/STOP) rides embed_module only.
+            self.embed_root   = nn.Linear(ROOT_DIM_P2 + N_CAT, d_model)             # override root dim
+            self.embed_module = nn.Linear(MODULE_DIM + N_CAT + N_SUB + _N_MODE, d_model)
+            self.angle_proj   = nn.Linear(2 + N_CAT, d_model)
 
             # additive learned embeddings (still summed on top): pos = limb slot (SHARED across start +
             # module), depth = swing(0)/knee(1..). type/mode are NOT additive anymore (see above).
@@ -182,10 +199,12 @@ class LimbTransformer(nn.Module):
             self.register_buffer("angle_enc", angle_enc, persistent=False)
 
             type_ids = torch.tensor(
-                [_T_ROOT] + [_T_START] * n_limbs + [_T_MODULE] * self.n_module_tokens,
+                [CAT_ROOT] + [CAT_START] * n_limbs + [CAT_EFFECTOR] * self.n_module_tokens,
                 dtype=torch.long)
-            # constant per-token type one-hot, concatenated into content per projection (sliced below).
-            self.register_buffer("type_oh", F.one_hot(type_ids, _N_TYPE).float(), persistent=False)
+            # Constant CLS/start category one-hots (rows 0 .. n_limbs), concatenated into content per
+            # projection. Module rows are NOT constant anymore -- each module slot's category
+            # (effector / cap / pad-null) and subtype are per-sample, built by _module_onehots.
+            self.register_buffer("type_oh", F.one_hot(type_ids, N_CAT).float(), persistent=False)
             pos_ids  = torch.tensor(
                 [0] + list(range(1, n_limbs + 1)) + list(range(1, n_limbs + 1)) * max_limb_length,
                 dtype=torch.long)
@@ -235,13 +254,18 @@ class LimbTransformer(nn.Module):
 
         if codesign_tokens:
             # generator heads on the shared trunk (single-network codesign):
-            #   GenAct    = continue/stop logits, read from each limb's START token (design mode).
+            #   GenAct    = FACTORED module-type emission, read from each limb's START token (design
+            #               mode): a CATEGORY head {effector, cap} (positionally grammar-masked) and
+            #               a SUBTYPE head (shared index, width 4) masked to the sampled category.
+            #               logp = logp(cat) + logp(sub | cat).
             #   GenCrit   = V1.0 body-quality value, read from CLS; NO time feature, evaluable on
             #               both live full-state tokens and partial designed prefixes (same weights).
             #   cls_design = learned CLS content used in design mode (generation has no root state).
-            self.gen_head = nn.Linear(d_model, 2)
-            nn.init.zeros_(self.gen_head.weight)
-            nn.init.zeros_(self.gen_head.bias)             # p_continue = 0.5 at init
+            self.gen_cat_head = nn.Linear(d_model, N_GEN_CAT)
+            self.gen_sub_head = nn.Linear(d_model, N_SUB)
+            for h in (self.gen_cat_head, self.gen_sub_head):
+                nn.init.zeros_(h.weight)
+                nn.init.zeros_(h.bias)   # uniform over the VALID set at init; p(effector)=0.5 == p1
             self.gencrit_head = nn.Linear(d_model, 1)
             self.cls_design = nn.Parameter(torch.zeros(d_model))
             # JEPA: shared learned [MASK] latent (swapped in pre-additive at masked positions) +
@@ -289,7 +313,7 @@ class LimbTransformer(nn.Module):
 
     def _xavier_init(self) -> None:
         for name, p in self.named_parameters():
-            if "joint_head" in name or "gen_head" in name:  # zero-init heads, leave them be
+            if "joint_head" in name or "gen_cat_head" in name or "gen_sub_head" in name:
                 continue
             if p.dim() >= 2:
                 nn.init.xavier_uniform_(p)
@@ -328,21 +352,34 @@ class LimbTransformer(nn.Module):
         return x * token_mask  # zero inactive outputs (cuts gradient through transformer)
 
     # ---- live control pass (uniform module tokens) ----------------------------------------------
-    def _encode_codesign(self, root, module_tok, active_mask, B, mask_pos=None):
-        """Fixed (1+n+n*max_len)-token live-mode pass: inactive module slots become STOP tokens
-        (never masked, state embed zeroed), real modules carry LIVE mode; plus persistent start
-        anchors + CLS. type + mode are CONCATENATED into content (2a); pos/depth stay additive.
-        mask_pos (B, n_tokens) bool (JEPA): swap the post-embed latent for the learned [MASK] at
-        masked positions BEFORE additive pos/depth (which still disambiguate the slot)."""
-        toh = self.type_oh                                             # (n_tokens, _N_TYPE)
-        mode_ids = torch.where(active_mask > 0, active_mask.new_full((), _MODE_LIVE),
-                               active_mask.new_full((), _MODE_STOP)).long()      # (B, n_dof)
-        mode_oh = F.one_hot(mode_ids, _N_MODE).to(module_tok.dtype)             # (B, n_dof, _N_MODE)
-        module_in = torch.cat(                                         # [physical, type_MODULE, mode]
-            [module_tok, toh[self._content_start:].expand(B, -1, -1), mode_oh], dim=-1)
-        m = self.embed_module(module_in) * active_mask.unsqueeze(-1)   # zero inactive module state
+    def _encode_codesign(self, root, module_tok, active_mask, cap_mask, sub_oh, B, mask_pos=None):
+        """Fixed (1+n+n*max_len)-token live-mode pass. Each module slot is an EFFECTOR (has a DOF ->
+        active_mask=1), this limb's CAP (present but actionless -> active_mask=0, cap_mask=1, carries
+        its subtype one-hot + the limb's contact force), or a PAD slot deeper than the cap (all-zero
+        category/subtype, MODE_PAD; never attention-masked, matching phase 1). Plus persistent start
+        anchors + CLS. category/subtype/mode are CONCATENATED into content (2a); pos/depth stay
+        additive. mask_pos (B, n_tokens) bool (JEPA): swap the post-embed latent for the learned
+        [MASK] at masked positions BEFORE additive pos/depth (which still disambiguate the slot).
+
+        NOTE: unlike phase 1 there is no post-projection `* active_mask` — that would erase the cap's
+        type + contact. The PHYSICAL content is already zero on non-effector slots (the env masks
+        every dynamic obs block by the DOF mask, and tokenize routes cfrc only to the contact slot),
+        so the type/mode one-hots are all that survives there. This also makes the live pass agree
+        with _encode_design, which never masked its module embeddings."""
+        dt = module_tok.dtype
+        toh = self.type_oh                                             # (n_tokens, N_CAT)
+        cat_oh = module_tok.new_zeros(B, self.n_module_tokens, N_CAT)   # pad slots stay all-zero
+        cat_oh[..., CAT_EFFECTOR] = active_mask
+        cat_oh[..., CAT_CAP] = cap_mask                                # mutually exclusive by build
+        present = active_mask + cap_mask
+        mode_ids = torch.where(present > 0, present.new_full((), _MODE_LIVE),
+                               present.new_full((), _MODE_PAD)).long()          # (B, n_dof)
+        mode_oh = F.one_hot(mode_ids, _N_MODE).to(dt)                           # (B, n_dof, _N_MODE)
+        module_in = torch.cat(                              # [physical, category, subtype, mode]
+            [module_tok, cat_oh, sub_oh.to(dt), mode_oh], dim=-1)
+        m = self.embed_module(module_in)
         cls = self.embed_root(torch.cat([root, toh[0:1].expand(B, -1)], dim=-1)).unsqueeze(1)
-        start_in = torch.cat([self.angle_enc, toh[1:1 + self.n_limbs]], dim=-1)  # (n, 2+_N_TYPE)
+        start_in = torch.cat([self.angle_enc, toh[1:1 + self.n_limbs]], dim=-1)  # (n, 2+N_CAT)
         start = self.angle_proj(start_in).unsqueeze(0).expand(B, -1, -1)         # (B, n, d) anchor
         x = torch.cat([cls, start, m], dim=1)                          # (B, 1+n+n_dof, d)
         if mask_pos is not None:
@@ -359,21 +396,22 @@ class LimbTransformer(nn.Module):
         depth-major slot order == env action order, so NO nat_to_dof remap.
         return_hidden=True also returns the post-trunk hidden states H (B, n_tokens, d) for JEPA
         target / repr-anchor use."""
-        root, module_tok, active_mask = self._tokenize_modules(obs)
-        H = self._encode_codesign(root, module_tok, active_mask, obs.shape[0])
+        root, module_tok, active_mask, cap_mask, sub_oh = self._tokenize_modules(obs)
+        H = self._encode_codesign(root, module_tok, active_mask, cap_mask, sub_oh, obs.shape[0])
         modules = H[:, self._content_start:, :]
         mu = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask
         out = (mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0]))
         return out + (H,) if return_hidden else out
 
-    def _sample_jepa_mask(self, active_mask: torch.Tensor, mask_prob: float) -> torch.Tensor:
-        """(B, n_tokens) bool JEPA mask. Maskable = CLS + active modules (never start/inactive-STOP).
-        Bernoulli(mask_prob) per maskable token, then per-sample guards force >=1 masked AND >=1
-        unmasked among the maskable set (always satisfiable: >=1 module + CLS => >=2 maskable)."""
-        B, T, dev = active_mask.shape[0], self.n_tokens, active_mask.device
+    def _sample_jepa_mask(self, present_mask: torch.Tensor, mask_prob: float) -> torch.Tensor:
+        """(B, n_tokens) bool JEPA mask. Maskable = CLS + PRESENT modules (effectors AND caps; never
+        start tokens or pad slots). Bernoulli(mask_prob) per maskable token, then per-sample guards
+        force >=1 masked AND >=1 unmasked among the maskable set (always satisfiable: >=1 module +
+        CLS => >=2 maskable)."""
+        B, T, dev = present_mask.shape[0], self.n_tokens, present_mask.device
         maskable = torch.zeros(B, T, dtype=torch.bool, device=dev)
         maskable[:, 0] = True                                          # CLS
-        maskable[:, self._content_start:] = active_mask.bool()         # active modules
+        maskable[:, self._content_start:] = present_mask.bool()        # effectors + caps
         mask_pos = maskable & (torch.rand(B, T, device=dev) < mask_prob)
         ar = torch.arange(B, device=dev)
         neg = torch.full((B, T), -1.0, device=dev)
@@ -391,12 +429,14 @@ class LimbTransformer(nn.Module):
         stop-grad post-trunk H_full (unmasked pass); pred = predictor(H_masked[mask]). BYOL cosine
         loss (2-2cos). Grad flows into embed_*/trunk (via unmasked tokens) + mask_token + predictor.
         obs is model-normalized."""
-        root, module_tok, active_mask = self._tokenize_modules(obs)
+        root, module_tok, active_mask, cap_mask, sub_oh = self._tokenize_modules(obs)
         B = obs.shape[0]
+        enc = lambda mp: self._encode_codesign(root, module_tok, active_mask, cap_mask, sub_oh,
+                                               B, mask_pos=mp)
         with torch.no_grad():                                          # target: unmasked context
-            H_full = self._encode_codesign(root, module_tok, active_mask, B)
-        mask_pos = self._sample_jepa_mask(active_mask, mask_prob)
-        H_masked = self._encode_codesign(root, module_tok, active_mask, B, mask_pos=mask_pos)
+            H_full = enc(None)
+        mask_pos = self._sample_jepa_mask(active_mask + cap_mask, mask_prob)
+        H_masked = enc(mask_pos)
         pred = self.jepa_predictor(H_masked[mask_pos])                 # (n_masked, d)
         tgt = H_full[mask_pos]                                         # already no-grad
         loss = (2 - 2 * (F.normalize(pred, dim=-1) * F.normalize(tgt, dim=-1)).sum(-1)).mean()
@@ -419,7 +459,7 @@ class LimbTransformer(nn.Module):
         masks last-horizon-step + `done`. torch.compiled -> fuses the target-derivation + masked MSE."""
         B, n, D = next_obs.shape[0], self.n_limbs, self.max_limb_length
         # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
-        _, mod_t, _ = tokenize_modules(next_obs, n, D)
+        _, mod_t, *_ = tokenize_modules(next_obs, n, D)
         if self.fd_variant == 'latent':
             # JEPA target = content-only embed of next physical state: next_phys @ W_phys.T (drop the
             # constant type/mode one-hot cols + bias -> the fixed offset c the head could trivially fit).
@@ -429,16 +469,14 @@ class LimbTransformer(nn.Module):
             cos = F.cosine_similarity(mod_pred, tgt, dim=-1, eps=1e-6).unsqueeze(-1)  # (B, n_dof, 1)
             return ((2.0 - 2.0 * cos) * mm).sum() / mm.sum().clamp(min=1)
         geom_tgt = mod_t[..., 10:25]                                    # relpos3+relrot6+relvel6 (15)
-        # cfrc target: per-limb sensor block of next_obs, broadcast to each depth slot of that limb
-        so = token_dims(n, D)["sens_off"]
-        cfrc_tgt = (next_obs[:, so:so + n * 6].view(B, 1, n, 6)
-                    .expand(B, D, n, 6).reshape(B, D * n, 6))           # (B, n_dof, 6)
-        # terminal mask from obs[t] active_mask (depth-major slot -> (B, D, n))
-        m = active_mask.view(B, D, n)
-        depth0 = torch.arange(D, device=next_obs.device).view(1, D, 1)
-        term = ((m > 0) & (depth0 == m.sum(1, keepdim=True) - 1)).reshape(B, D * n).float()
+        # cfrc target + mask both come from the CONTACT slot -- the morphology cap when the limb has
+        # one, else the terminal effector. Same routing tokenize_modules uses, so the module asked to
+        # predict contact is the one that observes it (Phase 5; == terminal effector when all caps
+        # are bare, i.e. phase-1-identical).
+        cfrc_tgt = mod_t[..., 4:10]                                     # (B, n_dof, 6)
+        cont = contact_mask(next_obs, n, D)                             # (B, n_dof)
         v = valid.float().unsqueeze(-1)
-        geom_mm, cfrc_mm = active_mask * v, term * v                    # (B, n_dof) each
+        geom_mm, cfrc_mm = active_mask * v, cont * v                    # (B, n_dof) each
         geom_mse = (((mod_pred[..., :15] - geom_tgt) ** 2).mean(-1) * geom_mm).sum() / geom_mm.sum().clamp(min=1)
         cfrc_mse = (((mod_pred[..., 15:] - cfrc_tgt) ** 2).mean(-1) * cfrc_mm).sum() / cfrc_mm.sum().clamp(min=1)
         return geom_mse + cfrc_mse
@@ -460,7 +498,7 @@ class LimbTransformer(nn.Module):
         geometry. Pure limb-chain composition (NO root term -> CLS inert): with P_d = prod of the
         chain's rel-rots up to depth d, pos_d = pos_{d-1} + P_{d-1}@relpos_d, vel likewise, rot_d =
         P_d (as 6D). Depth-major slot order == module tokens. Grill 2026-07-10."""
-        _, mod, active = self._tokenize_modules(obs)                    # mod (B, n_dof, 25)
+        _, mod, active, *_ = self._tokenize_modules(obs)                # mod (B, n_dof, 25)
         B, n, D = obs.shape[0], self.n_limbs, self.max_limb_length
         md = mod.view(B, D, n, MODULE_DIM)                             # depth-major -> (B, D, n, 25)
         P = torch.eye(3, device=obs.device, dtype=mod.dtype).expand(B, n, 3, 3).contiguous()
@@ -532,142 +570,263 @@ class LimbTransformer(nn.Module):
         return aux or None
 
     # ---- design mode: morphology-only generation pass (no physical state) ------------------------
-    def _encode_design(self, count, stopped):
-        """Encode a designed prefix. count (M,n) long = committed modules per limb; stopped (M,n)
-        bool = limb finalized (explicit stop or reached max_len). Per module slot (n,d):
-          COMMITTED if d<=count; STOP marker if d==count+1 and stopped; else PENDING (masked).
-        CLS uses the learned design content; module tokens carry NO physical state — their content is
-        zeros(MODULE_DIM) with the type + mode one-hots concatenated (same embed_module path as live
-        mode), so type/mode enter via content while pos/depth stay additive. Returns H (M,n_tokens,d)."""
+    def _encode_design(self, count, cap_sub, eff_sub):
+        """Encode a designed prefix (M prefixes batched):
+          count   (M,n)         long = committed EFFECTORS per limb
+          cap_sub (M,n)         long = the limb's cap subtype, or -1 while the limb is still growable
+          eff_sub (M,n,max_len) long = per-depth effector subtype (meaningful where depth < count)
+        Per module slot (limb n, 0-based depth d):
+          EFFECTOR if d < count; CAP if d == count and capped; else PAD (attention-masked).
+        Module tokens carry NO physical state — content is zeros(MODULE_DIM) with the category +
+        subtype + mode one-hots concatenated (same embed_module path as live mode), so type enters
+        via content while pos/depth stay additive. Returns H (M, n_tokens, d)."""
         M, n = count.shape
-        d, max_len = self._d_model, self.max_limb_length
-        dev = count.device
-        depth1 = torch.arange(1, max_len + 1, device=dev).view(1, max_len, 1)   # (1,max_len,1)
-        cnt = count.unsqueeze(1)                                        # (M,1,n)
-        committed = depth1 <= cnt                                       # (M,max_len,n)
-        is_stop   = stopped.unsqueeze(1) & (depth1 == cnt + 1)          # (M,max_len,n)
-        mode_slot = committed.long() * _MODE_COMMITTED + is_stop.long() * _MODE_STOP
-        pad_slot  = ~(committed | is_stop)                             # True = pending -> mask
-        mode_ids = mode_slot.reshape(M, self.n_module_tokens)          # depth-major slot order
-        pad_mod  = pad_slot.reshape(M, self.n_module_tokens)
+        max_len, dev = self.max_limb_length, count.device
+        depth0 = torch.arange(max_len, device=dev).view(1, max_len, 1)   # (1,max_len,1)
+        cnt = count.unsqueeze(1)                                         # (M,1,n)
+        committed = depth0 < cnt                                         # (M,max_len,n)
+        is_cap    = (cap_sub >= 0).unsqueeze(1) & (depth0 == cnt)
+        pad_slot  = ~(committed | is_cap)                                # True = pending -> mask
 
+        eff_d = eff_sub.permute(0, 2, 1)                                 # (M,max_len,n) depth-major
+        cap_d = cap_sub.unsqueeze(1).expand(M, max_len, n)
+        null  = count.new_full((), -1)
+        cat_slot  = torch.where(committed, count.new_full((), CAT_EFFECTOR),
+                                torch.where(is_cap, count.new_full((), CAT_CAP), null))
+        sub_slot  = torch.where(committed, eff_d, torch.where(is_cap, cap_d, null))
+        mode_slot = torch.where(pad_slot, count.new_full((), _MODE_PAD),
+                                count.new_full((), _MODE_COMMITTED))
+
+        nd = self.n_module_tokens
+        pad_mod = pad_slot.reshape(M, nd)                                # depth-major slot order
         toh = self.type_oh
-        mode_oh = F.one_hot(mode_ids, _N_MODE).float()                 # (M, n_dof, _N_MODE)
-        phys = mode_oh.new_zeros(M, self.n_module_tokens, MODULE_DIM)  # no physical state in design
-        module_in = torch.cat([phys, toh[self._content_start:].expand(M, -1, -1), mode_oh], dim=-1)
-        m = self.embed_module(module_in)
+        dt = toh.dtype
+        cat_oh  = _oh(cat_slot.reshape(M, nd), N_CAT, dt)
+        sub_oh  = _oh(sub_slot.reshape(M, nd), N_SUB, dt)
+        mode_oh = F.one_hot(mode_slot.reshape(M, nd), _N_MODE).to(dt)
+        phys = mode_oh.new_zeros(M, nd, MODULE_DIM)                      # no physical state in design
+        m = self.embed_module(torch.cat([phys, cat_oh, sub_oh, mode_oh], dim=-1))
         cls = self.cls_design.view(1, 1, -1).expand(M, 1, -1)
         start_in = torch.cat([self.angle_enc, toh[1:1 + n]], dim=-1)
         start = self.angle_proj(start_in).unsqueeze(0).expand(M, -1, -1)  # (M,n,d) angle anchor
         x = torch.cat([cls, start, m], dim=1)
-        x = x + self.pos_emb(self.pos_ids)                             # limb slot: always additive
+        x = x + self.pos_emb(self.pos_ids)                               # limb slot: always additive
         if not self.use_rope:
-            x = x + self._depth_add()                                 # depth: additive unless RoPE
+            x = x + self._depth_add()                                    # depth: additive unless RoPE
         pad = torch.cat([x.new_zeros(M, 1 + n, dtype=torch.bool), pad_mod], dim=1)
         return self.encoder(x, src_key_padding_mask=pad)
 
+    # ---- constrained decoder (5a): purely positional valid-next masks ----------------------------
+    def _gen_masks(self, depth, force_grow):
+        """depth (N,) long = 0-based depth of the slot about to be filled; force_grow (N,) bool =
+        the >=1-limb guard. Returns cat_mask (N, N_GEN_CAT) and sub_mask (N, N_GEN_CAT, N_SUB),
+        both bool, True = allowed. The rules are positional only (the prev-type mechanism the
+        general decoder supports is unused until Stage-3 connectors):
+          depth 0             -> effectors + the BARE cap only. A morphology cap needs a limb to sit
+                                 on, and `bare cap at depth 0` IS how the generator says "no limb".
+                                 force_grow additionally removes the whole cap category.
+          1 .. max_len-2      -> all effectors + all caps
+          max_len-1 (deepest) -> caps only  =>  at most max_len-1 effectors per limb
+        Applied IDENTICALLY here and in gen_replay, so the PPO ratio is over the same distribution
+        that produced the trace."""
+        N, dev = depth.shape[0], depth.device
+        eff_ok = depth < self.max_effectors                     # deepest slot is cap-only
+        # If the grammar leaves no effector, the cap category must stay open regardless of the guard
+        # (unreachable with max_limb_length >= 2, but keeps the row from being fully masked).
+        cap_ok = (~force_grow) | (~eff_ok)
+        cat_mask = torch.stack([eff_ok, cap_ok], dim=-1)                 # (N, N_GEN_CAT)
+        sub_eff = (torch.arange(N_SUB, device=dev) < N_EFF).expand(N, N_SUB)
+        cap_bare = F.one_hot(torch.full((N,), CAP_BARE, device=dev), N_SUB).bool()
+        sub_cap = torch.where((depth == 0).unsqueeze(-1), cap_bare,
+                              torch.ones(N, N_SUB, dtype=torch.bool, device=dev))
+        return cat_mask, torch.stack([sub_eff, sub_cap], dim=-2)         # (N, N_GEN_CAT, N_SUB)
+
+    @staticmethod
+    def gen_dist(cat_logits, sub_logits, cat_mask, sub_mask):
+        """Masked log-probs for the FACTORED GenAct action. Returns
+          cat_logp (..., N_GEN_CAT)
+          sub_logp (..., N_GEN_CAT, N_SUB)  -- row c = the subtype distribution CONDITIONED on
+                                               category c (the same N_SUB logits under c's mask).
+        Masking uses finfo.min rather than -inf so a masked entry contributes p*logp == 0 to the
+        entropy instead of 0 * -inf == NaN."""
+        neg = torch.finfo(cat_logits.dtype).min
+        cat_logp = F.log_softmax(cat_logits.masked_fill(~cat_mask, neg), dim=-1)
+        sub_logp = F.log_softmax(
+            sub_logits.unsqueeze(-2).expand_as(sub_mask).masked_fill(~sub_mask, neg), dim=-1)
+        return cat_logp, sub_logp
+
+    @staticmethod
+    def gen_logp_entropy(cat_logp, sub_logp, cat_a, sub_a):
+        """Joint log-prob of the taken (category, subtype) pair and the EXACT joint entropy
+        H(cat) + sum_c p(c) H(sub | c). Shapes broadcast over any leading dims."""
+        lp = cat_logp.gather(-1, cat_a.unsqueeze(-1)).squeeze(-1)
+        row = cat_a.unsqueeze(-1).unsqueeze(-1).expand(*cat_a.shape, 1, sub_logp.shape[-1])
+        sub_c = sub_logp.gather(-2, row).squeeze(-2)                     # (..., N_SUB) under cat_a
+        lp = lp + sub_c.gather(-1, sub_a.unsqueeze(-1)).squeeze(-1)
+        p_cat = cat_logp.exp()
+        h_cat = -(p_cat * cat_logp).sum(-1)
+        h_sub = -(sub_logp.exp() * sub_logp).sum(-1)                     # (..., N_GEN_CAT)
+        return lp, h_cat + (p_cat * h_sub).sum(-1)
+
+    @staticmethod
+    def gen_entropy_split(cat_logp, sub_logp):
+        """The two ADDITIVE terms of the joint entropy that gen_logp_entropy sums:
+          h_cat      = H(category)                -- the SKELETON decision (effector vs cap), which
+                                                     is EXACTLY the phase-1/3 binary grow/stop head
+          h_sub_cond = sum_c p(c) H(sub | c)      -- the subtype axis phase 5 ADDED
+        Split so Rao-Blackwell H(B) can be attributed to skeleton vs subtype: comparing phase-5's
+        total against phase-3's overconstrains the comparison, since phase 3 cannot express a
+        subtype difference at all. Analysis-only -- the PPO path still uses gen_logp_entropy."""
+        p_cat = cat_logp.exp()
+        h_cat = -(p_cat * cat_logp).sum(-1)
+        h_sub = -(sub_logp.exp() * sub_logp).sum(-1)                 # (..., N_GEN_CAT)
+        return h_cat, (p_cat * h_sub).sum(-1)
+
+    @staticmethod
+    def commit(count, cap_sub, eff_sub, arange, slot, depth, cat_a, sub_a, active):
+        """Apply one emitted token to the frontier state, IN PLACE. Emitting an effector appends it
+        at `depth`; emitting a cap finalizes the limb. Inactive envs (no growable limb left) are
+        no-ops. Shared by sample(), the replay scan, and the agent's scripted teacher so all three
+        walk one identical MDP."""
+        is_eff = (cat_a == GEN_EFF) & active
+        is_cap = (cat_a == GEN_CAP) & active
+        eff_sub[arange, slot, depth] = torch.where(is_eff, sub_a, eff_sub[arange, slot, depth])
+        count[arange, slot] += is_eff.long()
+        cap_sub[arange, slot] = torch.where(is_cap, sub_a, cap_sub[arange, slot])
+
     @torch.no_grad()
-    def sample(self, N: int) -> dict[str, torch.Tensor]:
-        """Unroll the frontier generation MDP for N envs (fixed L = n*max_len max steps). Each step:
+    def sample(self, N: int, mode: str = "stochastic") -> dict[str, torch.Tensor]:
+        """Unroll the frontier generation MDP for N envs (fixed L = n*max_len steps). Each step:
         encode the current designed prefix, read v(prefix) from CLS, pick a RANDOM still-growable
-        limb, read continue/stop on its START token, commit. A limb stops on `stop` or at max_len.
-        >=1-limb guard: force continue when the body is still empty and only one growable limb is
+        limb (one with no cap yet), read the FACTORED GenAct on its START token under the positional
+        grammar mask, and commit the emitted module.
+
+        `mode` selects how the (category, subtype) pair is drawn -- ALL three walk the identical
+        grammar-masked MDP, differing only in the pick:
+          stochastic  the trained GenAct distribution (default; training + in-distribution eval)
+          greedy      argmax of the masked GenAct -- the generator's committed 'best morph'
+          uniform     uniform over the grammar-VALID set (zero logits into gen_dist) -- a random
+                      policy on the same MDP; the diversity-reference / random-generator body source.
+
+        Emitting a cap finalizes the limb, and the grammar forces a cap at the deepest slot, so
+        every limb ends with exactly one cap and costs at most (max_len-1 effectors + 1 cap) =
+        max_len steps — L = n*max_len steps therefore always suffice.
+        >=1-limb guard: force an EFFECTOR when the body is still empty and only one growable limb is
         left. Steps where an env has no growable limb are no-ops (active_step=False, masked later)."""
         dev = self.type_ids.device
         n, max_len = self.n_limbs, self.max_limb_length
         L = n * max_len
         count   = torch.zeros(N, n, dtype=torch.long, device=dev)
-        stopped = torch.zeros(N, n, dtype=torch.bool, device=dev)
-        actions = torch.zeros(N, L, dtype=torch.long, device=dev)
+        cap_sub = torch.full((N, n), -1, dtype=torch.long, device=dev)
+        eff_sub = torch.full((N, n, max_len), -1, dtype=torch.long, device=dev)
+        cat_a   = torch.zeros(N, L, dtype=torch.long, device=dev)
+        sub_a   = torch.zeros(N, L, dtype=torch.long, device=dev)
         slots   = torch.zeros(N, L, dtype=torch.long, device=dev)
         old_logp    = torch.zeros(N, L, device=dev)
+        step_ent    = torch.zeros(N, L, device=dev)     # analytic per-step H -> Rao-Blackwell H(B)
+        step_ent_cat = torch.zeros(N, L, device=dev)    # skeleton term (== the phase-1/3 head)
+        step_ent_sub = torch.zeros(N, L, device=dev)    # subtype term (new in phase 5)
         active_step = torch.zeros(N, L, dtype=torch.bool, device=dev)
         v_states = torch.zeros(N, L + 1, device=dev)
         arange = torch.arange(N, device=dev)
 
         for t in range(L):
-            H = self._encode_design(count, stopped)
+            H = self._encode_design(count, cap_sub, eff_sub)
             v_states[:, t] = self.gencrit_head(H[:, 0]).squeeze(-1)
-            growable = ~stopped                                        # count==max_len already stopped
-            active = growable.any(1)                                   # (N,) still deciding
+            growable = cap_sub < 0                                 # uncapped == still growable
+            active = growable.any(1)                               # (N,) still deciding
             r = torch.rand(N, n, device=dev)
             slot = torch.where(growable, r, r.new_full((), -1.0)).argmax(1)   # random growable limb
-            logits = self.gen_head(H[arange, 1 + slot])               # (N,2) from START token
+            depth = count[arange, slot]
             force = active & (count.sum(1) == 0) & (growable.sum(1) == 1)     # >=1-limb guard
-            logits[force, _GEN_STOP] = float('-inf')
-            dist = torch.distributions.Categorical(logits=logits)
-            a = dist.sample()
-            old_logp[:, t] = dist.log_prob(a)
-            cont = (a == _GEN_ON) & active
-            count[arange, slot] += cont.long()
-            reached = count[arange, slot] >= max_len
-            stopped[arange, slot] |= ((a == _GEN_STOP) & active) | (cont & reached)
-            actions[:, t] = a
+            cat_mask, sub_mask = self._gen_masks(depth, force)
+            h = H[arange, 1 + slot]                                # (N,d) from the START token
+            cat_in, sub_in = self.gen_cat_head(h), self.gen_sub_head(h)
+            if mode == "uniform":                                  # random policy: uniform over valid
+                cat_in, sub_in = torch.zeros_like(cat_in), torch.zeros_like(sub_in)
+            cat_logp, sub_logp = self.gen_dist(cat_in, sub_in, cat_mask, sub_mask)
+            if mode == "greedy":
+                c = cat_logp.argmax(-1)
+                s = sub_logp[arange, c].argmax(-1)
+            else:
+                c = torch.distributions.Categorical(logits=cat_logp).sample()
+                s = torch.distributions.Categorical(logits=sub_logp[arange, c]).sample()
+            old_logp[:, t], step_ent[:, t] = self.gen_logp_entropy(cat_logp, sub_logp, c, s)
+            step_ent_cat[:, t], step_ent_sub[:, t] = self.gen_entropy_split(cat_logp, sub_logp)
+            self.commit(count, cap_sub, eff_sub, arange, slot, depth, c, s, active)
+            cat_a[:, t], sub_a[:, t] = c, s
             slots[:, t] = slot
             active_step[:, t] = active
 
-        H = self._encode_design(count, stopped)                       # v at the full body
+        H = self._encode_design(count, cap_sub, eff_sub)           # v at the full body
         v_states[:, L] = self.gencrit_head(H[:, 0]).squeeze(-1)
-        return {"slots": slots, "actions": actions, "old_logp": old_logp,
-                "v_states": v_states, "active_step": active_step,
-                "counts": count.float(), "presence": (count > 0).float()}
+        return {"slots": slots, "cat_actions": cat_a, "sub_actions": sub_a, "old_logp": old_logp,
+                "v_states": v_states, "active_step": active_step, "step_entropy": step_ent,
+                "step_entropy_cat": step_ent_cat, "step_entropy_sub": step_ent_sub,
+                "counts": count.float(), "presence": (count > 0).float(),
+                "eff_sub": eff_sub, "cap_sub": cap_sub}
 
-    def _replay_states(self, slots, actions):
-        """Teacher-forced scan (no encode) reconstructing the frontier state at every prefix. Returns
-        counts_hist (B,L+1,n), stopped_hist (B,L+1,n), active_hist (B,L), force_hist (B,L)."""
+    def _replay_states(self, slots, cat_a, sub_a):
+        """Teacher-forced scan (no encode) reconstructing the frontier state at every prefix.
+        Returns count_hist (B,L+1,n), cap_hist (B,L+1,n), eff_hist (B,L+1,n,max_len),
+        active_hist (B,L), depth_hist (B,L), force_hist (B,L)."""
         B, L = slots.shape
-        n, max_len = self.n_limbs, self.max_limb_length
-        dev = slots.device
+        n, max_len, dev = self.n_limbs, self.max_limb_length, slots.device
         arange = torch.arange(B, device=dev)
         count   = torch.zeros(B, n, dtype=torch.long, device=dev)
-        stopped = torch.zeros(B, n, dtype=torch.bool, device=dev)
-        counts_hist  = torch.zeros(B, L + 1, n, dtype=torch.long, device=dev)
-        stopped_hist = torch.zeros(B, L + 1, n, dtype=torch.bool, device=dev)
-        active_hist  = torch.zeros(B, L, dtype=torch.bool, device=dev)
-        force_hist   = torch.zeros(B, L, dtype=torch.bool, device=dev)
+        cap_sub = torch.full((B, n), -1, dtype=torch.long, device=dev)
+        eff_sub = torch.full((B, n, max_len), -1, dtype=torch.long, device=dev)
+        count_hist = torch.zeros(B, L + 1, n, dtype=torch.long, device=dev)
+        cap_hist   = torch.zeros(B, L + 1, n, dtype=torch.long, device=dev)
+        eff_hist   = torch.zeros(B, L + 1, n, max_len, dtype=torch.long, device=dev)
+        active_hist = torch.zeros(B, L, dtype=torch.bool, device=dev)
+        depth_hist  = torch.zeros(B, L, dtype=torch.long, device=dev)
+        force_hist  = torch.zeros(B, L, dtype=torch.bool, device=dev)
         for t in range(L):
-            counts_hist[:, t] = count
-            stopped_hist[:, t] = stopped
-            growable = ~stopped
+            count_hist[:, t], cap_hist[:, t], eff_hist[:, t] = count, cap_sub, eff_sub
+            growable = cap_sub < 0
             active = growable.any(1)
+            slot = slots[:, t]
+            depth = count[arange, slot]
             active_hist[:, t] = active
+            depth_hist[:, t] = depth
             force_hist[:, t] = active & (count.sum(1) == 0) & (growable.sum(1) == 1)
-            slot, a = slots[:, t], actions[:, t]
-            cont = (a == _GEN_ON) & active
-            count[arange, slot] += cont.long()
-            reached = count[arange, slot] >= max_len
-            stopped[arange, slot] |= ((a == _GEN_STOP) & active) | (cont & reached)
-        counts_hist[:, L] = count
-        stopped_hist[:, L] = stopped
-        return counts_hist, stopped_hist, active_hist, force_hist
+            self.commit(count, cap_sub, eff_sub, arange, slot, depth,
+                        cat_a[:, t], sub_a[:, t], active)
+        count_hist[:, L], cap_hist[:, L], eff_hist[:, L] = count, cap_sub, eff_sub
+        return count_hist, cap_hist, eff_hist, active_hist, depth_hist, force_hist
 
-    def gen_replay(self, slots: torch.Tensor, actions: torch.Tensor):
+    def gen_replay(self, slots: torch.Tensor, cat_a: torch.Tensor, sub_a: torch.Tensor):
         """Teacher-forced replay WITH grad, batched over all L+1 prefixes in one trunk forward.
-        Returns per-step GenAct logits at the chosen slot's START token (B,L,2), v(prefix) at every
-        prefix (B,L+1), and a valid-step mask (B,L) (False on no-op frontier steps)."""
+        Returns (cat_logp (B,L,N_GEN_CAT), sub_logp (B,L,N_GEN_CAT,N_SUB), v (B,L+1), valid (B,L)).
+        The grammar mask is rebuilt from the replayed state EXACTLY as in sample() — same positional
+        rule, same >=1-limb guard — so the PPO ratio is over the same constrained distribution."""
         B, L = slots.shape
-        n = self.n_limbs
-        counts_hist, stopped_hist, active_hist, force_hist = self._replay_states(slots, actions)
+        n, max_len = self.n_limbs, self.max_limb_length
+        c_h, cap_h, eff_h, active_h, depth_h, force_h = self._replay_states(slots, cat_a, sub_a)
         M = B * (L + 1)
-        H = self._encode_design(counts_hist.reshape(M, n), stopped_hist.reshape(M, n))
+        H = self._encode_design(c_h.reshape(M, n), cap_h.reshape(M, n),
+                                eff_h.reshape(M, n, max_len))
         v = self.gencrit_head(H[:, 0]).reshape(B, L + 1)
 
         start_out = H[:, 1:1 + n].reshape(B, L + 1, n, -1)            # start-token outputs per prefix
         d = start_out.shape[-1]
         idx = slots.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, d)  # (B,L,1,d)
         chosen = torch.gather(start_out[:, :L], 2, idx).squeeze(2)    # (B,L,d) prefix_t's slot t
-        logits = self.gen_head(chosen)                               # (B,L,2)
-        logits[..., _GEN_STOP] = torch.where(force_hist, logits.new_full((), float('-inf')),
-                                             logits[..., _GEN_STOP])
-        return logits, v, active_hist
+        cat_mask, sub_mask = self._gen_masks(depth_h.reshape(-1), force_h.reshape(-1))
+        cat_logp, sub_logp = self.gen_dist(
+            self.gen_cat_head(chosen), self.gen_sub_head(chosen),
+            cat_mask.view(B, L, N_GEN_CAT), sub_mask.view(B, L, N_GEN_CAT, N_SUB))
+        return cat_logp, sub_logp, v, active_h
+
 
     def forward(self, obs: torch.Tensor, compute_value: bool = True,
                 detach_value: bool = False, actions: torch.Tensor = None) -> dict[str, torch.Tensor]:
         B = obs.shape[0]
         out: dict[str, torch.Tensor] = {}
         if self.codesign_tokens:
-            root, module_tok, active_mask = self._tokenize_modules(obs)
-            x = self._encode_codesign(root, module_tok, active_mask, B)
+            root, module_tok, active_mask, cap_mask, sub_oh = self._tokenize_modules(obs)
+            x = self._encode_codesign(root, module_tok, active_mask, cap_mask, sub_oh, B)
             # Fused FD/FK aux (2b): run the heads here so they ride this pass's H[t] + the forward
             # compile (0 extra trunk passes). Fixed _enabled gate -> off-run never compiles them in.
             # FD also needs the own action (from prev_actions); absent in rollout -> skipped there.
