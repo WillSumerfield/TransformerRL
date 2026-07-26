@@ -18,7 +18,9 @@ from envs.ant_environment_common import (
 from envs.common import create_plane
 
 from ..multigroup_environment import MultiGroupEnvironmentGpu
-from .build_vsim import Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE, MAX_LIMB_LENGTH, DEFAULT_ANKLE
+from transformer_rl.vocab import N_SUB, CAP_BARE
+from .build_vsim import (Morphology, write_vsim, HIP_RANGE, ANKLE_RANGE, MAX_LIMB_LENGTH,
+                         MAX_EFFECTORS, DEFAULT_ANKLE)
 
 
 _N_LIMBS      = 8
@@ -42,8 +44,15 @@ _O_RELVEL    = _O_RELROT + 6 * _N_DOFS_FULL      # 429 rel-vel lin+ang (6/module
 _O_SENSOR    = _O_RELVEL + 6 * _N_DOFS_FULL      # 621 per-limb terminal contact (48)
 _OBS_BASE    = _O_SENSOR + _N_SENSOR             # 669  (end of physical obs; start of lengths)
 _LEN_DIM     = _N_DOFS_FULL                      # 32 module lengths (kept for diversity harness)
-_MASK_DIM    = _N_DOFS_FULL                      # 32
-_OBS_TOTAL   = _OBS_BASE + _LEN_DIM + _MASK_DIM  # 733
+_MASK_DIM    = _N_DOFS_FULL                      # 32 DOF mask: 1 per EFFECTOR slot
+# Phase-5 per-module TYPE ids, constant per body like lengths/mask. They sit in the RAW TAIL
+# [_O_MASK : _OBS_TOTAL] that models._restore_mask_tail re-inserts UNNORMALIZED — every channel is
+# exactly {0,1} and is read back with a `> 0` threshold. CATEGORY is derived, not stored:
+# effector <=> mask>0, cap <=> is_cap>0, pad <=> neither.
+_O_MASK      = _OBS_BASE + _LEN_DIM              # 701
+_O_CAP       = _O_MASK + _MASK_DIM               # 733 is_cap flag, 1 per limb at its cap slot
+_O_SUB       = _O_CAP + _N_DOFS_FULL             # 765 subtype one-hot, [slot][N_SUB]
+_OBS_TOTAL   = _O_SUB + N_SUB * _N_DOFS_FULL     # 893
 
 
 def _slot(n: int, d: int) -> int:
@@ -94,35 +103,6 @@ def _stable_morphologies(
     return result
 
 
-def morph_split(
-    morphs: list[frozenset],
-    train_pct: float,
-    seed: int,
-    test_set: bool = False,
-) -> list[frozenset]:
-    """Return train or test morphologies via stratified split by limb count.
-
-    Stratifies by limb count so each stratum contributes proportionally to both halves.
-    Requires seed; caller must validate before calling.
-    """
-    import random as _random
-    rng = _random.Random(seed)
-    by_limbs: dict[int, list[frozenset]] = {}
-    for m in morphs:
-        by_limbs.setdefault(len(m), []).append(m)
-
-    train, test = [], []
-    for strat in sorted(by_limbs):
-        group = by_limbs[strat][:]
-        rng.shuffle(group)
-        n_train = max(1, int(len(group) * train_pct))
-        n_train = min(n_train, len(group) - 1)  # ensure at least 1 in test
-        train.extend(group[:n_train])
-        test.extend(group[n_train:])
-
-    return test if test_set else train
-
-
 def sample_morphologies(num: int, seed: int = None, rng: "random.Random" = None) -> list[Morphology]:
     """Sample `num` full morphologies: limb count uniform in 3..8, topology uniform within that count,
     each active limb's hip/ankle length uniform in its range. Pass a persistent `rng` for a
@@ -147,7 +127,8 @@ def _as_morphology(m) -> Morphology:
 
 
 class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
-    """One EnvironmentGroup per morphology. Obs is 139D; actions are always 16D."""
+    """One EnvironmentGroup per morphology. Obs/action widths are padded to the fixed 32-slot
+    depth-major layout (see the _O_* offsets above); only active EFFECTOR slots carry a DOF."""
 
     @property
     def unwrapped(self):
@@ -192,13 +173,11 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         raise_exception: bool = True,
         morphologies: list | None = None,
         sample_morphs: bool = False,
-        train_pct: float = 1.0,
-        test_set: bool = False,
         value_size: int = 1,
         **kwargs,
     ):
         # Full ant: sample `num_envs` variable-length bodies (one per env). Otherwise use the given
-        # topology set (or the stable set), optionally train/test-split, at default lengths.
+        # topology set (or the stable set) at default lengths.
         self._sample_morphs = sample_morphs
         self._sample_seed = seed
         if sample_morphs:
@@ -209,10 +188,6 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             self._morphologies = self._draw_morphs(num_envs)
         else:
             morphs = morphologies if morphologies is not None else _stable_morphologies()
-            if train_pct < 1.0:
-                if seed is None:
-                    raise ValueError("seed required when train_pct < 1.0")
-                morphs = morph_split(morphs, train_pct, seed, test_set)
             self._morphologies = [_as_morphology(m) for m in morphs]
         self.n_morphs = len(self._morphologies)
         self.envs_per_morph = max(1, num_envs // self.n_morphs)
@@ -359,6 +334,10 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self._global_dof_mask = torch.zeros((N, _N_DOFS_FULL), dtype=torch.float32, device=self.device)
         # Per-env segment lengths, constant per body: [hip_leg1..8, ankle_leg1..8], 0 for inactive limbs.
         self._global_lengths = torch.zeros((N, _LEN_DIM), dtype=torch.float32, device=self.device)
+        # Phase-5 per-module type ids, also constant per body (see _O_CAP / _O_SUB).
+        self._global_is_cap = torch.zeros((N, _N_DOFS_FULL), dtype=torch.float32, device=self.device)
+        self._global_sub_oh = torch.zeros((N, _N_DOFS_FULL * N_SUB), dtype=torch.float32,
+                                          device=self.device)
 
         # DOF/sensor data is ragged (per-morphology width + a per-morphology slot permutation), so
         # it can't share a rectangular tensor. Each quantity gets ONE flat buffer holding every
@@ -441,10 +420,19 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
 
             morph = g["morph"]
             lvec = torch.zeros(_LEN_DIM, dtype=torch.float32, device=self.device)
+            capvec = torch.zeros(_N_DOFS_FULL, dtype=torch.float32, device=self.device)
+            subvec = torch.zeros((_N_DOFS_FULL, N_SUB), dtype=torch.float32, device=self.device)
             for n in g["active"]:
                 for d, ln in enumerate(morph.module_lengths[n], start=1):  # depth-major slot(n,d)
                     lvec[_slot(n, d)] = ln
+                for d, t in enumerate(morph.effector_types[n], start=1):
+                    subvec[_slot(n, d), t] = 1.0
+                cd = morph.num_modules(n) + 1              # the cap rides the depth==count slot
+                capvec[_slot(n, cd)] = 1.0                 # (<= MAX_EFFECTORS+1 == _MAX_LEN)
+                subvec[_slot(n, cd), morph.cap_of(n)] = 1.0
             self._global_lengths[start:end] = lvec
+            self._global_is_cap[start:end] = capvec
+            self._global_sub_oh[start:end] = subvec.reshape(-1)
 
             self._flat_dof_init[doff:doff + EPM * n_dofs] = g["dof_pos_init"].reshape(-1)
 
@@ -501,9 +489,12 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
             torso_k = names.index("torso")
             slot_to_k = torch.full((_N_DOFS_FULL,), -1, dtype=torch.long, device=self.device)
             for k, nm in enumerate(names):
-                if nm == "torso":
+                # 'mod_{n}_{d}' only — 'torso' has no slot and 'cap_{n}_{d}' links carry no
+                # relative-geometry obs (a cap is on a FIXED joint, so its pose is constant, and
+                # every rel-* block is masked by the DOF mask which is 0 at the cap slot).
+                if not nm.startswith("mod_"):
                     continue
-                _, ns, ds = nm.split("_")                       # 'mod_{n}_{d}'
+                _, ns, ds = nm.split("_")
                 slot_to_k[_slot(int(ns), int(ds))] = k
             parent_k = torch.full((_N_DOFS_FULL,), torso_k, dtype=torch.long, device=self.device)
             for c in range(_N_DOFS_FULL):
@@ -539,9 +530,11 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
                 zero_l,
             )
 
-        # Constant length + dof_mask blocks in obs; whole-tensor, set once.
-        self._obs_buf[:, _OBS_BASE:_OBS_BASE + _LEN_DIM]   = self._global_lengths
-        self._obs_buf[:, _OBS_BASE + _LEN_DIM:_OBS_TOTAL]  = self._global_dof_mask
+        # Constant length + dof_mask + type blocks in obs; whole-tensor, set once.
+        self._obs_buf[:, _OBS_BASE:_O_MASK] = self._global_lengths
+        self._obs_buf[:, _O_MASK:_O_CAP]    = self._global_dof_mask
+        self._obs_buf[:, _O_CAP:_O_SUB]     = self._global_is_cap
+        self._obs_buf[:, _O_SUB:_OBS_TOTAL] = self._global_sub_oh
 
         # Batch commands across all groups into single GPU arrays.
         self.all_motor_cmd_array  = self.gym.create_gpu_array(all_motor_cmds)
@@ -615,7 +608,8 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         else:
             obs[:, _O_SENSOR:_OBS_BASE].zero_()
 
-        # [_OBS_BASE:+_LEN_DIM] = lengths, [..:_OBS_TOTAL] = dof_mask — set once at allocate, preserved
+        # [_OBS_BASE : _OBS_TOTAL] = lengths | dof_mask | is_cap | subtype one-hot — all constant per
+        # body, set once at allocate and preserved here.
 
     def compute_reward_termination_truncation(self, actions: torch.Tensor):
         # Reward needs only root pose plus the already-global act/old-root/progress buffers, so it
