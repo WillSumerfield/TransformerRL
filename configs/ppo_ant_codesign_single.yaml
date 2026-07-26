@@ -67,11 +67,16 @@ params:
       copy_prob: 0.6         # p: slot keeps its OWN seed limb template (else copies another slot's)
       len_keep_prob: 0.6     # q: P(per-limb length offset == 0); sets the Gaussian sigma
       prob_invalid: 0.1      # keep an UNSTABLE body w.p. this
+      # Phase-5 second teacher knob: per-token TYPE flip. On a flip the emitted subtype is redrawn
+      # uniformly over the grammar-valid kinds for the category actually emitted, so the BC prior
+      # is seeded with real type diversity instead of the canonical (swing, knee, bare) corner.
+      # desirable_flip_prob = type_flip_prob = 0 reproduces the phase-1 canonical body exactly.
+      type_flip_prob: 0.10
       n_pretrain: 8          # warmup windows (BC toward the teacher draw + value fit; ramp gen-frac 0->1)
       epochs: 16             # BC epochs/window; each REDRAWS the teacher, so 16 = 4x fresh data, not 4x passes
       minibatches: 4
       clip: 0.2              # GenAct PPO-clip
-      entropy_coef: 0.6      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
+      entropy_coef: 0.05      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
       gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
       beta: 1.0             # control-actor KL clone coefficient
       lam: 1.0             # control-critic MSE clone coefficient

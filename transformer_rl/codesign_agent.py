@@ -26,8 +26,10 @@ from rl_games.algos_torch import torch_ext
 from rl_games.common.a2c_common import swap_and_flatten01
 from rl_games.common.schedulers import RLScheduler, AdaptiveScheduler
 
-from .architectures import _GEN_ON, _GEN_STOP
+from .vocab import GEN_EFF, GEN_CAP, N_SUB, EFF_SWING, EFF_KNEE, CAP_BARE, EFF_NAMES, CAP_NAMES
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
+# perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
+from experiments.diversity_p5 import population_to_repr, redundancy, rao_blackwell_h_body
 
 _N_LIMBS = 8                                 # obs mask offset / n_dof derive from the net's tdims
 # embedding-like matrices excluded from weight decay despite being nn.Linear (3b, grill 2026-07-15):
@@ -97,12 +99,17 @@ class CodesignAgent(LoggingA2CAgent):
         # obs layout + action dim from the net's tdims (single source of truth). Phase-1: 32 DOF,
         # mask at obs[187:219]; a limb is a chain of up to _max_len modules.
         self._n_dof = net.tdims['n_dof']
-        self._mask_off = net.tdims['obs_base'] + net.tdims['len_dim']
+        self._mask_off = net.tdims['mask_off']
         self._max_len = net.max_limb_length
+        self._max_eff = net.max_effectors      # max_len-1: the deepest slot is grammar-forced to a cap
 
         env = self._env()                                  # base_legs from the ENV -> window-0 match
         self._base_legs = tuple(sorted(getattr(env, '_base_legs', cd.get('base_legs', (1, 4, 6)))))
-        self._flip = float(cd.get('desirable_flip_prob', 0.10))    # per-token continue/stop flip prob
+        self._flip = float(cd.get('desirable_flip_prob', 0.10))    # per-token grow/stop flip prob
+        # Phase-5 teacher knob #2: per-token TYPE flip. On a flip the emitted subtype is redrawn
+        # uniformly over the grammar-valid kinds for the category actually emitted. p = q = 0
+        # reproduces the phase-1 canonical body (swing, then knees, bare cap) EXACTLY.
+        self._type_flip = float(cd.get('type_flip_prob', 0.10))
         # Warmup teacher. 'flip' = base +- per-token noise (original). 'parts' = seed-relative
         # PARTS-COPY: per-token flip has the wrong geometry -- mass at edit-radius r decays like
         # flip^r, and the CHEAP edits are the degenerate ones (sprouting a limb costs 1 flip, a limb
@@ -120,6 +127,8 @@ class CodesignAgent(LoggingA2CAgent):
         self._base_target = torch.tensor(
             [2 if (i + 1) in bset else 0 for i in range(_N_LIMBS)], dtype=torch.long, device=dev)
         self._base_counts = self._base_target.clone()      # window-0 realized body == base target
+        assert int(self._base_target.max()) <= self._max_eff, \
+            f"base target exceeds max effectors/limb ({self._max_eff})"
 
         # generator hyperparameters (shared optimizer; the heads live on self.model)
         self._n_pretrain = cd.get('n_pretrain', 8)
@@ -156,7 +165,13 @@ class CodesignAgent(LoggingA2CAgent):
                               else getattr(_shaper, 'scale_value', 1.0))
 
         # window state: window 0 is the env's base build, so _cur_counts = base everywhere.
+        # window 0 is the env's canonical base build: base counts, canonical types, bare caps.
         self._cur_counts = self._base_counts.view(1, _N_LIMBS).expand(N, _N_LIMBS).clone()
+        self._cur_eff = torch.full((N, _N_LIMBS, self._max_len), -1, dtype=torch.long, device=dev)
+        for d in range(self._max_len):
+            self._cur_eff[:, :, d] = torch.where(
+                self._cur_counts > d, EFF_SWING if d == 0 else EFF_KNEE, -1)
+        self._cur_cap = torch.where(self._cur_counts > 0, CAP_BARE, -1)
         self._cur_trace = None                             # last sample() trace (RL update input)
         self._base_draw = None                             # last base+-flip ramp draws (counts, pretrain)
         self._gen_window = 0
@@ -348,44 +363,73 @@ class CodesignAgent(LoggingA2CAgent):
         mask = (obs[..., self._mask_off:self._mask_off + self._n_dof] > 0).float()
         return mask * self.model.a2c_network.log_std_param
 
-    # ---- scripted frontier rollout: target-length teacher, optional per-token flip noise ---------
+    # ---- scripted frontier rollout: target-length teacher + per-token length/type flip noise -----
     @torch.no_grad()
-    def _frontier_rollout(self, target, flip):
-        """Walk the SAME frontier MDP as net.sample but with a scripted policy: at a limb of current
-        length c, canonical action = continue if c < target[limb] else stop, flipped with prob `flip`.
-        Random growable tip each step, >=1-limb guard, cap _max_len. Returns
-        (slots, actions, active_step, counts) over L=n*max_len steps. Used to (a) draw base+-flip
-        bodies (flip=p, target=base) and (b) reconstruct a valid token sequence for a target body
-        (flip=0, target=counts) for BC."""
+    def _frontier_rollout(self, target, flip, type_flip=0.0, eff_types=None, cap_types=None):
+        """Walk the SAME frontier MDP as net.sample (same random-tip order, same >=1-limb guard, same
+        constrained decoder) but with a scripted policy. Two independent noise knobs:
+          LENGTH: at a limb of current length c the canonical CATEGORY is effector if c <
+                  target[limb] else cap, flipped with prob `flip`.
+          TYPE:   the canonical SUBTYPE is the phase-1 chain (swing at depth 0, knee below) and the
+                  bare cap; with prob `type_flip` it is redrawn UNIFORMLY over the grammar-valid
+                  subtypes for the category actually emitted. flip = type_flip = 0 reproduces the
+                  phase-1 body exactly.
+        Pass eff_types/cap_types to instead RECONSTRUCT a specific body's token sequence (subtypes
+        read off that body, type_flip ignored) -- used for BC / GenCrit's prefix fit on the body
+        that actually ran.
+        The grammar (not this policy) enforces the deepest-slot cap and the guard: whenever the
+        scripted category is masked out, it flips to the only legal one.
+        Returns (slots, cat_actions, sub_actions, active_step, counts, eff_sub, cap_sub)."""
+        net = self._net()
         dev = target.device
         N, n = target.shape
         max_len = self._max_len
         L = n * max_len
-        count = torch.zeros(N, n, dtype=torch.long, device=dev)
-        stopped = torch.zeros(N, n, dtype=torch.bool, device=dev)
+        count   = torch.zeros(N, n, dtype=torch.long, device=dev)
+        cap_sub = torch.full((N, n), -1, dtype=torch.long, device=dev)
+        eff_sub = torch.full((N, n, max_len), -1, dtype=torch.long, device=dev)
         slots = torch.zeros(N, L, dtype=torch.long, device=dev)
-        actions = torch.zeros(N, L, dtype=torch.long, device=dev)
+        cat_a = torch.zeros(N, L, dtype=torch.long, device=dev)
+        sub_a = torch.zeros(N, L, dtype=torch.long, device=dev)
         active_step = torch.zeros(N, L, dtype=torch.bool, device=dev)
         arange = torch.arange(N, device=dev)
         for t in range(L):
-            growable = ~stopped
+            growable = cap_sub < 0
             active = growable.any(1)
             r = torch.rand(N, n, device=dev)
             slot = torch.where(growable, r, r.new_full((), -1.0)).argmax(1)
-            canon_cont = count[arange, slot] < target[arange, slot]
-            if flip > 0:
-                canon_cont = canon_cont ^ (torch.rand(N, device=dev) < flip)
+            depth = count[arange, slot]
             force = active & (count.sum(1) == 0) & (growable.sum(1) == 1)   # >=1-limb guard
-            do_cont = canon_cont | force
-            cont = do_cont & active
-            count[arange, slot] += cont.long()
-            reached = count[arange, slot] >= max_len
-            stopped[arange, slot] |= ((~do_cont) & active) | (cont & reached)
+            cat_mask, sub_mask = net._gen_masks(depth, force)
+
+            grow = depth < target[arange, slot]
+            if flip > 0:
+                grow = grow ^ (torch.rand(N, device=dev) < flip)
+            c = torch.where(grow, grow.new_full((), GEN_EFF), grow.new_full((), GEN_CAP)).long()
+            legal = cat_mask.gather(1, c.unsqueeze(1)).squeeze(1)
+            c = torch.where(legal, c, 1 - c)                 # only 2 categories, >=1 always legal
+
+            if eff_types is not None:                        # reconstruct a given body
+                s_eff = eff_types[arange, slot, depth.clamp(max=max_len - 1)]
+                s_cap = cap_types[arange, slot]
+            else:                                            # canonical chain + bare cap
+                s_eff = torch.where(depth == 0, depth.new_full((), EFF_SWING),
+                                    depth.new_full((), EFF_KNEE))
+                s_cap = depth.new_full((N,), CAP_BARE)
+            s = torch.where(c == GEN_EFF, s_eff, s_cap)
+            sm = sub_mask[arange, c]                                          # (N, N_SUB) valid set
+            if type_flip > 0 and eff_types is None:
+                u = torch.rand(N, N_SUB, device=dev) * sm.float()             # invalid -> exactly 0
+                s = torch.where(torch.rand(N, device=dev) < type_flip, u.argmax(1), s)
+            ok = sm.gather(1, s.clamp(min=0).unsqueeze(1)).squeeze(1)
+            s = torch.where(ok, s, sm.float().argmax(1))     # fall back to the first legal subtype
+
+            net.commit(count, cap_sub, eff_sub, arange, slot, depth, c, s, active)
             slots[:, t] = slot
-            actions[:, t] = torch.where(do_cont, do_cont.new_full((), _GEN_ON),
-                                        do_cont.new_full((), _GEN_STOP)).long()
+            cat_a[:, t] = c
+            sub_a[:, t] = s
             active_step[:, t] = active
-        return slots, actions, active_step, count
+        return slots, cat_a, sub_a, active_step, count, eff_sub, cap_sub
 
     @torch.no_grad()
     def _is_stable(self, counts):
@@ -422,7 +466,7 @@ class CodesignAgent(LoggingA2CAgent):
             other = other + (other >= ar).long()                      # uniform over the OTHER slots
             tmpl = self._base_target[torch.where(own, ar.expand(m, -1), other)]
             off = torch.round(torch.randn(m, _N_LIMBS, device=dev) * self._len_sigma).long()
-            c = torch.where(tmpl > 0, (tmpl + off).clamp(0, self._max_len), torch.zeros_like(tmpl))
+            c = torch.where(tmpl > 0, (tmpl + off).clamp(0, self._max_eff), torch.zeros_like(tmpl))
             c[c.sum(1) == 0, 0] = 2                                   # >=1-limb guard
             keep = c[self._is_stable(c) | (torch.rand(m, device=dev) < self._prob_invalid)]
             take = min(keep.shape[0], N - filled)
@@ -431,12 +475,15 @@ class CodesignAgent(LoggingA2CAgent):
         return out
 
     @torch.no_grad()
-    def _draw_base_counts(self, N):
-        """Warmup teacher draw -> body counts (N, n). See self._teacher."""
+    def _teacher_rollout(self, N):
+        """One scripted warmup-teacher draw. Returns the FULL frontier trace plus the realized body
+        (slots, cat_actions, sub_actions, active_step, counts, eff_sub, cap_sub) -- BC reads the
+        token trace, the ramp reads the body. See self._teacher for the length distribution; types
+        always come from the type-flip knob."""
         if self._teacher == 'parts':
-            return self._draw_parts_counts(N)
+            return self._frontier_rollout(self._draw_parts_counts(N), 0.0, self._type_flip)
         return self._frontier_rollout(self._base_target.view(1, _N_LIMBS).expand(N, _N_LIMBS),
-                                      self._flip)[3]
+                                      self._flip, self._type_flip)
 
     # ---- accumulate true episode returns (R_i, gamma=1) over the window ----------------
     def env_step(self, actions):
@@ -462,17 +509,20 @@ class CodesignAgent(LoggingA2CAgent):
 
     # ---- ramp: replace (1 - gen_fraction) of envs with base+-flip bodies -----------
     @torch.no_grad()
-    def _apply_ramp(self, counts):
-        """counts: (N, n) long generator-sampled module counts. Mix in base+-flip draws by fraction."""
+    def _apply_ramp(self, counts, eff_sub, cap_sub):
+        """Generator-sampled DESIGN (counts, per-depth effector subtypes, cap subtype). Mix in
+        teacher draws by fraction -- whole bodies, never a blend of two designs."""
         frac = self._gen_fraction()
         if frac >= 1.0:
             self._base_draw = None                         # RL phase: pure gen samples, no base draws
-            return counts
+            return counts, eff_sub, cap_sub
         N = counts.shape[0]
-        base = self._draw_base_counts(N)                   # (N,n) counts (>=1-module guaranteed)
-        self._base_draw = base                             # the around-base samples (build/*_base)
-        use_gen = (torch.rand(N, device=counts.device) < frac).unsqueeze(1)
-        return torch.where(use_gen, counts, base)
+        _, _, _, _, b_counts, b_eff, b_cap = self._teacher_rollout(N)
+        self._base_draw = b_counts                         # the around-base samples (build/*_base)
+        use = torch.rand(N, device=counts.device) < frac
+        return (torch.where(use.unsqueeze(1), counts, b_counts),
+                torch.where(use.view(N, 1, 1), eff_sub, b_eff),
+                torch.where(use.unsqueeze(1), cap_sub, b_cap))
 
     # ---- the resample-boundary joint update (one optimizer) -------------------------
     def _resample_update(self, R, obses):
@@ -515,11 +565,13 @@ class CodesignAgent(LoggingA2CAgent):
         # because R was measured on the body that actually ran. In pretrain, GenAct's BC target is a
         # separate, freshly-drawn TEACHER body (see the epoch loop).
         if pretrain:
-            slots, actions, valid, _ = self._frontier_rollout(self._cur_counts, 0.0)
+            slots, cat_a, sub_a, valid, *_ = self._frontier_rollout(
+                self._cur_counts, 0.0, eff_types=self._cur_eff, cap_types=self._cur_cap)
             old_logp, adv, raw_adv = None, None, None
         else:                                              # RL: PPO over the sampled trace
             tr = self._cur_trace
-            slots, actions, old_logp = tr['slots'], tr['actions'], tr['old_logp']
+            slots, cat_a, sub_a = tr['slots'], tr['cat_actions'], tr['sub_actions']
+            old_logp = tr['old_logp']
             valid = tr['active_step']                                     # mask no-op frontier steps
             raw_adv = tr['v_states'][:, 1:] - tr['v_states'][:, :-1]      # telescoping (Shapley)
             sel = raw_adv[valid]
@@ -537,32 +589,35 @@ class CodesignAgent(LoggingA2CAgent):
                 # is (1-frac) teacher + frac generator-samples with frac -> ~1 across the ramp, so
                 # cloning it makes the generator imitate ITSELF in the late windows -- a feedback loop
                 # that compounds fit error instead of correcting it.
-                bc_slots, bc_actions, _, _ = self._frontier_rollout(self._draw_base_counts(N), 0.0)
+                bc_slots, bc_cat, bc_sub, *_ = self._teacher_rollout(N)
             perm = torch.randperm(N, device=dev)
             for s in range(0, N, mb_size):
                 mb = perm[s:s + mb_size]
                 # --- generator: GenAct (PPO or BC) + GenCrit prefix fit ---
                 # gen_replay re-derives the valid (non-no-op) step mask from (slots,actions); average
                 # GenAct losses over valid steps only so no-op frontier steps don't dilute the signal.
-                logits, v, vm = net.gen_replay(slots[mb], actions[mb])   # (m,L,2), (m,L+1), (m,L)
+                # FACTORED GenAct: gen_replay returns masked log-probs for the category head and
+                # the per-category subtype head; gen_logp_entropy folds them into the joint
+                # logp = logp(cat) + logp(sub | cat) and the exact joint entropy.
+                cat_lp, sub_lp, v, vm = net.gen_replay(slots[mb], cat_a[mb], sub_a[mb])
                 vf = vm.float()
                 v_prefix = (v - R[mb].unsqueeze(1)).pow(2).mean()        # all L+1 prefixes -> R
 
                 if pretrain:                       # BC: separate replay on the teacher tokens
-                    bl, _, bm = net.gen_replay(bc_slots[mb], bc_actions[mb])
+                    b_cat_lp, b_sub_lp, _, bm = net.gen_replay(bc_slots[mb], bc_cat[mb], bc_sub[mb])
                     bf = bm.float()
                     nval = bf.sum().clamp(min=1.0)
-                    dist = torch.distributions.Categorical(logits=bl)
-                    gen_pg = -(dist.log_prob(bc_actions[mb]) * bf).sum() / nval
-                    ent = (dist.entropy() * bf).sum() / nval
+                    lp, ent_t = net.gen_logp_entropy(b_cat_lp, b_sub_lp, bc_cat[mb], bc_sub[mb])
+                    gen_pg = -(lp * bf).sum() / nval
+                    ent = (ent_t * bf).sum() / nval
                 else:                              # RL: PPO-clip on the sampled trace
                     nval = vf.sum().clamp(min=1.0)
-                    dist = torch.distributions.Categorical(logits=logits)
-                    ratio = (dist.log_prob(actions[mb]) - old_logp[mb]).exp()
+                    lp, ent_t = net.gen_logp_entropy(cat_lp, sub_lp, cat_a[mb], sub_a[mb])
+                    ratio = (lp - old_logp[mb]).exp()
                     a = adv[mb]
                     per = torch.min(ratio * a, ratio.clamp(1 - self._gen_clip, 1 + self._gen_clip) * a)
                     gen_pg = -(per * vf).sum() / nval
-                    ent = (dist.entropy() * vf).sum() / nval
+                    ent = (ent_t * vf).sum() / nval
 
                 # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
                 # Anchor on: sample from the snapshot SUBSET so H_full_new reuses this single forward
@@ -607,18 +662,21 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_log['R_mean'] = R.mean().item()
         self._gen_log['R_std'] = R.std().item()
         self._gen_log['by_limbcount'] = self._by_limbcount(R, self._cur_counts)
+        self._gen_log['types'] = self._type_usage()
         if not pretrain:                                   # RL: built body == generated (ramp off)
-            self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, actions, valid)
-            rank, ev, K = self._body_value_metrics(self._cur_trace['counts'],
+            self._gen_log['marg'] = self._slot_marginal(raw_adv, slots, cat_a, valid)
+            body_id = self._body_key(self._cur_trace['counts'].long(), self._cur_trace['eff_sub'],
+                                     self._cur_trace['cap_sub'])
+            rank, ev, K = self._body_value_metrics(body_id,
                                                    self._cur_trace['v_states'][:, -1], R)
             self._gen_log['value_rank_corr'] = rank       # denoised Spearman (NaN if <5 bodies)
             self._gen_log['value_ev'] = ev                # denoised per-body explained variance
             self._gen_log['n_distinct_bodies'] = float(K)
 
     @torch.no_grad()
-    def _slot_marginal(self, raw_adv, slots, actions, valid):
-        """Per-limb marginal value of adding a module (continue token), over valid steps only."""
-        on = (actions == _GEN_ON) & valid
+    def _slot_marginal(self, raw_adv, slots, cat_a, valid):
+        """Per-limb marginal value of adding an EFFECTOR, over valid steps only."""
+        on = (cat_a == GEN_EFF) & valid
         marg = torch.full((_N_LIMBS,), float('nan'), device=raw_adv.device)
         for k in range(_N_LIMBS):
             m = on & (slots == k)
@@ -636,16 +694,42 @@ class CodesignAgent(LoggingA2CAgent):
 
     @staticmethod
     @torch.no_grad()
-    def _body_value_metrics(counts, v_full, R):
-        """Denoised body-quality fit: group envs by distinct body (module-count vector), then compare
+    def _body_key(counts, eff_sub, cap_sub):
+        """Distinct-body id INCLUDING types: counts alone now under-counts, since two bodies with the
+        same limb lengths but different effector/cap kinds are different bodies. 64-bit polynomial
+        hash over [counts | eff_sub+1 | cap_sub+1] (wraparound is fine, it is only a bucket id)."""
+        B = counts.shape[0]
+        flat = torch.cat([counts.reshape(B, -1), (eff_sub + 1).reshape(B, -1),
+                          (cap_sub + 1).reshape(B, -1)], dim=1)
+        h = torch.zeros(B, dtype=torch.long, device=counts.device)
+        for j in range(flat.shape[1]):
+            h = h * 1000003 + flat[:, j]
+        return h
+
+    @torch.no_grad()
+    def _type_usage(self):
+        """Realized type mix over the CURRENT window's built bodies: fraction of effectors of each
+        kind and fraction of present limbs carrying each cap kind. The collapse canary for 5a --
+        a generator that never leaves the canonical (swing, knee, bare) corner has learnt nothing
+        about the new vocabulary."""
+        eff, cap = self._cur_eff, self._cur_cap
+        n_eff = (eff >= 0).sum().clamp(min=1)
+        n_cap = (cap >= 0).sum().clamp(min=1)
+        out = {f'eff/{EFF_NAMES[t]}': ((eff == t).sum() / n_eff).item() for t in range(len(EFF_NAMES))}
+        out.update({f'cap/{CAP_NAMES[t]}': ((cap == t).sum() / n_cap).item()
+                    for t in range(len(CAP_NAMES))})
+        return out
+
+    @staticmethod
+    @torch.no_grad()
+    def _body_value_metrics(body_id, v_full, R):
+        """Denoised body-quality fit: group envs by distinct body (see _body_key), then compare
         the generator's v(full) to each body's MEAN R (removes reset noise). Returns (rank_corr, ev,
         n_bodies):
           rank_corr = Spearman over bodies (NaN if <5 -> unreliable); spread/scale-robust.
           ev        = 1 - Var(meanR - v)/Var(meanR) over bodies (NaN if <2).
         Valid only when built==generated (RL phase), where R matches the generated body."""
         dev = R.device
-        base = int(counts.max().item()) + 1                       # radix over count values (>= max_len+1)
-        body_id = (counts.long() * (base ** torch.arange(_N_LIMBS, device=dev))).sum(1)
         _, inv = body_id.unique(return_inverse=True)
         K = int(inv.max().item()) + 1
         cnt = torch.zeros(K, device=dev).index_add_(0, inv, torch.ones_like(R))
@@ -694,9 +778,11 @@ class CodesignAgent(LoggingA2CAgent):
                      R=R.cpu().numpy())
 
         trace = self._net().sample(N)
-        counts = self._apply_ramp(trace['counts'].long())
-        self._cur_trace, self._cur_counts = trace, counts
-        env.set_next(counts)
+        counts, eff_sub, cap_sub = self._apply_ramp(
+            trace['counts'].long(), trace['eff_sub'], trace['cap_sub'])
+        self._cur_trace = trace
+        self._cur_counts, self._cur_eff, self._cur_cap = counts, eff_sub, cap_sub
+        env.set_next(counts, eff_sub, cap_sub)
         print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
               f"limbcount={(counts > 0).sum(1).float().mean().item():.2f} "
@@ -755,8 +841,12 @@ class CodesignAgent(LoggingA2CAgent):
             w.add_scalar('build/limbcount_var', limbc.var().item(), frame)  # diversity / collapse canary
             w.add_scalar('build/modulecount', modc.mean().item(), frame)
             w.add_scalar('build/modulecount_var', modc.var().item(), frame)
-        if 'n_distinct_bodies' in g:
+            self._log_diversity(w, frame)                  # M1: perplexity metrics (both BC + RL)
+        if 'n_distinct_bodies' in g:                       # kept as a saturating canary (M1)
             w.add_scalar('build/n_distinct', g['n_distinct_bodies'], frame)
+        # realized TYPE mix (5a collapse canary: all-canonical => the vocabulary is unused)
+        for k, val in g.get('types', {}).items():
+            w.add_scalar(f'build/type/{k}', val, frame)
 
         # --- gen/: GenAct (generator actor) learning ---
         w.add_scalar('gen/actor_loss', g['gen_pg'], frame)
@@ -791,10 +881,38 @@ class CodesignAgent(LoggingA2CAgent):
 
         self._gen_log = None
 
+    @torch.no_grad()
+    def _log_diversity(self, w, frame):
+        """build/* perplexity diversity from the current window's generator trace (native/typed
+        view). Replaces the saturating build/n_distinct (M1) -- a body count hard-capped at the
+        sample size -- with perplexities that have no ln(M) rail:
+          mean_limb_diversity = mean_n exp H(L_n)   within-limb commitment (effective # limb designs)
+          limb_diversity/<n>  = exp H(L_n)          per compass slot
+          body_diversity      = exp H(B)            effective # distinct bodies (Rao-Blackwell over
+                                                    the generator's OWN step entropy, not a count)
+          body_structure      = C / sum_n H(L_n)    scale-free cross-limb redundancy (0 = independent
+                                                    limb-lotteries, >0 = correlated body plans)
+        Typed reprs pair with the FULL step_entropy (== step_entropy_cat + step_entropy_sub), so the
+        joint-entropy term is alphabet-matched to the repr and C is not inflated (M3b)."""
+        tr = self._cur_trace
+        reprs = population_to_repr(tr['counts'].detach().cpu().numpy().astype(int),
+                                   tr['eff_sub'].detach().cpu().numpy().astype(int),
+                                   tr['cap_sub'].detach().cpu().numpy().astype(int))
+        h_body = rao_blackwell_h_body(tr['step_entropy'].detach().cpu().numpy(),
+                                      tr['active_step'].detach().cpu().numpy())
+        red = redundancy(reprs, h_body)                    # N_body, C_nats, N_limb, H_within_sum, ...
+        w.add_scalar('build/mean_limb_diversity', red['N_limb_mean'], frame)
+        w.add_scalar('build/body_diversity', red['N_body'], frame)
+        sumH = red['H_within_sum']
+        w.add_scalar('build/body_structure', red['C_nats'] / sumH if sumH > 1e-9 else 0.0, frame)
+        for i in range(_N_LIMBS):
+            w.add_scalar(f'build/limb_diversity/{_LIMB_CODE[i + 1]}', float(red['N_limb'][i]), frame)
+
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):
         s = super().get_full_state_weights()
         s.update(gen_window=self._gen_window, cur_counts=self._cur_counts,
+                 cur_eff=self._cur_eff, cur_cap=self._cur_cap,
                  cur_trace=self._cur_trace, steps_since_resample=self._steps_since_resample)
         return s
 
@@ -804,6 +922,9 @@ class CodesignAgent(LoggingA2CAgent):
             return
         self._gen_window = int(weights['gen_window'])
         self._cur_counts = weights['cur_counts'].to(self.ppo_device)
+        if 'cur_eff' in weights:
+            self._cur_eff = weights['cur_eff'].to(self.ppo_device)
+            self._cur_cap = weights['cur_cap'].to(self.ppo_device)
         tr = weights.get('cur_trace')
         self._cur_trace = {k: v.to(self.ppo_device) for k, v in tr.items()} if tr else None
         self._steps_since_resample = int(weights.get('steps_since_resample', 0))

@@ -31,7 +31,7 @@ class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
         if self._gen and getattr(e, '_sample_morphs', False):
             tr = self.model.a2c_network.net.sample(e.total_num_envs)
             counts = tr['counts'].long()
-            e.set_next(counts)
+            e.set_next(counts, tr['eff_sub'], tr['cap_sub'])
             e.resample()                               # full rebuild to the sampled bodies
             print(f"[codesign-play] sampled bodies: mean #limbs="
                   f"{(counts > 0).sum(1).float().mean().item():.2f} "
