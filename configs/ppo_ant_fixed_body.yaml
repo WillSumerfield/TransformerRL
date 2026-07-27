@@ -1,0 +1,16 @@
+# Fixed-canonical-body control.
+#
+# Inherit the selected CoDesign controller settings, then disable morphology
+# learning by never reaching a resample boundary. The body therefore remains
+# the environment's initial [1, 4, 6] morphology for the entire training run.
+# `fixed_body_continuous` uses the CoDesign training agent (same PPO, AdamW,
+# warmup, FD and FK code) but the fixed-body player, which never samples the
+# dormant generator when the checkpoint is played.
+extends: ppo_ant_codesign_single.yaml
+
+params:
+  algo:
+    name: fixed_body_continuous
+
+  config:
+    resample_interval: 0

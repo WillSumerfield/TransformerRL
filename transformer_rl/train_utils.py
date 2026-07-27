@@ -962,6 +962,16 @@ def run_training(
     runner.algo_factory.register_builder(
         'codesign_continuous', lambda **kwargs: CodesignAgent(**kwargs)
     )
+    # The fixed baseline deliberately reuses the complete CoDesign controller
+    # training stack. Its config sets resample_interval=0, so no generator
+    # update or morphology rebuild occurs.
+    def _fixed_body_agent(**kwargs):
+        interval = kwargs["params"]["config"].get("resample_interval", 0)
+        if interval:
+            raise ValueError("fixed_body_continuous requires resample_interval=0")
+        return CodesignAgent(**kwargs)
+
+    runner.algo_factory.register_builder('fixed_body_continuous', _fixed_body_agent)
     # Play uses rl_games' Player, not the agent. PPG shares the standard continuous net so the
     # stock player runs it; codesign uses a custom player that samples bodies from the trained
     # generator distribution each episode (else it would just show the fixed base morph).
@@ -979,6 +989,10 @@ def run_training(
     runner.player_factory.register_builder('a2c_continuous', _mk_player(SwitchablePlayer))
     runner.player_factory.register_builder('ppg_continuous', _mk_player(SwitchablePlayer))
     runner.player_factory.register_builder('codesign_continuous', _mk_player(CodesignPlayer))
+    runner.player_factory.register_builder(
+        'fixed_body_continuous',
+        _mk_player(SwitchablePlayer),
+    )
     runner.load(config)
 
     run_args = {"train": mode == "train", "play": mode == "play"}

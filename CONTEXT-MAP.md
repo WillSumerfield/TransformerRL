@@ -9,6 +9,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ├── CONTEXT-MAP.md                    ← this file; shared kernel below
 ├── docs/
 │   ├── adr/                          ← system-wide decisions
+│   ├── paper/                        ← related-work and paper-facing evidence
 │   ├── transformer_architecture.md   (living doc: full obs→action flow, shapes, why)
 │   ├── adaptive_ant_fixes.md
 │   ├── group_count_throughput.md     (playbook: group-count-independent env throughput)
@@ -28,16 +29,30 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── architectures.py              (LimbTransformer, MultiMorphLimbTransformer)
 │   ├── tokenize.py                   (obs → root/module tokens; codesign uniform module tokens)
 │   ├── models.py                     (rl_games model/network builders)
-│   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
+│   ├── codesign_agent.py
+│   ├── codesign_player.py
 │   ├── logging_agent.py
+│   ├── policy_switch.py
 │   └── train_utils.py
+├── benchmarks/                       ← Benchmark context
+│   ├── CONTEXT.md
+│   ├── codesign.py                   (CoDesign + shared controller loading)
+│   ├── fixed_body.py                 (fixed-base-morph control)
+│   ├── evaluate.py                   (shared rollout/artifact flow)
+│   ├── metrics.py
+│   └── data.py
 ├── scripts/                          ← Training context
 │   ├── CONTEXT.md
 │   ├── train_ant_*.py
+│   ├── benchmark_eval.py             (ADR-0016 method-agnostic evaluator)
+│   ├── eval.py                       (legacy CoDesign evaluator)
+│   ├── activate_uv.sh                (manual UV/VLearn activation)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
+│   ├── benchmarks/                   (shared benchmark protocol)
 │   ├── ppo_ant*.yaml
 │   └── tune_config.yaml
+├── tests/                             ← Benchmark contract tests
 ├── experiments/                      ← Analysis context
 │   ├── CONTEXT.md
 │   └── attention_over_time.py
@@ -50,6 +65,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 
 - [Morphology](./envs/CONTEXT.md) — the ant body design space: vsim physics builds, the morphology set, active/inactive DOFs, the DOF mask
 - [Control](./transformer_rl/CONTEXT.md) — the transformer policy that controls any morphology: tokenization, limb encoding, token masking, rl_games integration
+- [Benchmarks](./benchmarks/CONTEXT.md) — readable method modules and the shared native-pair evaluation, metric, seed, and artifact contract
 - [Training](./scripts/CONTEXT.md) — PPO training, Optuna tuning, play/render orchestration
 - [Analysis](./experiments/CONTEXT.md) — attention studies over trained policies
 
@@ -57,6 +73,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 
 - **Morphology → Control**: Morphology emits the observation — **139-D baseline** (107 physical + 8 hip_lengths + 8 ankle_lengths + 16 DOF mask) or **219-D codesign** (variable-length `module_lengths` + 32 DOF mask, layout from `tdims`); Control tokenizes it and reads the DOF mask to decide which limb/module tokens exist.
 - **Control → Training**: Control registers networks/models with rl_games under names Training selects via config `model.name` / `network.name`.
+- **Control/Morphology → Benchmarks**: plainly named method modules load native controllers, sample typed bodies, and install them through the common VSim morphology interface; `benchmarks/evaluate.py` owns comparison semantics.
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
 - **Shared kernel** (below): Robot, Morphology, Limb, Module, Root, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign, Task — defined once here, used identically across all contexts.
 

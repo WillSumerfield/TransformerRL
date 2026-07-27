@@ -137,13 +137,21 @@ class CodesignAgent(LoggingA2CAgent):
         # n_pretrain resamples is fixed by (resample_interval * max_episode_length / horizon_length).
         # Off by default (config.lr_warmup) -> self.scheduler stays rl_games' plain AdaptiveScheduler.
         interval = self.config.get('resample_interval', 0)
-        if bool(self.config.get('lr_warmup', False)) and interval and env is not None:
-            epochs_per_window = max(1, math.ceil(interval * env.max_episode_length / self.horizon_length))
-            # 3c sweep: DECOUPLE the LR-ramp span from pretrain. `warmup_epochs` (config) overrides;
-            # unset (0) => n_pretrain*epochs_per_window (the old pretrain-coupled 504-epoch ramp that
-            # ran the whole BC pretrain cold). A short ramp reaches peak within a window, then pretrain
-            # runs hot. Peak stays == learning_rate; only the ramp DURATION changes.
-            warmup_epochs = int(self.config.get('warmup_epochs', 0)) or self._n_pretrain * epochs_per_window
+        if bool(self.config.get('lr_warmup', False)) and env is not None:
+            # An explicit span also applies to fixed-body controls (interval=0), so they inherit
+            # the selected CoDesign controller schedule exactly. Only the old derived default
+            # needs a morphology-window interval.
+            warmup_epochs = int(self.config.get('warmup_epochs', 0))
+            if not warmup_epochs:
+                if not interval:
+                    raise ValueError("lr_warmup with resample_interval=0 needs warmup_epochs")
+                epochs_per_window = max(
+                    1,
+                    math.ceil(
+                        interval * env.max_episode_length / self.horizon_length
+                    ),
+                )
+                warmup_epochs = self._n_pretrain * epochs_per_window
             self.scheduler = _WarmupThenAdaptiveScheduler(
                 peak_lr=float(self.last_lr), warmup_epochs=warmup_epochs,
                 kl_threshold=getattr(self, 'kl_threshold', self.config.get('kl_threshold', 0.008)))

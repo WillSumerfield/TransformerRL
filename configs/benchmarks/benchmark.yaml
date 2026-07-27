@@ -1,0 +1,101 @@
+# One readable source of truth for the benchmark. Method-specific settings are
+# grouped at the bottom instead of inherited from another YAML file.
+protocol_version: 1
+method: codesign
+
+# The evaluator does not train anything. These are only the conditions a saved
+# run must satisfy to qualify as a final paper result. Development checkpoints
+# can bypass them with --allow-incomplete-training or --allow-seed-mismatch.
+paper_run_requirements:
+  # Required physics-step budget: 3000 epochs * 4096 envs * horizon 16.
+  environment_steps: 196608000
+  # Required number of parallel VSim environments used during training.
+  parallel_envs: 4096
+  # Five independent training seeds used for the final paper results.
+  training_seeds: [42, 43, 44, 45, 46]
+
+evaluation:
+  # "paper" is the full evaluation; "smoke" is a quick development check.
+  # The CLI can override this with --preset paper|smoke.
+  preset: paper
+
+  # These integers are used exactly as written—there is no hashing or
+  # derivation. The CLI's --seed N sets all three to N.
+  seeds:
+    # Chooses which bodies the trained method samples for VSim evaluation.
+    morphology: 1
+    # Controls VSim initial conditions and episode-reset randomness.
+    rollout: 1
+    # Chooses a separate body-only sample used for diversity metrics.
+    diversity: 1
+
+  presets:
+    paper:
+      # A "pair" is one sampled morphology and its method-native controller.
+      # CoDesign uses the checkpoint's shared controller for every sampled body;
+      # future NGE/BodyGen bodies may each have their own controller.
+      pairs: 128
+      # Every pair is held fixed and run for this many complete VSim episodes.
+      episodes_per_pair: 32
+      # Report the mean return of the best K pairs from the sampled population.
+      top_k: 10
+      # Extra bodies sampled without VSim rollout, used only for diversity
+      # (unique fraction, entropy/effective count, and structural distance).
+      design_samples: 4096
+
+    # Same process as paper, but deliberately tiny and not publication-quality.
+    smoke:
+      pairs: 4
+      episodes_per_pair: 2
+      top_k: 2
+      design_samples: 32
+
+runtime:
+  # Device used for policy inference and the VSim environments.
+  device: cuda:0
+
+output:
+  # Each invocation creates a no-overwrite comparison directory under here.
+  root: evals/benchmarks
+  # null creates a timestamped name; set a string for a stable chosen name.
+  evaluation_id: null
+
+logging:
+  # TensorBoard is the required durable local metric record.
+  tensorboard: true
+  # Optional mirror of the same metrics. Credentials alone do not enable it.
+  wandb:
+    enabled: false
+    mode: offline
+    project: null
+    entity: null
+    group: null
+
+# These may only be disabled explicitly for local development checks.
+checks:
+  enforce_training_budget: true
+  enforce_training_seed: true
+
+codesign:
+  # The CLI supplies a positional run and resolves --epochs for each job.
+  # These nulls therefore mean "read it from the selected saved run".
+  run_dir: null
+  run_config: null
+  # Used by direct library calls; the CLI's --epochs is normally authoritative.
+  checkpoint: final
+  # null reads params.seed from the saved run config.
+  training_seed: null
+
+fixed_body:
+  # Named runs are resolved beneath this directory. Absolute paths also work.
+  run_root: runs/benchmarks/fixed_body/fixed_body_transformer
+  run_dir: null
+  run_config: null
+  checkpoint: final
+  training_seed: null
+
+# Numerical tolerances used by tests comparing CoDesign action/value outputs
+# against scripts/eval.py. They do not change normal evaluation results.
+parity:
+  relative_tolerance: 1.0e-6
+  absolute_tolerance: 1.0e-5
