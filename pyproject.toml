@@ -27,4 +27,4 @@ notebook = [
 ]
 
 [tool.uv.sources]
-vlearn = { path = "../vlearn-main/vlearn-0.3.9-cp311-cp311-linux_x86_64.whl" }
+vlearn = { path = "/home/alex-daniel/opt/vsim/vlearn-0.3.12/vlearn-0.3.12-cp311-cp311-linux_x86_64.whl" }
