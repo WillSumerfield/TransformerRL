@@ -16,6 +16,14 @@ Example (the warmup-length sweep it was generalized from):
     --seeds 42 --max-epochs 1500 --name-prefix warm --control
   # -> warm64_s42, warm128_s42, warm256_s42 (+ warmctrl_s42), sequential, then a reward table.
 
+Seeds-only mode: omit --param/--values to just replicate ONE base config over --seeds (no sweep axis):
+  python scripts/sweep.py \
+    --script scripts/train_ant_codesign_single.py \
+    --config configs/ppo_ant_codesign_single.yaml \
+    --seeds 42,43,44 --max-epochs 1500 --name-prefix base
+  # -> base_s42, base_s43, base_s44, then a per-seed reward table.
+  # --control is redundant here (every run IS the base config) and is rejected.
+
 Non-destructive: if a run name already exists the train script aborts that point (rc!=0); sweep marks
 it FAILED and continues. It never deletes run dirs.
 """
@@ -48,8 +56,8 @@ def main():
     ap = argparse.ArgumentParser(description="Enumerate-and-run config sweep (Optuna search = tune.py)")
     ap.add_argument("--script", required=True, help="train script = the alg+env, e.g. scripts/train_ant_codesign_single.py")
     ap.add_argument("--config", required=True, help="base config yaml")
-    ap.add_argument("--param", required=True, help="dotted config key to sweep, e.g. params.config.warmup_epochs")
-    ap.add_argument("--values", required=True, help="comma-separated values for --param")
+    ap.add_argument("--param", default=None, help="dotted config key to sweep, e.g. params.config.warmup_epochs (omit for seeds-only replication)")
+    ap.add_argument("--values", default=None, help="comma-separated values for --param (omit for seeds-only replication)")
     ap.add_argument("--seeds", default="42", help="comma-separated seeds (default 42)")
     ap.add_argument("--name-prefix", required=True, dest="name_prefix", help="run = {prefix}{value}_s{seed}")
     ap.add_argument("--max-epochs", type=int, default=None, dest="max_epochs")
@@ -61,17 +69,30 @@ def main():
     ap.add_argument("--runs-root", default="runs", dest="runs_root", help="root globbed for reward scraping")
     args = ap.parse_args()
 
-    values = [v.strip() for v in args.values.split(",") if v.strip()]
-    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
-    leaf = args.param.split(".")[-1]
+    # --param/--values are both-or-neither: present => sweep mode, absent => seeds-only replication.
+    if (args.param is None) != (args.values is None):
+        ap.error("--param and --values must be given together (omit both for seeds-only replication)")
+    seeds_only = args.param is None
+    if seeds_only and args.control:
+        ap.error("--control is redundant without --param; every seeds-only run is already the base config")
 
-    # (label, set-value or None-for-control) x seeds -> the run plan
-    points = ([("control", None)] if args.control else []) + [(v, v) for v in values]
-    plan = []
-    for label, val in points:
-        for seed in seeds:
-            tag = "ctrl" if val is None else _san(val)
-            plan.append((label, val, seed, f"{args.name_prefix}{tag}_s{seed}"))
+    seeds = [int(s) for s in args.seeds.split(",") if s.strip()]
+
+    if seeds_only:
+        leaf = "seeds"
+        # one base point per seed; name = {prefix}_s{seed}
+        plan = [("base", None, seed, f"{args.name_prefix}_s{seed}") for seed in seeds]
+        values = []
+    else:
+        values = [v.strip() for v in args.values.split(",") if v.strip()]
+        leaf = args.param.split(".")[-1]
+        # (label, set-value or None-for-control) x seeds -> the run plan
+        points = ([("control", None)] if args.control else []) + [(v, v) for v in values]
+        plan = []
+        for label, val in points:
+            for seed in seeds:
+                tag = "ctrl" if val is None else _san(val)
+                plan.append((label, val, seed, f"{args.name_prefix}{tag}_s{seed}"))
 
     print(f"[sweep] {len(plan)} runs | param={args.param} | values={values} | seeds={seeds} "
           f"| control={args.control} | extra_set={args.extra_set}", flush=True)
