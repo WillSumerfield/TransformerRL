@@ -64,8 +64,11 @@ def load_config(path: str | Path, *, preset: str | None = None) -> dict[str, Any
 
 def validate_config(config: dict[str, Any]) -> None:
     """Check only comparison rules whose violation could invalidate a result."""
-    if config.get("method") not in {"codesign", "fixed_body"}:
-        raise ValueError("method must be codesign or fixed_body")
+    methods = {"codesign", "fixed_body", "uniform_action"}
+    if config.get("method") not in methods:
+        raise ValueError(
+            "method must be codesign, fixed_body or uniform_action"
+        )
 
     requirements = config.get("paper_run_requirements", {})
     if int(requirements.get("environment_steps", 0)) <= 0:

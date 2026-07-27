@@ -22,6 +22,8 @@ The `scripts/benchmark_eval.py` companion to **Eval**, deliberately using the sa
 The fixed-base-morph stage adds `--method fixed_body` for an unprefixed run. Mixed comparisons use
 explicit positional labels, for example `codesign=RUN_A fixed_body=RUN_B`, and still produce one
 comparison artifact through the same evaluator.
+The uniform-action stage adds `--method uniform_action`; all three can be compared in one invocation
+with `codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C`.
 
 **Fixed-body training**:
 `scripts/train_ant_fixed_body.py` pairs with `configs/ppo_ant_fixed_body.yaml`. The config inherits
@@ -29,6 +31,15 @@ the selected CoDesign controller settings and changes only the algorithm label p
 `resample_interval: 0`. The fixed algorithm uses the same CoDesign PPO/AdamW/warmup/FD/FK agent but
 a normal fixed-body player; with no resample boundary, generator updates and morphology rebuilds
 cannot occur. Training starts and remains on the `[1,4,6]` base morph.
+
+**Uniform-action training**:
+`scripts/train_ant_uniform_action.py` pairs with `configs/ppo_ant_uniform_action.yaml`. The config
+inherits the complete selected CoDesign controller configuration and changes only the algorithm
+label; it writes `resample_interval: 1` explicitly to prevent accidental fixed-body training.
+Training begins on `[1,4,6]`, then `UniformActionAgent` installs a fresh
+`net.sample(..., mode="uniform")` population at each normal morphology boundary. It runs controller
+PPO/AdamW/FD/FK exactly as CoDesign does, but it does not train GenAct or GenCrit and does not run the
+generator's control-cloning update.
 
 **Benchmark implementation sequence**:
 Contract-gated delivery in increasing integration complexity: shared protocol and evaluator, codesign parity, fixed and uniform controls, faithful NGE, then faithful BodyGen. Every completed stage remains in the final five-method suite.

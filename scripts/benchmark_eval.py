@@ -8,14 +8,15 @@ retains every sampled body and episode.
 
 Usage:
   python scripts/benchmark_eval.py RUN [RUN ...]
-      [--method codesign|fixed_body]
+      [--method codesign|fixed_body|uniform_action]
       [--epochs final|N,N,...] [--preset paper|smoke]
       [--episodes N] [--top-k K] [--num-envs N] [--out DIRECTORY]
 
 An unprefixed RUN uses ``--method`` (or the YAML's ``method``). To compare
 different methods in one result, prefix each run, for example:
 
-  python scripts/benchmark_eval.py codesign=RUN_A fixed_body=RUN_B
+  python scripts/benchmark_eval.py \
+      codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C
 
 ``final`` is the paper default. Numeric epochs are intended for development and
 normally require ``--allow-incomplete-training``.
@@ -84,10 +85,12 @@ from benchmarks.codesign import (  # noqa: E402
 )
 from benchmarks.evaluate import evaluate_runs, load_config, validate_config  # noqa: E402
 from benchmarks.fixed_body import load_fixed_body  # noqa: E402
+from benchmarks.uniform_action import load_uniform_action  # noqa: E402
 
 _METHOD_LOADERS = {
     "codesign": load_codesign,
     "fixed_body": load_fixed_body,
+    "uniform_action": load_uniform_action,
 }
 
 
@@ -99,7 +102,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "runs",
         nargs="*",
-        help="run directory, optionally written as codesign=RUN or fixed_body=RUN",
+        help=(
+            "run directory, optionally prefixed with codesign=, fixed_body= "
+            "or uniform_action="
+        ),
     )
     parser.add_argument(
         "--method",

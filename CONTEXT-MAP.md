@@ -30,6 +30,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── tokenize.py                   (obs → root/module tokens; codesign uniform module tokens)
 │   ├── models.py                     (rl_games model/network builders)
 │   ├── codesign_agent.py
+│   ├── uniform_action_agent.py       (uniform-action training control)
 │   ├── codesign_player.py
 │   ├── logging_agent.py
 │   ├── policy_switch.py
@@ -38,6 +39,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── CONTEXT.md
 │   ├── codesign.py                   (CoDesign + shared controller loading)
 │   ├── fixed_body.py                 (fixed-base-morph control)
+│   ├── uniform_action.py             (uniform grammar-action control)
 │   ├── evaluate.py                   (shared rollout/artifact flow)
 │   ├── metrics.py
 │   └── data.py

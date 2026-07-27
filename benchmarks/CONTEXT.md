@@ -9,8 +9,9 @@ The deliberately small implementation of ADR-0016. Benchmark settings live in
 2. `evaluate.py` — the complete sample → VSim rollout → score → save flow.
 3. `codesign.py` — CoDesign plus the saved-controller loading shared with its controls.
 4. `fixed_body.py` — the fixed-base-morph control; one short specialization.
-5. `metrics.py` — exact definitions of every shared reported metric.
-6. `data.py` — the two arrays-based data containers exchanged between them.
+5. `uniform_action.py` — the uniform grammar-action control; one short specialization.
+6. `metrics.py` — exact definitions of every shared reported metric.
+7. `data.py` — the two arrays-based data containers exchanged between them.
 
 No dynamic adapter framework or YAML inheritance is used. When another method arrives, it should
 first be added as one plainly named module with the same small set of methods used in
@@ -52,6 +53,23 @@ and to flow through the exact same metric/artifact path. Morphology and diversit
 effect, diversity correctly has effective body count one, and the environment stays on its
 canonical initial build rather than invoking a rebuild.
 
+**Uniform-action benchmark method**:
+`uniform_action.py` reuses the same controller loader and changes only
+`CodesignMethod.sampling_mode` from `stochastic` to `uniform`. This invokes the generator's existing
+grammar-masked MDP with zero action logits: every valid action is equally likely at each decision.
+It is not a uniform distribution over completed bodies. Repeated sampled bodies retain their
+frequency as probability mass, exactly like CoDesign samples.
+
+## Check the benchmark contracts
+
+In a new shell, load the project environment and then run all three small
+benchmark test groups:
+
+```bash
+source scripts/activate_uv.sh
+python -m unittest discover -s tests -p 'test_benchmark*.py'
+```
+
 ## Implementation history
 
 - Stage 1 originally introduced generic adapters, recursive config overlays, and separate runner,
@@ -62,3 +80,7 @@ canonical initial build rather than invoking a rebuild.
 - The first control baseline added one inherited training config, one training entry point, and
   `fixed_body.py`. It reuses the complete selected CoDesign controller training stack with
   `resample_interval=0`; therefore generator updates and morphology rebuilds never occur.
+- The second control added the equally small `uniform_action.py` adapter and a
+  `UniformActionAgent`. Training begins on the shared base morph, then replaces each morphology
+  window with `net.sample(..., mode="uniform")`. Controller PPO/AdamW/FD/FK training is unchanged;
+  GenAct, GenCrit, and the generator's control-cloning update are not run.

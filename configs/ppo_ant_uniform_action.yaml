@@ -1,0 +1,15 @@
+# Uniform-action morphology control.
+#
+# Inherit every selected CoDesign controller setting. Morphologies still change
+# at the same resample cadence, but UniformActionAgent draws each new body by
+# choosing uniformly among the grammar-valid actions. It never optimizes GenAct
+# or GenCrit and never performs the generator's control-cloning update.
+extends: ppo_ant_codesign_single.yaml
+
+params:
+  algo:
+    name: uniform_action_continuous
+
+  config:
+    # Written explicitly so the baseline cannot accidentally become fixed-body.
+    resample_interval: 1

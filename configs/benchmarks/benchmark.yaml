@@ -94,6 +94,16 @@ fixed_body:
   checkpoint: final
   training_seed: null
 
+uniform_action:
+  # Named runs are resolved beneath this directory. The controller was trained
+  # while bodies were drawn from uniform valid grammar actions at every
+  # morphology window; evaluation draws fresh bodies from that same policy.
+  run_root: runs/benchmarks/uniform_action/uniform_action_transformer
+  run_dir: null
+  run_config: null
+  checkpoint: final
+  training_seed: null
+
 # Numerical tolerances used by tests comparing CoDesign action/value outputs
 # against scripts/eval.py. They do not change normal evaluation results.
 parity:

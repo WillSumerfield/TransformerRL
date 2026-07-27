@@ -972,11 +972,32 @@ def run_training(
         return CodesignAgent(**kwargs)
 
     runner.algo_factory.register_builder('fixed_body_continuous', _fixed_body_agent)
+    # The uniform-action control keeps the same PPO/AdamW/auxiliary training
+    # stack, but its small subclass replaces each learned generator update with
+    # a fresh uniform draw from the grammar.
+    from .uniform_action_agent import UniformActionAgent
+
+    def _uniform_action_agent(**kwargs):
+        interval = kwargs["params"]["config"].get("resample_interval", 0)
+        if interval <= 0:
+            raise ValueError(
+                "uniform_action_continuous requires resample_interval > 0"
+            )
+        return UniformActionAgent(**kwargs)
+
+    runner.algo_factory.register_builder(
+        'uniform_action_continuous',
+        _uniform_action_agent,
+    )
     # Play uses rl_games' Player, not the agent. PPG shares the standard continuous net so the
     # stock player runs it; codesign uses a custom player that samples bodies from the trained
     # generator distribution each episode (else it would just show the fixed base morph).
     # All three share SwitchMixin so play can hot-swap checkpoints (inert when switch=None).
-    from .codesign_player import CodesignPlayer, SwitchablePlayer
+    from .codesign_player import (
+        CodesignPlayer,
+        SwitchablePlayer,
+        UniformActionPlayer,
+    )
 
     def _mk_player(cls):
         def build(**kwargs):
@@ -992,6 +1013,10 @@ def run_training(
     runner.player_factory.register_builder(
         'fixed_body_continuous',
         _mk_player(SwitchablePlayer),
+    )
+    runner.player_factory.register_builder(
+        'uniform_action_continuous',
+        _mk_player(UniformActionPlayer),
     )
     runner.load(config)
 

@@ -168,6 +168,7 @@ class CodesignMethod:
     """The small method-specific surface consumed by ``benchmarks.evaluate``."""
 
     name = "codesign"
+    sampling_mode = "stochastic"
 
     def __init__(
         self,
@@ -200,7 +201,7 @@ class CodesignMethod:
         )
 
     def _sample(self, count: int, seed: int) -> EvaluationPairs:
-        """Sample with the trained generator's native stochastic distribution."""
+        """Sample the method's native morphology distribution at an exact seed."""
         cuda_devices = []
         if self.device.type == "cuda":
             cuda_devices = [
@@ -210,7 +211,7 @@ class CodesignMethod:
             ]
         with torch.random.fork_rng(devices=cuda_devices):
             torch.manual_seed(int(seed))
-            sample = self.network.net.sample(count, mode="stochastic")
+            sample = self.network.net.sample(count, mode=self.sampling_mode)
         return EvaluationPairs(
             counts=sample["counts"].detach().cpu().numpy(),
             eff_sub=sample["eff_sub"].detach().cpu().numpy(),

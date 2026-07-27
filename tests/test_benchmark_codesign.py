@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import os
 import subprocess
 import sys
@@ -18,7 +20,10 @@ from benchmarks.codesign import (
 )
 from benchmarks.evaluate import load_config
 from benchmarks.fixed_body import FixedBodyMethod
+from benchmarks.uniform_action import UniformActionMethod
 from scripts import eval as legacy_eval
+from transformer_rl.train_utils import _load_config
+from transformer_rl.uniform_action_agent import UniformActionAgent
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,8 +31,11 @@ ROOT = Path(__file__).resolve().parents[1]
 class _Inner:
     tdims = {"raw_tail_off": 2, "raw_tail_dim": 2}
 
+    def __init__(self):
+        self.sample_modes = []
+
     def sample(self, count: int, mode: str = "stochastic"):
-        del mode
+        self.sample_modes.append(mode)
         counts = torch.zeros((count, 8))
         counts[:, 0] = 1
         effectors = torch.full((count, 8, 4), -1, dtype=torch.long)
@@ -199,6 +207,100 @@ class CodesignBenchmarkTests(unittest.TestCase):
         np.testing.assert_array_equal(first.counts[0], [2, 0, 0, 2, 0, 2, 0, 0])
         np.testing.assert_array_equal(first.eff_sub[0, 0, :2], [0, 1])
         self.assertTrue(np.all(first.cap_sub == 0))
+
+    def test_uniform_action_evaluation_uses_uniform_mode_and_exact_seed(self) -> None:
+        method = object.__new__(UniformActionMethod)
+        method.network = _Network()
+        method.device = torch.device("cpu")
+        method.checkpoint_path = Path("uniform.pth")
+
+        first = method.sample_pairs(8, seed=17)
+        second = method.sample_pairs(8, seed=17)
+
+        self.assertEqual(method.network.net.sample_modes, ["uniform", "uniform"])
+        np.testing.assert_array_equal(first.counts, second.counts)
+        np.testing.assert_array_equal(first.eff_sub, second.eff_sub)
+        np.testing.assert_array_equal(first.cap_sub, second.cap_sub)
+
+    def test_uniform_action_inherits_the_codesign_controller_config(self) -> None:
+        codesign = _load_config(ROOT / "configs/ppo_ant_codesign_single.yaml")
+        uniform = _load_config(ROOT / "configs/ppo_ant_uniform_action.yaml")
+
+        self.assertEqual(
+            uniform["params"]["algo"]["name"],
+            "uniform_action_continuous",
+        )
+        self.assertEqual(uniform["env"], codesign["env"])
+        self.assertEqual(
+            uniform["params"]["network"],
+            codesign["params"]["network"],
+        )
+        self.assertEqual(
+            uniform["params"]["config"],
+            codesign["params"]["config"],
+        )
+
+    def test_uniform_training_resamples_without_a_generator_update(self) -> None:
+        class FakeEnvironment:
+            max_episode_length = 1
+            total_num_envs = 2
+            _sample_morphs = True
+
+            def __init__(self):
+                self.installed = None
+                self.resample_count = 0
+
+            def set_next(self, counts, effectors, caps):
+                self.installed = (counts, effectors, caps)
+
+            def resample(self):
+                self.resample_count += 1
+
+        class FakeGenerator:
+            def __init__(self):
+                self.modes = []
+
+            def sample(self, count, mode):
+                self.modes.append(mode)
+                counts = torch.ones((count, 8), dtype=torch.long)
+                effectors = torch.zeros((count, 8, 4), dtype=torch.long)
+                caps = torch.zeros((count, 8), dtype=torch.long)
+                return {
+                    "counts": counts,
+                    "presence": counts > 0,
+                    "eff_sub": effectors,
+                    "cap_sub": caps,
+                }
+
+        environment = FakeEnvironment()
+        generator = FakeGenerator()
+        agent = object.__new__(UniformActionAgent)
+        agent.config = {"resample_interval": 1}
+        agent.horizon_length = 1
+        agent._steps_since_resample = 0
+        agent._env = lambda: environment
+        agent._window_Ri = lambda: torch.tensor([1.0, 2.0])
+        agent._r_scale = 1.0
+        agent._net = lambda: generator
+        agent._gen_window = 0
+        agent.epoch_num = 3
+        agent.env_reset = lambda: torch.zeros((2, 1))
+        agent.current_rewards = torch.ones(2)
+        agent.current_lengths = torch.ones(2)
+        agent._ep_ret = torch.ones(2)
+        agent._win_ret_sum = torch.ones(2)
+        agent._win_ret_cnt = torch.ones(2)
+        agent._morph_meta = object()
+
+        # No _resample_update attribute is installed: succeeding proves this
+        # control does not invoke the learned generator update.
+        with contextlib.redirect_stdout(io.StringIO()):
+            agent._maybe_resample()
+
+        self.assertEqual(generator.modes, ["uniform"])
+        self.assertEqual(environment.resample_count, 1)
+        self.assertEqual(agent._steps_since_resample, 0)
+        self.assertTrue(torch.equal(agent._cur_counts, torch.ones((2, 8))))
 
 
 if __name__ == "__main__":
