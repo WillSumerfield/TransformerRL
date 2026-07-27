@@ -685,11 +685,22 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         return sample_morphologies(num, rng=self._morph_rng)
 
     def _rebuild(self):
-        # DRAIN all in-flight async work before delete_gym frees vsim's pinned host buffers.
-        # A lingering async op referencing a just-freed buffer causes a rare rebuild-time
-        # use-after-free: vsim "FATAL: Error deallocating pinned host memory". torch.cuda.synchronize()
-        # alone is insufficient (vsim drives its own stream/pipeline), so also drain vsim via
-        # end_streaming + a device error-check. Cost ~0.2ms vs ~14s per rebuild.
+        self.close()
+        self._create_gym()
+        self.groups = []
+        self.create_envs()
+        self.allocate_buffers()
+        create_plane(self.gym)
+        self.gym.set_num_solver_iterations(8)
+        self.gym.finalize()
+
+    def close(self):
+        """Drain and delete VSim's singleton gym so another job can create one."""
+        if getattr(self, "gym", None) is None:
+            return
+
+        # Drain all in-flight async work before delete_gym frees pinned host buffers.
+        # CUDA synchronization alone is insufficient because VSim drives its own stream.
         torch.cuda.synchronize()
         for _fn in ("end_streaming", "_check_for_cuda_errors"):
             try:
@@ -705,12 +716,5 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self.gym = self.gym_render = None
         gc.collect()
 
-        v.delete_gym()
-        self._create_gym()
-        self.groups = []
-        self.create_envs()
-        self.allocate_buffers()
-        create_plane(self.gym)
-        self.gym.set_num_solver_iterations(8)
-        self.gym.finalize()
-
+        if v.get_gym() is not None:
+            v.delete_gym()

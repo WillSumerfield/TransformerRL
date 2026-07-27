@@ -38,4 +38,6 @@ _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
 
 **Morphology resampling**:
 Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
-
+`AntMultiMorphEnv.close()` owns the shared drain-and-delete half of that rebuild and is also the
+required end-of-job boundary for sequential benchmark checkpoints: VLearn permits only one live
+`GymSingleton`, so the previous job must close before the next creates its seeded environment.
