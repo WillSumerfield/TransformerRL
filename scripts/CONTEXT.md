@@ -14,11 +14,145 @@ The leaf label identifying a single training run, the last segment of its output
 In `play` mode: stops the player after `num_episodes × max_episode_length` total steps (default: runs until window closed). When `--video` is set in `play` or `random` mode: bounds recording duration (default 1 episode when unset).
 
 **Eval** (`scripts/eval.py`):
-Standalone headless checkpoint evaluation, decoupling a **control policy** from a **body source** so the same policy is scored across body distributions. Loads a run's checkpoint (best by default, or `--epochs`), pairs it with each body source, and rolls out `--episodes` deterministic-`mu` episodes per body over a **fixed** body population (one body per env; drawn once, held — never resampled mid-run). Reports per-body reward (mean, top-k), robustness (fall rate, episode length), generator [diversity + committance](../experiments/CONTEXT.md), and value calibration. Runs are compared **side-by-side**: one wide CSV row per (run, epoch) written to `evals/` (git-ignored). Reuses the lightweight `experiments/` load+rollout path, not the rl_games runner.
+Standalone headless checkpoint evaluation, decoupling a **control policy** from a **body source** so the same policy is scored across body distributions. Loads a run's checkpoint (best by default, or `--epochs`), pairs it with each body source, and rolls out `--episodes` deterministic-`mu` episodes per body over a **fixed** body population (one body per env; drawn once, held — never resampled mid-run). Reports per-body reward (mean, top-k), stability (fall rate, episode length), generator [diversity + committance](../experiments/CONTEXT.md), and value calibration. Runs are compared **side-by-side**: one wide CSV row per (run, epoch) written to `evals/` (git-ignored). Reuses the lightweight `experiments/` load+rollout path, not the rl_games runner.
 _Avoid_: calling it a "run mode" — it is a separate script, deliberately not a `train_ant_*.py` positional mode.
+
+**Benchmark eval**:
+The `scripts/benchmark_eval.py` companion to **Eval**, deliberately using the same interface shape: positional `RUN [RUN ...]`, `--epochs`, evaluation-size overrides, a side-by-side console table, and one multi-row CSV. It preserves every method's native morphology–controller pairs and adds paper checks plus raw episodes. Stage 1 implements codesign: it reads the single `configs/benchmarks/benchmark.yaml`, requires `--epochs final` by default, uses the literal configured morphology/rollout/diversity seeds, and writes one comparison directory. `--seed N` sets all three directly to `N`; `--preset smoke` selects the cheap preset; numeric epochs require an explicit development budget exemption when incomplete. Each sequential checkpoint closes its VSim environment after rollout before the next job creates the one permitted `GymSingleton`. When invoked directly with `.venv/bin/python`, the launcher restarts once with this virtualenv's CUDA 13 and VLearn native-library directories prepended to `LD_LIBRARY_PATH`, avoiding accidental resolution through an older Conda VLearn installation. It remains separate from Eval until GPU/VSim parity is demonstrated.
+The fixed-base-morph stage adds `--method fixed_body` for an unprefixed run. Mixed comparisons use
+explicit positional labels, for example `codesign=RUN_A fixed_body=RUN_B`, and still produce one
+comparison artifact through the same evaluator.
+
+**Fixed-body training**:
+`scripts/train_ant_fixed_body.py` pairs with `configs/ppo_ant_fixed_body.yaml`. The config inherits
+the selected CoDesign controller settings and changes only the algorithm label plus
+`resample_interval: 0`. The fixed algorithm uses the same CoDesign PPO/AdamW/warmup/FD/FK agent but
+a normal fixed-body player; with no resample boundary, generator updates and morphology rebuilds
+cannot occur. Training starts and remains on the `[1,4,6]` base morph.
+
+**Benchmark implementation sequence**:
+Contract-gated delivery in increasing integration complexity: shared protocol and evaluator, codesign parity, fixed and uniform controls, faithful NGE, then faithful BodyGen. Every completed stage remains in the final five-method suite.
+_Avoid_: implementing all adapters before validating the shared comparison path
+
+**Faithful benchmark port**:
+A locally integrated adaptation from a pinned official NGE or BodyGen commit onto this repository's vlearn/VSim environment interface and typed grammar. The `faithful` label requires a component-by-component mapping to local code and tests. Upstream provenance, licensing, and every behaviourally relevant adaptation are recorded; the original simulator backend is not retained.
+_Avoid_: paper-only reconstruction when official code exists, external MuJoCo jobs, calling VSim "Isaac Sim"
+
+**Baseline adaptation log**:
+A tracked `benchmarks/<method>/ADAPTATIONS.md` record of port changes that can affect algorithm behaviour or results, accompanied by a machine-readable upstream commit and licence record. Each entry identifies the upstream symbol and local counterpart, rationale, expected behavioural effect, fidelity status, and validating test. Evaluation manifests retain hashes of both records.
+_Avoid_: logging formatting-only changes, silently omitting a native component
+
+**Benchmark contract suite**:
+The gate for each implementation stage: grammar validity, deterministic seed replay, exact environment-step accounting, raw artifact loading, and method parity. Codesign also has to match the existing evaluator within a documented numerical tolerance. Tests are grouped by the code a person audits: metrics, evaluation flow, and the CoDesign integration.
+_Avoid_: relying only on smoke training or dashboard inspection
+
+**Paired benchmark randomness**:
+Explicit deterministic seeds control native morphology sampling, rollout and diversity sampling.
+Methods retain different native body samples, while corresponding jobs use the same configured
+rollout seed and simulator initial-condition randomness wherever supported.
+_Avoid_: forcing matched morphologies, independent rollout randomness that needlessly inflates between-method variance
+
+**Benchmark replication unit**:
+One independently trained reporting seed. Paper summaries show all five seed-level estimates, their mean and 95% bootstrap confidence interval, plus paired seed-level method differences. Pair and episode samples describe one trained method's output distribution.
+_Avoid_: treating sampled bodies or rollout episodes as additional independent training runs
+
+**Benchmark logging**:
+The shared experiment-tracking contract for every benchmark method. TensorBoard is the durable local record; W&B is a YAML-enabled, lazy-loaded optional second view with online and offline modes. It is disabled by default and credentials do not activate it. Comparable outputs use identical `benchmark/...` names in TensorBoard, W&B, and local summaries; algorithm internals use `method/<method>/...`.
+_Avoid_: method-specific metric names, W&B-only runs
+
+**Benchmark output layout**:
+Generated training runs use `runs/benchmarks/<method>/<run-id>/s<seed>/`; tuning studies use `logs/tune/benchmarks/<method>/`; cross-method comparison bundles use `evals/benchmarks/<evaluation-id>/`. The source `benchmarks/` package contains no generated state.
+_Avoid_: writing results into source, scattering one comparison across method-specific eval directories
+
+**Benchmark config**:
+`configs/benchmarks/benchmark.yaml` is the single readable authority for shared settings and the selected method's settings. Explicit CLI flags cover common development changes; the complete resolved config is saved with every result.
+_Avoid_: YAML inheritance, duplicated budgets, hiding protocol values in Python constants
+
+**Benchmark tuning**:
+Equal-budget hyperparameter selection for codesign, faithful NGE, and faithful BodyGen: exactly 30 complete candidate configurations × the same three fixed tuning seeds at the full proxy environment-step budget, or 90 proxy runs per adaptive method. Candidates are ranked by mean primary benchmark score; tuning seeds are disjoint from the five reporting seeds. Fixed-base-morph and uniform-action controls inherit the selected codesign controller settings.
+_Avoid_: tuning on reporting seeds, tuning only codesign, early pruning, discretionary stopping
+
+**Native benchmark training**:
+Each benchmark method retains its published or existing optimisation machinery while receiving the same locomotion task reward. The common benchmark evaluator is external to training and cannot supply reporting samples or objectives to a method.
+_Avoid_: forcing the final comparison score into every training loop, leaking reporting evaluation into training
+
+**Benchmark environment step**:
+Any physics transition consumed before a method's final checkpoint, including controller learning, morphology fitness or selection, GM-UC labels, and BodyGen design evaluation. All such transitions draw from one shared per-run budget; simulator-free design-network computation does not.
+_Avoid_: counting only policy-gradient batches, hiding morphology-search simulation in a separate allowance
+
+**Benchmark resource parity**:
+Methods receive equal physics environment-step and parallel-environment budgets but retain their native architecture sizes. Trainable parameters, wall time, peak RAM/VRAM, and environment-step throughput are reported outcomes.
+_Avoid_: resizing faithful methods to match codesign, substituting wall-clock matching for the primary budget
+
+**Primary benchmark score**:
+The final native-pair probability-weighted expected deterministic control return at the fixed evaluation budget. Repeated stochastic draws retain their natural frequency; hyperparameters are selected on this score.
+_Avoid_: method-specific training reward, selecting hyperparameters by best-pair return
+
+**Final-budget checkpoint**:
+The complete frozen method state captured when a method reaches the exact shared physics environment-step budget. It is the only checkpoint used for the headline benchmark result, preventing temporal checkpoint selection from becoming a hidden method-specific advantage. Benchmark eval samples fresh native pairs from it under recorded reporting seeds; for NGE it includes the complete surviving species population, not just a champion.
+_Avoid_: rl_games' bare `best` checkpoint, best-over-training as the primary paper result
+
+**Benchmark resume boundary**:
+A complete checkpoint of model and optimiser states, RNGs, schedulers, the authoritative environment-step counter, and method-native search state. Resume keeps the same run identity and continues the remaining budget; NGE includes population and GM-UC data, and BodyGen includes design-policy state.
+_Avoid_: weights-only resume, resetting the budget counter after interruption
+
+**Unique-body mean**:
+The equal-weight mean deterministic return over the distinct morphologies in a method's final sampled population. Reported secondarily so rare and dominant designs contribute equally.
+_Avoid_: treating it as the method's expected deployment return
+
+**Benchmark diversity**:
+Three cross-method distribution summaries over the 4,096 design-only samples: unique fraction for support breadth; empirical entropy and effective body count for probability concentration; and mean normalized typed-token distance in the canonical grammar encoding for structural spread. Codesign committance remains a method diagnostic.
+_Avoid_: using raw unique count alone, comparing method-specific latent embeddings
+
+**Benchmark stability**:
+Nominal-task fall rate and episode length for native pairs. These measure whether locomotion remains upright and sustained under the standard evaluation task; they are not robustness evidence.
+_Avoid_: calling nominal stability "robustness" without a perturbation or generalisation suite
+
+**Top-K-of-M**:
+The mean return of the K highest-returning native morphology–controller pairs from an equal-budget sample of M pairs. **Top-1-of-M** is the corresponding maximum; both are cross-method selection metrics.
+_Avoid_: best morph, global mode, greedy body
 
 **Body source** (eval):
 Where each evaluated body comes from, held independent of the control policy. Three, all unrolling the generator's grammar-masked MDP (`net.sample` mode): **general** — the trained generator's stochastic draw (in-distribution performance); **best morph** — greedy/argmax decode, the generator's *committed* body; **random** — uniform over the grammar-valid set, i.e. a random policy on the same MDP, doubling as the diversity reference and the baseline for **gen-advantage-over-random**.
+
+**Morphology-search baseline**:
+A non-learned or evolutionary comparator to learned **codesign**, coupled to a concurrently trained controller within one run.
+_Avoid_: body source (an eval-time population, not a training algorithm), random eval
+
+**Codesign benchmark suite**:
+The four required comparators that contextualize learned **codesign**: the **fixed-base-morph baseline**, **uniform-action generation policy**, **faithful NGE**, and **faithful BodyGen**.
+_Avoid_: genetic algorithm, GA (the evolutionary comparator is specifically NGE)
+
+**Codesign benchmark design space**:
+The shared typed morphology grammar used by every method in the benchmark suite: eight fixed limb slots, each absent or holding one to three typed effectors followed by a typed terminal cap. The robot has at least one effector; effector type determines module length.
+_Avoid_: count-only design space, method-specific morphology spaces
+
+**Shared benchmark start**:
+The codesign **base morph** `[1,4,6]` is the initial morphology for every benchmark method. Adaptive methods may diverge only after this common starting point. It supplies morphology only: controllers use method-native random initialization under matched training seeds, with no free pretrained policy.
+_Avoid_: method-specific initial morphology distributions, giving one method uncounted controller pretraining
+
+**Fixed-base-morph baseline**:
+A controller-only baseline whose morphology is always the codesign **base morph**. It uses the codesign control stack without learned morphology generation.
+_Avoid_: fixed canonical body
+
+**Uniform-action generation policy**:
+A no-learning baseline that chooses uniformly among the valid actions at every step of the morphology-generation MDP and uses the codesign control stack. It is not a uniform distribution over completed morphologies.
+_Avoid_: uniform random bodies, uniform morphology sampling, random eval (an eval-time body source)
+
+**Faithful NGE**:
+The full Neural Graph Evolution method, including its native graph controller, parent-to-child policy sharing, population selection, and Graph Mutation with Uncertainty, adapted only to the shared task and morphology design space.
+_Avoid_: NGE-style, generic genetic algorithm, NGE search with the codesign controller
+
+**NGE graph mutations**:
+The four NGE mutation classes—**Add-Node**, **Add-Graph**, **Del-Graph**, and **Pert-Graph**—interpreted as grammar-preserving operations on the benchmark's typed radial limb chains.
+
+**Faithful BodyGen**:
+The full BodyGen method, including MoSAT, TopoPE, topology and attribute design policies, enhanced temporal credit assignment, and its method-native value networks, adapted only to the shared task and morphology design space. Its topology policy retains Add/Delete/NoChange; its attribute policy selects the benchmark's categorical effector and cap types.
+_Avoid_: BodyGen-inspired, a BodyGen generator paired with the codesign controller
+
+**Native-pair evaluation**:
+The benchmark evaluation in which every morphology is controlled by the controller produced with it by the same method. A method is compared as an end-to-end morphology–controller system.
+_Avoid_: substituting the codesign controller into NGE or BodyGen
 
 **Gen-advantage-over-random**:
 Mean control reward on the generator's bodies minus on random bodies, with the *same* control policy. The headline "did the generator learn to pick better bodies than chance" number. Co-adapted (control trained on generator bodies), so read as a paired comparison, not a pure generator score.
