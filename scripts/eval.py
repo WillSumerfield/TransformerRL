@@ -42,6 +42,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 import numpy as np
 import torch
 import yaml
+from tqdm import tqdm
 
 from experiments.ppg_parity import _load_policy
 from experiments.diversity_p5 import population_to_repr, rao_blackwell_h_body, redundancy
@@ -101,10 +102,11 @@ def _forward(net, obs_norm, obs):
 
 
 @torch.no_grad()
-def _rollout(net, obs_norm, env, device, *, episodes):
+def _rollout(net, obs_norm, env, device, *, episodes, label=""):
     """K episodes per env on the currently-installed (fixed) bodies. EPM==1 => per-env == per-body.
     Returns per-body arrays: return (mean over K), fall_rate (terminated vs truncated), ep_len, v0
-    (mean V0.98 at episode starts). Bodies are held fixed -- resample() is NOT called here."""
+    (mean V0.98 at episode starts). Bodies are held fixed -- resample() is NOT called here.
+    `label` names the source (gen/best/rnd) in the tqdm progress bar."""
     n, L = env.total_num_envs, env.max_episode_length
     z = lambda: torch.zeros(n, device=device)
     ret_sum, term_sum, len_sum = z(), z(), z()
@@ -116,7 +118,15 @@ def _rollout(net, obs_norm, env, device, *, episodes):
     obs, _ = env.reset()
     cap = (episodes + 2) * L
     step = 0
-    while bool((ep_done < episodes).any()) and step < cap:
+    # bar tracks the slowest env's episode count (min ep_done); the loop exits when it hits budget.
+    bar = tqdm(total=episodes, desc=f"[eval]   {label} rollout".rstrip(),
+               unit="ep", leave=False, dynamic_ncols=True)
+    while step < cap:
+        mn = int(ep_done.min().item())                      # == loop-exit driver; one sync/step
+        bar.update(mn - bar.n)
+        bar.set_postfix_str(f"step {step}/{cap}", refresh=False)
+        if mn >= episodes:
+            break
         mu, value = _forward(net, obs_norm, obs)
         collecting = ep_done < episodes
         if value is not None:
@@ -138,6 +148,8 @@ def _rollout(net, obs_norm, env, device, *, episodes):
         at_s0 = done
         step += 1
 
+    bar.update(episodes - bar.n)                             # fill to full (covers cap-exit)
+    bar.close()
     e = float(episodes)
     return {"return": (ret_sum / e).cpu().numpy(),
             "fall_rate": (term_sum / e).cpu().numpy(),
@@ -206,7 +218,7 @@ def evaluate(net, obs_norm, env, device, *, episodes, top_k):
     # --- general: in-distribution (metric E) + diversity/committance + calibration ---
     gen = _sample(net, n, "stochastic")
     _install(env, gen)
-    g = _rollout(net, obs_norm, env, device, episodes=episodes)
+    g = _rollout(net, obs_norm, env, device, episodes=episodes, label="gen")
     gret = g["return"]
     topk = np.sort(gret)[::-1][:top_k]
     v1 = gen["v_states"][:, -1].cpu().numpy()               # GenCrit/V1.0 predicted body quality
@@ -220,13 +232,13 @@ def evaluate(net, obs_norm, env, device, *, episodes, top_k):
     best = _sample(net, n, "greedy")
     row["best_n_unique"] = _n_unique(best)
     _install(env, best)
-    b = _rollout(net, obs_norm, env, device, episodes=episodes)
+    b = _rollout(net, obs_norm, env, device, episodes=episodes, label="best")
     row.update(best_avg=float(b["return"].mean()), best_fall=float(b["fall_rate"].mean()))
 
     # --- random source: diverse reference (metric D) + gen-advantage-over-random ---
     rnd = _sample(net, n, "uniform")
     _install(env, rnd)
-    rr = _rollout(net, obs_norm, env, device, episodes=episodes)
+    rr = _rollout(net, obs_norm, env, device, episodes=episodes, label="rnd")
     row.update(random_avg=float(rr["return"].mean()),
                gen_advantage=float(gret.mean() - rr["return"].mean()))
     return row
