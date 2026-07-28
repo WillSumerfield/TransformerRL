@@ -37,5 +37,5 @@ The multi-morphology ant over a sampled morphology set — one variable-length b
 _Avoid_: dynamic ant (legacy name from the old MuJoCo joint-masking approach).
 
 **Morphology resampling**:
-Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
+Replacing the full ant's sampled bodies with a fresh seeded draw partway through training, so the controller keeps meeting unseen morphologies. Because vsim bakes link geometry at finalize, it requires a full in-process sim rebuild (not in-place mutation), so it fires on a cadence rather than continuously. Reproducible from the run seed. Cost and cadence trade-off: [docs/guides/morphology_resampling_cost.md](../docs/guides/morphology_resampling_cost.md).
 

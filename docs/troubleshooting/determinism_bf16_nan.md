@@ -1,8 +1,9 @@
 # Why `--seed` runs NaN out (deterministic algorithms × bf16 × torch.compile)
 
 This explains why `torch.use_deterministic_algorithms(True)` is disabled in `train_utils.py`, and how
-to turn full bit-exact determinism back on safely. Sibling of `deterministic_embedding.md` (a *speed*
-casualty of the same flag); this one is a *correctness* casualty.
+to turn full bit-exact determinism back on safely. Sibling of
+[`deterministic_embedding.md`](../guides/deterministic_embedding.md) (a *speed* casualty of the same
+flag); this one is a *correctness* casualty.
 
 ## The symptom
 

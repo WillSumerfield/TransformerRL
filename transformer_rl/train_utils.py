@@ -831,7 +831,7 @@ def run_training(
         # are numerically fragile; in bf16 (mixed_precision) they overflow -> Inf -> NaN grads ->
         # corrupted weights. Runs stay seed-stable (same sampling/init) but not bit-exact. To restore
         # bit-exact determinism you must ALSO drop bf16 (mixed_precision: false, i.e. fp32).
-        # Full analysis + re-enable recipe: docs/determinism_bf16_nan.md.
+        # Full analysis + re-enable recipe: docs/troubleshooting/determinism_bf16_nan.md.
         torch.set_num_threads(1)
         torch.set_num_interop_threads(1)
         torch.cuda.set_device(0)

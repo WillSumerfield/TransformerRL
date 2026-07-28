@@ -7,7 +7,7 @@ morphology count (7% of the 1-group rate at 64 groups). We rewrote the step to b
 across groups; it is now group-count-independent (~2.9M env-steps/s for 1…1024 groups). vsim's
 physics solve is already group-agnostic, so the win was purely removing host-side per-group
 Python/torch work. The reusable technique is distilled in
-[docs/group_count_throughput.md](../group_count_throughput.md).
+[docs/guides/group_count_throughput.md](../guides/group_count_throughput.md).
 
 ## Changes, in order (and what each revealed)
 

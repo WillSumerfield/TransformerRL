@@ -23,7 +23,7 @@ from the training agent:
 - **Reproducibility.** A single `random.Random(seed)` on the env feeds the initial draw and every
   resample, so the whole morphology stream is reproducible from the run seed.
 
-Cost and cadence are measured in [docs/morphology_resampling_cost.md](../morphology_resampling_cost.md)
+Cost and cadence are measured in [docs/guides/morphology_resampling_cost.md](../guides/morphology_resampling_cost.md)
 (rebuild ~14.4 s; episode ~58.5 s; default K=5 ≈ 5% overhead).
 
 ## Alternatives considered

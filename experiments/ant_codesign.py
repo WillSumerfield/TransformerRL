@@ -3,7 +3,7 @@ control on one shared trunk) on the full ant, then aggregate the generator/contr
 notebook (notebooks/ant_codesign.ipynb).
 
 Gate: per-limb presence climbs base -> ~all-8, fast and stable (no limb/energy cost yet, so more
-limbs => more return). See docs/codesign_metrics.md and ADR-0013.
+limbs => more return). See docs/reference/codesign_metrics.md and ADR-0013.
 
 Runs are namespaced `report_s{seed}` so this NEVER touches pre-existing `s{seed}` codesign dirs;
 only `report_*` dirs are (re)created.

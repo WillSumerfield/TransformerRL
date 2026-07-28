@@ -799,7 +799,7 @@ class CodesignAgent(LoggingA2CAgent):
         return  # codesign reports body quality via quality/* (true R), not the base per-step morph_reward
 
     # ---- generator logging (sparse: only at window boundaries) ----------------------
-    # Metrics are grouped by subsystem (see docs/codesign_metrics.md):
+    # Metrics are grouped by subsystem (see docs/reference/codesign_metrics.md):
     #   build/    the body the generator produces      gen/     GenAct (generator actor) learning
     #   gencrit/  GenCrit/V1.0 value-head fit          quality/ body-quality outcome (the target)
     #   clone/    control preservation at resample

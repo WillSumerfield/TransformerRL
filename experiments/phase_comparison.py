@@ -86,7 +86,7 @@ def train_all(seeds, max_epochs, num_envs):
         if num_envs is not None:
             cmd += ["--num_envs", str(num_envs)]
         print(f"\n[phase] TRAIN {name}: {' '.join(cmd)}", flush=True)
-        # Retry the known intermittent gym-rebuild crash (docs/resample_rebuild_crash.md) so one bad
+        # Retry the known intermittent gym-rebuild crash (docs/troubleshooting/resample_rebuild_crash.md) so one bad
         # resample doesn't abort a multi-hour multi-seed sweep. rmtree between attempts = fresh run.
         for attempt in range(1, 4):
             if subprocess.run(cmd, cwd=_ROOT).returncode == 0:

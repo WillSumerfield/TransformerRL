@@ -7,7 +7,7 @@ canonical *term* definitions live in the glossaries and are linked, not restated
 ## Setup
 
 Eval decouples a **control policy** from a **body source** — see
-[*Eval* and *Body source*](../scripts/CONTEXT.md). Per (run, epoch) it installs a **fixed**
+[*Eval* and *Body source*](../../scripts/CONTEXT.md). Per (run, epoch) it installs a **fixed**
 population of $B$ bodies (one body per env; `num-envs` sets $B$), then rolls out $K$ episodes
 per body (`--episodes`, default 32) with the **deterministic** control policy (mean action
 $\mu$, no sampling). Every body-level metric is a per-env statistic (EPM = 1, so per-env =
@@ -18,7 +18,7 @@ $k$-th episode on body $b$ (sum of unshaped reward to termination/truncation), $
 \frac1K\sum_k R(b,k)$ = that body's mean return, $L$ = max episode length.
 
 Three body sources feed the reward/diversity metrics (all walk the same grammar-masked
-generation MDP; see [*Body source*](../scripts/CONTEXT.md)): **gen** (`stochastic` draw),
+generation MDP; see [*Body source*](../../scripts/CONTEXT.md)): **gen** (`stochastic` draw),
 **best** (`greedy`/argmax — the committed body), **random** (`uniform` — the diversity
 reference). Diversity/committance are computed on the **gen** sample; reward is reported per
 source.
@@ -64,7 +64,7 @@ Higher = better. Always $\ge$ `gen_avg`. A large top-k − gen_avg gap ⇒ a bro
 ### Gen-advantage-over-random
 
 Did the generator learn to pick better bodies than chance? See
-[*Gen-advantage-over-random*](../scripts/CONTEXT.md).
+[*Gen-advantage-over-random*](../../scripts/CONTEXT.md).
 
 #### Meaning
 Column `gen_advantage`. Mean control reward on the generator's bodies minus on random bodies,
@@ -124,7 +124,7 @@ Does the control critic's value predict realized return, across bodies?
 
 #### Meaning
 Column `val_calib_r`. Pearson correlation between the critic's value at each episode's start
-(`V0.98`, discounted-return units; see [*Value estimate*](../experiments/CONTEXT.md)) and that
+(`V0.98`, discounted-return units; see [*Value estimate*](../../experiments/CONTEXT.md)) and that
 body's realized return, over the gen population.
 
 #### Formula
@@ -157,14 +157,14 @@ accurate internal quality estimate.
 ## Diversity
 
 Diversity is measured on the **subtype-collapsed skeleton** of the gen sample: the
-[*free_entropy* finding](../experiments/CONTEXT.md) is that the skeleton commits while the
+[*free_entropy* finding](../../experiments/CONTEXT.md) is that the skeleton commits while the
 subtype axis stays free, so a full-typed count would inflate on that free axis. Both metrics
-below cluster/compare on [`d_struct`](../experiments/CONTEXT.md).
+below cluster/compare on [`d_struct`](../../experiments/CONTEXT.md).
 
 ### Effective number of modes
 
 How many genuinely distinct designs the converged generator produces. See
-[*Effective number of modes* (`N_modes`)](../experiments/CONTEXT.md).
+[*Effective number of modes* (`N_modes`)](../../experiments/CONTEXT.md).
 
 #### Meaning
 Column `div_nmodes`. Prevalence-weighted count of distinct skeletons: a Hill number (order

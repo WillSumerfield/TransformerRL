@@ -670,7 +670,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         """Draw a fresh sampled body set and rebuild the sim in place (full gym rebuild).
 
         vsim bakes link geometry at finalize, so new segment lengths require tearing the gym down
-        and recreating it; see docs/morphology_resampling_cost.md. The caller must reset afterwards
+        and recreating it; see docs/guides/morphology_resampling_cost.md. The caller must reset afterwards
         (the env is left rebuilt-but-unreset). Only valid for the sampled (full ant) configuration.
         """
         if not getattr(self, "_sample_morphs", False):

@@ -59,7 +59,7 @@ ContAct] + λ·MSE(ContCrit, ContCrit_old)** — so the joint step doesn't drift
 - One trunk instead of two/three — recovers the parameter and memory cost.
 - The value head must be correct in **both** modes: a design-mode encode/mode bug silently
   body-invariants the prefix values and kills the marginal signal. This is the first symptom to
-  rule out — see the debugging playbook in [`docs/codesign_metrics.md`](../codesign_metrics.md) §1.
+  rule out — see the debugging playbook in [`docs/reference/codesign_metrics.md`](../reference/codesign_metrics.md) §1.
 - Old codesign checkpoints (separate-net generator, or `value_size==2` control) will not load.
 - Enables the restructured `gencrit/` metrics and the `quality/R_mean` tuning objective
   (`configs/tune_config.yaml`).

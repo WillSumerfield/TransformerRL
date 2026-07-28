@@ -9,11 +9,19 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ├── CONTEXT-MAP.md                    ← this file; shared kernel below
 ├── docs/
 │   ├── adr/                          ← system-wide decisions
-│   ├── transformer_architecture.md   (living doc: full obs→action flow, shapes, why)
-│   ├── adaptive_ant_fixes.md
-│   ├── group_count_throughput.md     (playbook: group-count-independent env throughput)
-│   ├── morphology_resampling_cost.md (playbook: rebuild cost + resample cadence for the full ant)
-│   └── vsim_geometry_api.md
+│   ├── reference/                    ← lookup docs
+│   │   ├── transformer_architecture.md (living doc: full obs→action flow, shapes, why)
+│   │   ├── Metrics.md                (eval.py metric reference: meaning/formula/reading)
+│   │   ├── codesign_metrics.md       (codesign TB metrics + debugging playbook)
+│   │   └── vsim_geometry_api.md
+│   ├── guides/                       ← how-to / cost playbooks
+│   │   ├── group_count_throughput.md (group-count-independent env throughput)
+│   │   ├── morphology_resampling_cost.md (rebuild cost + resample cadence for the full ant)
+│   │   └── deterministic_embedding.md (matmul mode-embedding: determinism + speed)
+│   └── troubleshooting/              ← crashes / gotchas / bug records
+│       ├── determinism_bf16_nan.md  (why --seed drops deterministic algos)
+│       ├── resample_rebuild_crash.md (intermittent gym-rebuild race)
+│       └── adaptive_ant_fixes.md
 ├── envs/                             ← Morphology context
 │   ├── CONTEXT.md
 │   ├── multigroup_environment.py
@@ -73,7 +81,7 @@ Reference these when working on env physics or the group/motor/sensor plumbing:
   - [`control.md`](../vlearn-main/docs/api/control.md) — motors / joint commands · [`sensors.md`](../vlearn-main/docs/api/sensors.md) — force sensors · [`gpu_arrays.md`](../vlearn-main/docs/api/gpu_arrays.md) — batched motor/sensor buffers
 - **Built HTML** (browsable): `../vlearn-main/vlearn-docs/html/index.html`; type stubs in `../vlearn-main/docs/stubs/`.
 
-Our local [`docs/vsim_geometry_api.md`](./docs/vsim_geometry_api.md) covers the geometry subset `build_vsim.py` uses.
+Our local [`docs/reference/vsim_geometry_api.md`](./docs/reference/vsim_geometry_api.md) covers the geometry subset `build_vsim.py` uses.
 
 ## Shared Language
 

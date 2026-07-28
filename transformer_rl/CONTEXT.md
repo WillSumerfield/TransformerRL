@@ -1,6 +1,6 @@
 # Control
 
-The transformer policy that controls any robot. It tokenizes the observation into per-body-part tokens, reads the DOF mask to know which limbs exist, and emits an action per active DOF. Shared terms (robot, limb, module, DOF, DOF mask, active/inactive, root, morphology) live in the [Context Map](../CONTEXT-MAP.md). Full input→output flow, shapes, and the rl_games wrapper: [docs/transformer_architecture.md](../docs/transformer_architecture.md).
+The transformer policy that controls any robot. It tokenizes the observation into per-body-part tokens, reads the DOF mask to know which limbs exist, and emits an action per active DOF. Shared terms (robot, limb, module, DOF, DOF mask, active/inactive, root, morphology) live in the [Context Map](../CONTEXT-MAP.md). Full input→output flow, shapes, and the rl_games wrapper: [docs/reference/transformer_architecture.md](../docs/reference/transformer_architecture.md).
 
 The architecture is **robot-agnostic by design**; the ant is its current (only) instance. Terms below are stated generically, with the ant instance noted.
 
@@ -52,7 +52,7 @@ The attention-level masking of inactive limbs: their token embeddings are zeroed
 The block of obs that is deliberately **not normalized**: the `{0,1}` **DOF mask** plus (Phase 5) the per-slot **`is_cap` flag** and **subtype one-hot**. Every channel is exactly 0 or 1 and is read back with a `> 0` threshold, which normalization would break — a channel that happens to be constant over a window collapses to ~0 and would be misread as absent. Constant per body, written once at env `allocate_buffers` alongside the lengths block. The token **category** is *derived* from it, not stored: effector ⟺ mask, cap ⟺ `is_cap`, pad ⟺ neither. `token_dims()['raw_tail_off'/'raw_tail_dim']` is the single source of truth.
 
 **Masked-norm model**:
-The rl_games model wrapper that runs the stock input normalizer but restores the **raw tail** (above) afterward, so normalization can't collapse the constant mask/type channels. Registered as `transformer_masked_a2c_logstd`. (See `docs/adaptive_ant_fixes.md` for why.)
+The rl_games model wrapper that runs the stock input normalizer but restores the **raw tail** (above) afterward, so normalization can't collapse the constant mask/type channels. Registered as `transformer_masked_a2c_logstd`. (See `docs/troubleshooting/adaptive_ant_fixes.md` for why.)
 
 **Dual-network PPG**:
 The default PPG control agent: a **policy net** and a separate **value net** with disjoint weights (≈2× params). The value net does all RL value math; the policy net carries an **aux value head** trained only in the aux phase to distill value representations into its trunk. The `ppg_continuous` baseline.
@@ -93,7 +93,7 @@ Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)
 
 ## Generation (morphology generator)
 
-The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in `temp/codesign_single_network_plan.md` and the **Codesign heads/tokens** sections above (the single-network design), not here. How to read the run's TensorBoard metrics + debug the algorithm from them: [`docs/codesign_metrics.md`](../docs/codesign_metrics.md).
+The control-side realization of the generative morphology policy (see [Codesign](../CONTEXT-MAP.md)). Vocabulary for the generator that emits a body and is trained by **policy-gradient** on the same reward the controller earns. Architecture/wiring/schedule details live in `temp/codesign_single_network_plan.md` and the **Codesign heads/tokens** sections above (the single-network design), not here. How to read the run's TensorBoard metrics + debug the algorithm from them: [`docs/reference/codesign_metrics.md`](../docs/reference/codesign_metrics.md).
 
 **Morphology generator** (generator):
 A **sequential, token-at-a-time** policy that emits the robot's designed morphology one slot at a time, trained by **policy-gradient** on the **control reward** — a body is good if the controller earns high return on it. It shares the **control trunk** (single network: GenAct + GenCrit heads alongside ContAct + ContCrit); each limb slot is decided in **randomized order**, conditioned on the already-committed tokens. Acts **once per resample window**; its body never enters the control's per-step action stream — it is applied to the env at the window's rebuild. Emits morphology, not per-DOF actions.

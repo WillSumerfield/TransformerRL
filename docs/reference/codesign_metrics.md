@@ -4,8 +4,8 @@ How to read the TensorBoard metrics for single-network codesign (`CodesignAgent`
 `configs/ppo_ant_codesign_single.yaml`) and how to debug the algorithm from them.
 
 Terms (limb, generator, GenAct/GenCrit, marginal value, R, resample window, …) are defined in
-[`transformer_rl/CONTEXT.md`](../transformer_rl/CONTEXT.md). The algorithm itself is in
-[`temp/codesign_single_network_plan.md`](../temp/codesign_single_network_plan.md). This doc is
+[`transformer_rl/CONTEXT.md`](../../transformer_rl/CONTEXT.md). The algorithm itself is in
+[`temp/codesign_single_network_plan.md`](../../temp/codesign_single_network_plan.md). This doc is
 only about *what the numbers mean and what to do when they look wrong*.
 
 ---

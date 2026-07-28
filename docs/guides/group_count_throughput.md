@@ -3,13 +3,13 @@
 A guide to why per-`EnvironmentGroup` overhead slows a vsim env, how to measure it, and the
 techniques that remove it. Applying these to `AntMultiMorphEnv` took it from inversely-scaling to
 **flat ~2.9M env-steps/s regardless of group count**; the ordered change history, per-stage numbers,
-and reproduction live in [ADR-0004](./adr/0004-vectorize-antmultimorph-across-groups.md). Benchmark
+and reproduction live in [ADR-0004](../adr/0004-vectorize-antmultimorph-across-groups.md). Benchmark
 first run 2026-06-01.
 
 ## Background
 
 vlearn's `EnvironmentGroup` is one vsim physics build shared by a batch of envs. This repo uses
-**one group per morphology** (see [ADR 0001](./adr/0001-environment-group-per-morphology.md)):
+**one group per morphology** (see [ADR 0001](../adr/0001-environment-group-per-morphology.md)):
 real limb removal needs a distinct vsim body, so the adaptive ant runs 46 groups, the full ant up
 to 131. A natural worry follows: does having many groups (each then holding fewer envs) hurt
 throughput, independent of the bodies themselves?
@@ -58,8 +58,8 @@ This is the **end-to-end** number a real run actually sees.
 
 ## Results
 
-Charts: [`data/group_throughput.png`](../data/group_throughput.png) (raw vsim) and
-[`data/group_throughput_env.png`](../data/group_throughput_env.png) (full env). Raw tables in
+Charts: [`data/group_throughput.png`](../../data/group_throughput.png) (raw vsim) and
+[`data/group_throughput_env.png`](../../data/group_throughput_env.png) (full env). Raw tables in
 `data/group_throughput.md` and `data/group_throughput_env.md`.
 
 | Groups | Envs/group | Raw vsim (env-steps/s) | Rel. | Full env (env-steps/s) | Rel. |
@@ -138,4 +138,4 @@ Once de-looped, the step is **~95% vsim physics** and group-count-independent â€
 overhead remains. CUDA-graph capture and `torch.compile` were evaluated and do **not** help (vsim
 won't capture; in-place buffer mutation disables inductor's cudagraphs). The simulator is the floor;
 stop there. Full results, per-stage numbers, and reproduction are in
-[ADR-0004](./adr/0004-vectorize-antmultimorph-across-groups.md).
+[ADR-0004](../adr/0004-vectorize-antmultimorph-across-groups.md).

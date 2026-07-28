@@ -184,7 +184,7 @@ class LoggingA2CAgent(A2CAgent):
     def _maybe_resample(self):
         """Every resample_interval episodes, draw a fresh morphology set (full gym rebuild) and
         refresh the agent's cached obs. No-op unless the env samples morphologies and the knob is set.
-        See docs/morphology_resampling_cost.md."""
+        See docs/guides/morphology_resampling_cost.md."""
         interval = self.config.get('resample_interval', 0)  # episodes between resamples; 0 = off
         if not interval:
             return

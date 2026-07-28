@@ -15,7 +15,7 @@ that the robot's *body keeps changing* — it can have anywhere from 3 to 8 limb
 different angles around the root, with different module lengths. We want **one** controller
 that can walk *any* of these bodies, not a fresh network retrained per shape. (Down the
 line this feeds **codesign** — evolving the body and the brain together; see the
-[Context Map](../CONTEXT-MAP.md).)
+[Context Map](../../CONTEXT-MAP.md).)
 
 ### Why a transformer is the right tool here
 
@@ -33,18 +33,18 @@ old "ankle") — or 16 DOFs, that's the ant *instance* of a general pattern (one
 + repeated limbs → tokens → attention → per-part outputs). Today's ant limb is exactly two
 effector modules; Phase 1 makes limbs variable-length. The **physics build and the obs
 length block still spell these "hip"/"ankle"** — that data-model rename is deferred to
-Phase 1 (see [ADR-0014](adr/0014-generalized-construction-vocabulary.md)).
+Phase 1 (see [ADR-0014](../adr/0014-generalized-construction-vocabulary.md)).
 
 Shared terms (robot, limb, DOF, DOF mask, active/inactive, root, morphology) live in the
-[Context Map](../CONTEXT-MAP.md); architecture vocabulary (token, root token,
-limb encoding, token mask, effector) lives in the [Control glossary](../transformer_rl/CONTEXT.md).
+[Context Map](../../CONTEXT-MAP.md); architecture vocabulary (token, root token,
+limb encoding, token mask, effector) lives in the [Control glossary](../../transformer_rl/CONTEXT.md).
 
 ---
 
 ## 1. Why a transformer
 
 **Headline: attention is the bridge to codesign.** The end goal is a loop that jointly
-optimizes *morphology* and *control* (see [Codesign](../CONTEXT-MAP.md)). A transformer
+optimizes *morphology* and *control* (see [Codesign](../../CONTEXT-MAP.md)). A transformer
 control policy is the chosen interface for that future generative morphology policy:
 both speak in per-part tokens and attention, so a morphology generator can eventually
 attend to / be conditioned on the same token representation the controller uses. The
@@ -65,7 +65,7 @@ This is what lets the controller keep working as the body changes during codesig
 prerequisite that the rest of the project is built on.
 
 > Implementation note: today the shape is **padded** to a fixed 8 limbs / 16 DOFs with a
-> DOF mask marking which are real (see [ADR-0002](adr/0002-fixed-8-leg-padding-and-dof-mask.md)).
+> DOF mask marking which are real (see [ADR-0002](../adr/0002-fixed-8-leg-padding-and-dof-mask.md)).
 > Padding + masking is how count-invariance is realized in practice without ragged
 > batches; the transformer never attends to padded tokens (§5).
 
@@ -114,7 +114,7 @@ prerequisite that the rest of the project is built on.
 
 The transformer's input is the env observation. This doc takes the obs as a **given
 contract** — how the env assembles it (DOF scatter, module lengths, the mask) is
-Morphology's concern; see [envs/CONTEXT.md](../envs/CONTEXT.md).
+Morphology's concern; see [envs/CONTEXT.md](../../envs/CONTEXT.md).
 
 **Ant instance — 139-D, 8-limb padded layout** (obs field names still spell the ant's
 physical hip/ankle build; that rename is deferred to Phase 1):
@@ -316,8 +316,8 @@ to read a single state value.
 
 The pure `LimbTransformer` emits `(mu, value)`. Two rl_games pieces complete the
 obs→action path. The *why* behind the masking choices is recorded in
-[`adaptive_ant_fixes.md`](adaptive_ant_fixes.md) and
-[ADR-0002](adr/0002-fixed-8-leg-padding-and-dof-mask.md) — summarized here, not duplicated.
+[`adaptive_ant_fixes.md`](../troubleshooting/adaptive_ant_fixes.md) and
+[ADR-0002](../adr/0002-fixed-8-leg-padding-and-dof-mask.md) — summarized here, not duplicated.
 
 ### Network builder — `log_std` gating (`models.py`)
 

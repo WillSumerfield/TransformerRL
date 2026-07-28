@@ -43,7 +43,7 @@ _Avoid_: calling the run dropdown the "model" dropdown in prose — it selects *
 Cumulative raw reward over one episode (sum of `_rew_buf` across steps until termination or truncation).
 
 **`resample_interval`**:
-Config knob (full ant only): episodes between morphology resamples. The training agent rebuilds the sim with a fresh sampled body set every `resample_interval` episodes; `0` (default elsewhere) disables it. The mechanism and cost live in the Morphology context — [Morphology resampling](../envs/CONTEXT.md) and [docs/morphology_resampling_cost.md](../docs/morphology_resampling_cost.md).
+Config knob (full ant only): episodes between morphology resamples. The training agent rebuilds the sim with a fresh sampled body set every `resample_interval` episodes; `0` (default elsewhere) disables it. The mechanism and cost live in the Morphology context — [Morphology resampling](../envs/CONTEXT.md) and [docs/guides/morphology_resampling_cost.md](../docs/guides/morphology_resampling_cost.md).
 
 **Proxy run** (tuning):
 The short run each Optuna trial executes — `max_epochs=500`, checkpoint writes off (`configs/ppo_ant_ppg_tune.yaml`) — standing in for the 1500-epoch deployment run. A short-horizon signal: at 500 epochs the morphology [resample](../envs/CONTEXT.md) fires only once (~epoch 313, period ≈ `resample_interval × max_episode_length ÷ horizon_length`), versus ~4 resamples at deployment length. The tuned winner is meant to transfer to `ppo_ant_ppg.yaml`.

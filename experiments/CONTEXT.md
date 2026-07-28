@@ -22,7 +22,7 @@ _Avoid_: generator-entropy as the diversity headline (inflates independent-compo
 
 ## Committance
 
-A **separate axis from [Diversity](#diversity)**: not *how many* distinct designs a generator produces, but *how committed vs. free* it is, and whether its limbs form a coordinated body plan. Measured by entropy-decomposition of the generator's own per-step distributions (analytic Rao–Blackwell), not by clustering samples — so it is confounded with total entropy and must not be read as diversity. Formulas + column names live in [docs/Metrics.md](../docs/Metrics.md).
+A **separate axis from [Diversity](#diversity)**: not *how many* distinct designs a generator produces, but *how committed vs. free* it is, and whether its limbs form a coordinated body plan. Measured by entropy-decomposition of the generator's own per-step distributions (analytic Rao–Blackwell), not by clustering samples — so it is confounded with total entropy and must not be read as diversity. Formulas + column names live in [docs/reference/Metrics.md](../docs/reference/Metrics.md).
 
 **Redundancy** (`rho`):
 Total correlation across the 8 limb slots, in perplexity units — how much more committed the joint body is than the product of its per-slot marginals. `rho ≈ 1` = eight **independent limb-lotteries** (no body plan; entropy coef bought jitter, not branching); `rho ≫ 1` = limbs co-vary into real correlated body plans.
