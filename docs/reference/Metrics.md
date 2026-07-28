@@ -7,7 +7,7 @@ canonical *term* definitions live in the glossaries and are linked, not restated
 ## Setup
 
 Eval decouples a **control policy** from a **body source** — see
-[*Eval* and *Body source*](../../scripts/CONTEXT.md). Per (run, epoch) it installs a **fixed**
+[*Eval* and *Body source*](../../scripts/CONTEXT.md). Per (run, epoch) it creates a **fixed**
 population of $B$ bodies (one body per env; `num-envs` sets $B$), then rolls out $K$ episodes
 per body (`--episodes`, default 32) with the **deterministic** control policy (mean action
 $\mu$, no sampling). Every body-level metric is a per-env statistic (EPM = 1, so per-env =
@@ -63,21 +63,25 @@ Higher = better. Always $\ge$ `gen_avg`. A large top-k − gen_avg gap ⇒ a bro
 
 ### Gen-advantage-over-random
 
-Did the generator learn to pick better bodies than chance? See
+The gap between control's reward on the generator's bodies and on random ones — a *joint* signal
+about the generator **and** control's generalization. See
 [*Gen-advantage-over-random*](../../scripts/CONTEXT.md).
 
 #### Meaning
 Column `gen_advantage`. Mean control reward on the generator's bodies minus on random bodies,
-**same** control policy. Co-adapted (control was trained on generator bodies), so read as a
-paired comparison, not a pure generator score.
+**same** control policy. Co-adapted (control was trained on generator bodies), so it is not a
+pure generator score: the gap has **two entangled drivers** — (a) the generator genuinely picks
+better bodies, and (b) control is specialized to the generator's distribution and transfers
+poorly to unfamiliar random bodies. Both push it up; this metric alone cannot separate them.
 
 #### Formula
 $$\text{gen\_advantage} = \texttt{gen\_avg} - \texttt{random\_avg}$$
 
 #### Reading it
-Higher = the generator's bodies beat chance. $\approx 0$ ⇒ the generator adds nothing over
-random morphologies (or control simply generalizes to anything). Can be negative early in
-training.
+Higher = the generator's bodies beat chance **and/or** control has narrowed to them. $\approx 0$ ⇒
+either the generator adds nothing over random morphologies, or control generalizes equally to
+anything (a broadly-competent controller and a strong-but-narrow one can both sit here — disambiguate
+with `gen_avg`/`random_avg` levels, not just their gap). Can be negative early in training.
 
 ---
 
