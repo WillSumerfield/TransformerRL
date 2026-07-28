@@ -46,6 +46,7 @@ from tqdm import tqdm
 
 from experiments.ppg_parity import _load_policy
 from experiments.diversity_p5 import population_to_repr, rao_blackwell_h_body, redundancy
+from experiments.diversity import within_run_metrics
 from transformer_rl.models import _raw_tail
 from envs.ant_envs.ant_codesign import AntCodesignEnv
 from envs.ant_envs.ant_multimorph import _OBS_TOTAL, _N_DOFS_FULL
@@ -57,6 +58,7 @@ EVAL_SEED = 123
 FIELDS = ["run", "epoch",
           "gen_avg", "gen_topk_mean", "gen_top1", "gen_fall", "gen_ep_len",
           "val_calib_r", "gencrit_calib_r",
+          "div_nmodes", "div_struct",
           "N_body_skel", "N_sub", "N_limb_mean", "rho",
           "best_avg", "best_fall", "best_n_unique",
           "random_avg", "gen_advantage"]
@@ -190,7 +192,9 @@ def _diversity(out):
         skel = [counts_to_repr(c) for c in out["counts"].cpu().numpy().astype(int)]
         h_skel = rao_blackwell_h_body(out["step_entropy"].cpu().numpy(), active)
         r = redundancy(skel, h_skel)
-        return {"N_body_skel": r["N_body"], "N_sub": 1.0,
+        wm = within_run_metrics(skel)                       # distance-clustered diversity (skeleton)
+        return {"div_nmodes": wm["div_nmodes"], "div_struct": wm["div_struct"],
+                "N_body_skel": r["N_body"], "N_sub": 1.0,
                 "N_limb_mean": r["N_limb_mean"], "rho": r["rho"]}
     counts = out["counts"].cpu().numpy().astype(int)
     eff, cap = out["eff_sub"].cpu().numpy(), out["cap_sub"].cpu().numpy()
@@ -198,7 +202,9 @@ def _diversity(out):
     h_skel = rao_blackwell_h_body(out["step_entropy_cat"].cpu().numpy(), active)
     h_sub = rao_blackwell_h_body(out["step_entropy_sub"].cpu().numpy(), active)
     r = redundancy(skel, h_skel)
-    return {"N_body_skel": r["N_body"], "N_sub": float(np.exp(h_sub)),
+    wm = within_run_metrics(skel)                           # diversity on subtype-collapsed skeleton:
+    return {"div_nmodes": wm["div_nmodes"], "div_struct": wm["div_struct"],  # ignores free subtype flips
+            "N_body_skel": r["N_body"], "N_sub": float(np.exp(h_sub)),
             "N_limb_mean": r["N_limb_mean"], "rho": r["rho"]}
 
 
@@ -249,10 +255,12 @@ def evaluate(net, obs_norm, env, device, *, episodes, top_k):
 def _print_table(rows, top_k):
     cols = [("run", 18, "s"), ("epoch", 6, "s"), ("gen_avg", 9, ".1f"),
             (f"top{top_k}", 9, ".1f"), ("best_avg", 9, ".1f"), ("rand_avg", 9, ".1f"),
-            ("gen_adv", 8, ".1f"), ("fall", 6, ".2f"), ("N_skel", 8, ".2g"),
+            ("gen_adv", 8, ".1f"), ("fall", 6, ".2f"), ("N_modes", 8, ".3g"),
+            ("d_struct", 9, ".2f"), ("N_skel", 8, ".2g"),
             ("N_sub", 9, ".3g"), ("gencrit_r", 9, ".2f")]
     src = {"top%d" % top_k: "gen_topk_mean", "best_avg": "best_avg", "rand_avg": "random_avg",
-           "gen_adv": "gen_advantage", "fall": "gen_fall", "N_skel": "N_body_skel",
+           "gen_adv": "gen_advantage", "fall": "gen_fall", "N_modes": "div_nmodes",
+           "d_struct": "div_struct", "N_skel": "N_body_skel",
            "N_sub": "N_sub", "gencrit_r": "gencrit_calib_r", "gen_avg": "gen_avg"}
     hdr = " ".join(f"{name:>{w}}" if name != "run" else f"{name:<{w}}" for name, w, _ in cols)
     print("\n" + hdr)
@@ -315,8 +323,8 @@ def main():
             rows.append(row)
             print(f"[eval]   gen={row['gen_avg']:.1f} best={row['best_avg']:.1f} "
                   f"rand={row['random_avg']:.1f} adv={row['gen_advantage']:+.1f} | "
-                  f"N_skel={row['N_body_skel']:.2g} N_sub={row['N_sub']:.3g} "
-                  f"gencrit_r={row['gencrit_calib_r']:.2f}", flush=True)
+                  f"N_modes={row['div_nmodes']:.3g} d_struct={row['div_struct']:.2f} "
+                  f"N_skel={row['N_body_skel']:.2g} gencrit_r={row['gencrit_calib_r']:.2f}", flush=True)
             del net, obs_norm
             torch.cuda.empty_cache()
 
