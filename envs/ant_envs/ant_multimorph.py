@@ -688,10 +688,11 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         # DRAIN all in-flight async work before delete_gym frees vsim's pinned host buffers.
         # A lingering async op referencing a just-freed buffer causes a rare rebuild-time
         # use-after-free: vsim "FATAL: Error deallocating pinned host memory". torch.cuda.synchronize()
-        # alone is insufficient (vsim drives its own stream/pipeline), so also drain vsim via
-        # end_streaming + a device error-check. Cost ~0.2ms vs ~14s per rebuild.
+        # alone is insufficient (vsim drives its own pipeline), so also drain vsim via a device
+        # error-check. Cost ~0.2ms vs ~14s per rebuild. (end_streaming was dropped: we never
+        # start_streaming, so it only hit vsim's "never started" early-return + printed a WARN.)
         torch.cuda.synchronize()
-        for _fn in ("end_streaming", "_check_for_cuda_errors"):
+        for _fn in ("_check_for_cuda_errors",):
             try:
                 getattr(self.gym, _fn)()
             except Exception as _e:
