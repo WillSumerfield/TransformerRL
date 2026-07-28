@@ -20,6 +20,17 @@ _Avoid_: root-aligned / positional limb comparison (misranks unequal-length limb
 Prevalence-weighted count of *distinct designs* a converged generator produces: Hill number (order q=1, perplexity) over `d_struct`-clusters (τ = 1 module) of the sampled bodies. `1.0` = single design (ES-like); `>1` = branching (EA-like). The Phase-8 diversity target. Between-seed variant adds **mode-overlap** (fraction of seed-pairs sharing a mode).
 _Avoid_: generator-entropy as the diversity headline (inflates independent-component flipping without breaking the common core — see Phase 8).
 
+## Committance
+
+A **separate axis from [Diversity](#diversity)**: not *how many* distinct designs a generator produces, but *how committed vs. free* it is, and whether its limbs form a coordinated body plan. Measured by entropy-decomposition of the generator's own per-step distributions (analytic Rao–Blackwell), not by clustering samples — so it is confounded with total entropy and must not be read as diversity. Formulas + column names live in [docs/Metrics.md](../docs/Metrics.md).
+
+**Redundancy** (`rho`):
+Total correlation across the 8 limb slots, in perplexity units — how much more committed the joint body is than the product of its per-slot marginals. `rho ≈ 1` = eight **independent limb-lotteries** (no body plan; entropy coef bought jitter, not branching); `rho ≫ 1` = limbs co-vary into real correlated body plans.
+_Avoid_: reading `rho` alone — a fully-committed generator has `rho = 1` **trivially** (no variance left to correlate), so it is confounded with total entropy; pair it with the effective-skeleton count.
+
+**Free vs. committed axes**:
+The [free_entropy finding](#): under training the **skeleton commits** (effective skeleton count → 1) while the **subtype axis stays free** (effective subtype count > 1). This split is why [Diversity](#diversity) is measured on the subtype-collapsed skeleton — the free subtype axis would otherwise inflate any count.
+
 ## Language
 
 **Attention weight**:
