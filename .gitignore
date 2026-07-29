@@ -1,9 +1,12 @@
 # Custom
-logs/
-runs/
+# Runtime roots are real directories in the primary checkout and symlinks in
+# linked worktrees. No trailing slash: Git only treats real directories as
+# matching a directory-only pattern such as `runs/`.
+/logs
+/runs
 uv.lock
-data/
-videos/
+/data
+/videos
 .claude/
 TurboActivate.dat
 envs/ant_envs/assets/generated/
@@ -221,4 +224,4 @@ marimo/_lsp/
 __marimo__/
 
 # eval.py output (per-run metrics CSVs)
-evals/
+/evals
