@@ -18,6 +18,11 @@ and links its machine-local runtime state to the primary checkout. Generated
 and arbitrary untracked source files remain worktree-local. The primary
 checkout owns the real shared directories, so removing an experimental
 worktree cannot remove their contents.
+For an existing worktree, run
+`scripts/share_worktree_state.sh --migrate-existing WORKTREE` after stopping
+its trainers. It refuses conflicting files, copies non-conflicting artifacts
+into the primary directories, and retains the original directories under the
+ignored `.worktree-state-backup/`.
 _Avoid_: automatically linking every ignored or untracked path; some are
 branch-specific mutable state rather than shared experiment artifacts.
 

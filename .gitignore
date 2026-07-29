@@ -10,6 +10,7 @@ envs/ant_envs/assets/generated/
 imgui.ini
 .vscode/
 temp/
+.worktree-state-backup/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

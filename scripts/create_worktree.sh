@@ -31,6 +31,7 @@ if [[ $git_common_dir != /* ]]; then
 fi
 primary_root=$(cd "$(dirname "$git_common_dir")" && pwd -P)
 worktree_path=$(realpath -m -- "$worktree_argument")
+script_directory=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 
 git check-ref-format --branch "$branch" >/dev/null
 
@@ -42,41 +43,7 @@ else
     git worktree add -b "$branch" "$worktree_path" "$start_point"
 fi
 
-# These are generated artifacts or machine-local resources that are useful
-# from every branch. The primary worktree owns the real directories.
-shared_directories=(
-    runs
-    evals
-    logs
-    videos
-    data
-)
-for name in "${shared_directories[@]}"; do
-    mkdir -p "$primary_root/$name"
-    ln -s "$primary_root/$name" "$worktree_path/$name"
-    echo "[worktree] shared $name/"
-done
-
-# These must already exist in the primary worktree. Missing optional resources
-# produce a clear warning rather than leaving a misleading broken link.
-shared_resources=(
-    .venv
-    .envrc
-    TurboActivate.dat
-)
-for name in "${shared_resources[@]}"; do
-    if [[ -e "$primary_root/$name" || -L "$primary_root/$name" ]]; then
-        ln -s "$primary_root/$name" "$worktree_path/$name"
-        echo "[worktree] shared $name"
-    else
-        echo "[worktree] skipped missing $primary_root/$name"
-    fi
-done
-
-if command -v direnv >/dev/null && [[ -e "$worktree_path/.envrc" ]]; then
-    direnv allow "$worktree_path/.envrc"
-    echo "[worktree] allowed .envrc"
-fi
+"$script_directory/share_worktree_state.sh" "$worktree_path"
 
 echo
 echo "[worktree] ready: $worktree_path"
