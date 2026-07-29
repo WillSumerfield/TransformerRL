@@ -1,5 +1,6 @@
 """AntMultiMorphEnv: train one controller across many morphologies, one group per morphology."""
 import gc
+import os
 import random
 import sys
 from math import ceil
@@ -174,6 +175,7 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         morphologies: list | None = None,
         sample_morphs: bool = False,
         value_size: int = 1,
+        suppress_streaming_shutdown_warning: bool = False,
         **kwargs,
     ):
         # Full ant: sample `num_envs` variable-length bodies (one per env). Otherwise use the given
@@ -199,6 +201,13 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         self.reset_noise_scale = reset_noise_scale
         self.value_size = value_size            # reported to rl_games env_info (always 1)
         self._obs_total = _OBS_TOTAL
+        # BodyGen intentionally creates and closes one short-lived gym per collection
+        # wave. VSim warns on every end_streaming() call even though this is expected.
+        # Keep the drain for teardown safety, but allow that one native warning to be
+        # hidden for this high-frequency use case.
+        self._suppress_streaming_shutdown_warning = (
+            suppress_streaming_shutdown_warning
+        )
 
         super().__init__(
             num_envs=total_envs,
@@ -704,7 +713,24 @@ class AntMultiMorphEnv(MultiGroupEnvironmentGpu):
         torch.cuda.synchronize()
         for _fn in ("end_streaming", "_check_for_cuda_errors"):
             try:
-                getattr(self.gym, _fn)()
+                if (
+                    _fn == "end_streaming"
+                    and self._suppress_streaming_shutdown_warning
+                ):
+                    # VSim writes this warning from native code, so Python's
+                    # redirect_stderr() cannot catch it. Redirect file descriptor 2
+                    # only for the duration of the expected end_streaming() call.
+                    saved_stderr = os.dup(2)
+                    null_stderr = os.open(os.devnull, os.O_WRONLY)
+                    try:
+                        os.dup2(null_stderr, 2)
+                        getattr(self.gym, _fn)()
+                    finally:
+                        os.dup2(saved_stderr, 2)
+                        os.close(null_stderr)
+                        os.close(saved_stderr)
+                else:
+                    getattr(self.gym, _fn)()
             except Exception as _e:
                 print(f"[rebuild-drain] {_fn}() skipped: {_e!r}", flush=True)
         # Drop every gym-backed reference so delete_gym frees cleanly, then recreate the scene

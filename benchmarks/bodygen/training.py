@@ -805,6 +805,10 @@ class BodyGenTrainer:
             "raise_exception": False,
             "with_window": False,
             "base_legs": tuple(saved["base_legs"]),
+            # BodyGen closes one VSim gym after every synchronous collection
+            # wave. The shutdown is intentional; do not flood the terminal with
+            # VSim's harmless "streaming already ended" warning.
+            "suppress_streaming_shutdown_warning": True,
         }
         for key in (
             "max_episode_length",
@@ -964,6 +968,15 @@ class BodyGenTrainer:
         synchronization_waste = 0
         design_transitions = 0
         peak_width = 0
+        wave_number = 0
+
+        print(
+            "[bodygen] collecting update "
+            f"{self.completed_updates + 1}: "
+            f"{stream_count} streams, "
+            f"{worker_target:,} stored transitions/stream",
+            flush=True,
+        )
 
         while self.environment_steps + physics_steps < self.target_environment_steps:
             unfinished = [
@@ -992,6 +1005,24 @@ class BodyGenTrainer:
             for stream, episode in completed:
                 streams[stream].append(episode)
                 stored[stream] += episode.stored_transitions
+            wave_number += 1
+            stored_values = tuple(stored.values())
+            ready_streams = sum(
+                value >= worker_target for value in stored_values
+            )
+            print(
+                "[bodygen] collect "
+                f"wave={wave_number} "
+                f"global_steps={self.environment_steps + physics_steps:,}/"
+                f"{self.target_environment_steps:,} "
+                f"episodes={sum(len(items) for items in streams.values())} "
+                f"streams_ready={ready_streams}/{stream_count} "
+                "stored[min/mean/max]="
+                f"{min(stored_values):,}/"
+                f"{np.mean(stored_values):.0f}/"
+                f"{max(stored_values):,}",
+                flush=True,
+            )
 
         complete = all(value >= worker_target for value in stored.values())
         episodes = tuple(
@@ -1905,6 +1936,13 @@ class BodyGenTrainer:
                     )
                     break
 
+                print(
+                    "[bodygen] optimizing "
+                    f"update={self.completed_updates + 1} "
+                    f"episodes={len(collection.episodes)} "
+                    f"passes={self.config['training']['optimization_epochs']}",
+                    flush=True,
+                )
                 prepared = self._prepare_batch(collection.episodes)
                 ppo_metrics = self._ppo_update(prepared)
                 self.completed_updates += 1
