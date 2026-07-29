@@ -13,8 +13,12 @@ The deliberately small implementation of ADR-0016. Benchmark settings live in
 6. `nge/graph.py` then `nge/population.py` — NGE's four mutations and selection loop.
 7. `nge/nervenet.py` then `nge/gm_uc.py` — NerveNet++ and uncertainty pruning.
 8. `nge/training.py` then `nge/method.py` — measured training and evaluation routing.
-9. `metrics.py` — exact definitions of every shared reported metric.
-10. `data.py` — the two arrays-based data containers exchanged between them.
+9. `bodygen/design.py`, `bodygen/mosat.py`, then `bodygen/credit.py` — BodyGen's
+   shared-grammar design MDP, MoSAT/TopoPE networks, and Enhanced-TCA.
+10. `bodygen/training.py` then `bodygen/method.py` — complete-trajectory PPO and
+    final native-distribution evaluation.
+11. `metrics.py` — exact definitions of every shared reported metric.
+12. `data.py` — the two arrays-based data containers exchanged between them.
 
 No dynamic adapter framework or YAML inheritance is used. When another method arrives, it should
 first be added as one plainly named module with the same small set of methods used in
@@ -33,11 +37,19 @@ The literal `evaluation.seeds` integers for morphology sampling, rollout, and di
 The evaluator records and uses exactly these values—there is no hashing or derived root seed.
 `--seed N` sets all three to `N` for a direct, easily understood comparison.
 
+**VSim episode boundary**:
+The terminal transition is followed by a charged simulator notification call
+on which VSim has already reset the lane. Evaluation and episodic training
+exclude that call's reset reward/action and attach its done flag to the prior
+transition. Older CSVs that include the notification are not comparable.
+_Avoid_: adding the reset healthy reward to return, counting the notification
+as episode length
+
 **Matched progress comparison**:
 A shared benchmark evaluation of method-native checkpoints that consumed the same number of
 training environment steps. `METHOD@CHECKPOINTS=RUN` lets one invocation select different native
-checkpoint counters, such as CoDesign epochs and NGE generations, while retaining one evaluator and
-one comparison artifact.
+checkpoint counters, such as CoDesign epochs, NGE generations, and BodyGen PPO
+updates, while retaining one evaluator and one comparison artifact.
 _Avoid_: overlaying method-specific training reward tags as if they had identical sampling semantics
 
 **Training progress evaluation**:
@@ -116,11 +128,39 @@ The controller and selection transition counters whose sum is the authoritative
 training environment-step count. All three are checkpointed and logged.
 _Avoid_: free selection evaluation, PPO-only step count
 
+**BodyGen benchmark method**:
+`bodygen/` is a package because the native method has four named, independently
+auditable parts: the topology/attribute design MDP, six MoSAT actor/critic
+trunks with TopoPE, Enhanced-TCA, and complete-trajectory PPO. Training begins
+from `[1,4,6]`, uses five topology waves and one categorical attribute wave,
+then rebuilds the resulting body once for VSim control. `method.py` samples
+fresh stochastic designs from the frozen final actor and pairs all rows with
+its shared universal controller. Read `bodygen/ADAPTATIONS.md` before changing
+the algorithm or calling it faithful.
+
+**BodyGen topology action**:
+One `{NoChange, Add, Delete}` choice for every node present at the beginning of
+a topology wave. Actions are applied from that snapshot and new nodes cannot
+act until the next wave. Root Add fills the first empty numbered limb slot;
+Delete removes only a terminal node and can never remove the final effector.
+_Avoid_: sequential within-wave mutation, a learned root-slot head, deleting a
+non-terminal subtree
+
+**BodyGen step audit**:
+The exact charged physics count split into retained trajectory transitions,
+synchronous-wave waste, and a recorded exact-budget discarded tail. Six
+simulator-free design transitions per trajectory are PPO data but are not
+physics steps. VSim's one-call-late done notification is not PPO data, but its
+physical call remains charged as synchronous-wave waste. BodyGen may use fewer
+simultaneous environments than the shared 4,096 cap.
+_Avoid_: charging design-network calls as physics, hiding synchronisation
+activity, treating the cap as an equality requirement
+
 **Benchmark search contract**:
 The method-specific `tune_<method>.yaml` ranges and named feasibility
 conditions paired with one runnable `<method>.yaml`; the method validator
-enforces the conditions again after resolution. NGE uses this split now and
-BodyGen must adopt it with its faithful port.
+enforces the conditions again after resolution. NGE and BodyGen both use this
+split.
 _Avoid_: mixing ranges into runnable configs, tuner-only validation
 
 ## Check the benchmark contracts
@@ -151,3 +191,7 @@ python -m unittest discover -s tests -p 'test_benchmark*.py'
   population of native controllers, four graph mutations, GM-UC, recurrent PPO,
   genealogy, and complete resume state. Its package contains no reusable
   adapter hierarchy; every file corresponds to one named NGE component.
+- The BodyGen stage retains its unified design/control MDP, six independent
+  MoSAT trunks, TopoPE, Enhanced-TCA, complete-trajectory collector, and full
+  resume state. Continuous MuJoCo geometry attributes are categorical typed
+  grammar choices; the adaptation is enumerated in `bodygen/ADAPTATIONS.md`.

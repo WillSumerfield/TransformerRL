@@ -50,7 +50,10 @@ class _Environment:
     def step(self, _action):
         self.local_steps += 1
         reward = torch.arange(1, self.total_num_envs + 1, dtype=torch.float32)
-        done = self.local_steps == 2
+        # Match AntMultiMorphEnv: two real transitions, followed by a delayed
+        # done notification whose reset reward must not enter the episode.
+        done = self.local_steps == 3
+        reward = torch.where(done, torch.full_like(reward, 99), reward)
         terminated = done & (torch.arange(self.total_num_envs) % 2 == 0)
         truncated = done & ~terminated
         self.local_steps = torch.where(done, 0, self.local_steps)
@@ -115,9 +118,22 @@ class _ExclusiveMethod(_Method):
         return _ExclusiveEnvironment(count)
 
 
+class _DoubleValueMethod(_Method):
+    def deterministic_action(self, observation):
+        precise = 1.0 + 2.0**-40
+        return (
+            torch.zeros((len(observation), 1)),
+            torch.full(
+                (len(observation),),
+                precise,
+                dtype=torch.float64,
+            ),
+        )
+
+
 class BenchmarkEvaluationTests(unittest.TestCase):
     def test_run_job_can_override_checkpoints_for_one_method(self) -> None:
-        methods = {"codesign", "fixed_body", "uniform_action", "nge"}
+        methods = {"codesign", "fixed_body", "uniform_action", "nge", "bodygen"}
 
         self.assertEqual(
             parse_run_job(
@@ -137,9 +153,19 @@ class BenchmarkEvaluationTests(unittest.TestCase):
             ),
             ("codesign", "/tmp/codesign-run", "final"),
         )
+        self.assertEqual(
+            parse_run_job(
+                "bodygen@100,200=/tmp/bodygen-run",
+                methods=methods,
+                default_method="codesign",
+                default_checkpoints="final",
+            ),
+            ("bodygen", "/tmp/bodygen-run", "100,200"),
+        )
 
     def test_config_uses_the_seed_values_exactly_as_written(self) -> None:
         config = load_config(CONFIG, preset="smoke")
+        self.assertEqual(config["protocol_version"], 2)
         self.assertEqual(config["method"], "codesign")
         self.assertEqual(config["evaluation"]["pairs"], 4)
         self.assertNotIn("presets", config["evaluation"])
@@ -170,6 +196,15 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         np.testing.assert_allclose(results.falls, [[1, 1], [0, 0]])
         np.testing.assert_allclose(results.lengths, [[2, 2], [2, 2]])
         np.testing.assert_allclose(results.start_values, 3)
+
+    def test_rollout_preserves_float64_critic_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            method = _DoubleValueMethod(Path(temporary))
+            results = run_episodes(method, _Environment(2), _pairs(), 1)
+
+        expected = 1.0 + 2.0**-40
+        self.assertEqual(results.start_values.dtype, np.float64)
+        np.testing.assert_array_equal(results.start_values, expected)
 
     def test_training_and_final_evaluation_share_expected_return(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -231,6 +266,52 @@ class BenchmarkEvaluationTests(unittest.TestCase):
             config = load_config(CONFIG, preset="smoke")
             config["runtime"]["device"] = "cpu"
             with self.assertRaisesRegex(ValueError, "budget mismatch"):
+                evaluate_runs(
+                    config,
+                    [method],
+                    project_root=ROOT,
+                    destination=Path(temporary) / "eval",
+                )
+
+    def test_parallel_environment_requirement_is_a_positive_cap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            method = _Method(root)
+            method.parallel_envs = 20
+            config = load_config(CONFIG, preset="smoke")
+            config["runtime"]["device"] = "cpu"
+            destination, summaries = evaluate_runs(
+                config,
+                [method],
+                project_root=ROOT,
+                destination=root / "comparison",
+            )
+
+            self.assertTrue(destination.is_dir())
+            self.assertTrue(summaries[0]["budget_compliant"])
+
+    def test_nonpositive_or_over_cap_parallel_width_is_rejected(self) -> None:
+        for width in (0, 4097):
+            with self.subTest(width=width), tempfile.TemporaryDirectory() as temporary:
+                method = _Method(Path(temporary))
+                method.parallel_envs = width
+                config = load_config(CONFIG, preset="smoke")
+                config["runtime"]["device"] = "cpu"
+                with self.assertRaisesRegex(ValueError, "peak envs"):
+                    evaluate_runs(
+                        config,
+                        [method],
+                        project_root=ROOT,
+                        destination=Path(temporary) / "eval",
+                    )
+
+    def test_development_run_is_not_paper_budget_compliant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            method = _Method(Path(temporary))
+            method.paper_eligible = False
+            config = load_config(CONFIG, preset="smoke")
+            config["runtime"]["device"] = "cpu"
+            with self.assertRaisesRegex(ValueError, "paper-eligible"):
                 evaluate_runs(
                     config,
                     [method],

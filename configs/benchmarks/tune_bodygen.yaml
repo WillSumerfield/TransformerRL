@@ -1,0 +1,51 @@
+# Search-space contract for the paper BodyGen sweep.
+#
+# A sweep launcher copies bodygen.yaml, applies one candidate, sets the exact
+# proxy physics budget below, validates it, and trains all three tuning seeds.
+# The method-native schedule (five topology steps, one attribute step, twenty
+# complete-episode streams and ten PPO passes) is intentionally not tuned.
+study:
+  method: bodygen
+  base_config: configs/benchmarks/bodygen.yaml
+  candidates: 30
+  tuning_seeds: [142, 143, 144]
+  proxy_environment_steps: 78643200
+  objective: benchmark/return/expected
+  early_pruning: false
+
+params:
+  - path: training.actor_learning_rate
+    type: categorical
+    choices: [5.0e-5, 1.0e-4, 3.0e-4]
+
+  - path: training.critic_learning_rate
+    type: categorical
+    choices: [1.0e-4, 3.0e-4]
+
+  - path: network.hidden_size
+    type: categorical
+    choices: [32, 64, 128, 256]
+
+  # Appendix A.3.2 tunes the MoSAT normalisation placement. The observation,
+  # return and advantage normalisers remain at their camera-ready defaults.
+  - path: network.layer_norm
+    type: categorical
+    choices: [none, pre, post]
+
+constraints:
+  - name: upstream_worker_partition_is_exact
+    expression: >-
+      collection.minimum_transitions_per_stream ==
+      floor(
+        collection.minimum_batch_transitions /
+        collection.logical_streams
+      )
+
+  - name: bodygen_respects_parallel_environment_cap
+    expression: >-
+      collection.logical_streams <= budget.parallel_envs
+
+  - name: design_schedule_is_camera_ready
+    expression: >-
+      design.topology_steps == 5 &&
+      design.attribute_steps == 1

@@ -93,10 +93,10 @@ def load_config(path: str | Path, *, preset: str | None = None) -> dict[str, Any
 
 def validate_config(config: dict[str, Any]) -> None:
     """Check only comparison rules whose violation could invalidate a result."""
-    methods = {"codesign", "fixed_body", "uniform_action", "nge"}
+    methods = {"codesign", "fixed_body", "uniform_action", "nge", "bodygen"}
     if config.get("method") not in methods:
         raise ValueError(
-            "method must be codesign, fixed_body, uniform_action or nge"
+            "method must be codesign, fixed_body, uniform_action, nge or bodygen"
         )
 
     requirements = config.get("paper_run_requirements", {})
@@ -170,7 +170,10 @@ def run_episodes(
     returns = torch.full(shape, torch.nan, device=device)
     falls = torch.full(shape, torch.nan, device=device)
     lengths = torch.full(shape, torch.nan, device=device)
-    start_values = torch.full(shape, torch.nan, device=device)
+    # Most shared controllers use float32, whereas faithful BodyGen keeps its
+    # critic in the upstream float64 dtype. Allocate this lazily so recording a
+    # critic value never narrows it or rejects an otherwise valid method.
+    start_values: torch.Tensor | None = None
 
     current_return = torch.zeros(pairs.size, device=device)
     current_length = torch.zeros(pairs.size, device=device)
@@ -186,8 +189,18 @@ def run_episodes(
 
         action, value = method.deterministic_action(observation)
         capture = episode_start & active
-        if value is not None and bool(capture.any()):
-            start_values[rows[capture], completed[capture]] = value[capture]
+        if value is not None:
+            if start_values is None:
+                start_values = torch.full(
+                    shape,
+                    torch.nan,
+                    device=device,
+                    dtype=value.dtype,
+                )
+            if bool(capture.any()):
+                start_values[rows[capture], completed[capture]] = (
+                    value[capture].to(start_values)
+                )
 
         observation, reward, terminated, truncated, _ = environment.step(action)
         reward = reward.squeeze(-1) if reward.ndim > 1 else reward
@@ -195,9 +208,11 @@ def run_episodes(
         reset_controllers = getattr(method, "reset_controllers", None)
         if callable(reset_controllers):
             reset_controllers(done)
-        current_return += torch.where(active, reward, 0)
-        current_length += active.float()
 
+        # AntMultiMorphEnv exposes done one call after the terminal transition.
+        # On this notification call the lane has already been reset and
+        # ``reward`` belongs to that reset, not to the completed episode. The
+        # real terminal reward/length were accumulated on the preceding call.
         finished = done & active
         if bool(finished.any()):
             row = rows[finished]
@@ -207,6 +222,9 @@ def run_episodes(
             lengths[row, episode] = current_length[finished]
             completed[finished] += 1
 
+        retained = active & ~done
+        current_return += torch.where(retained, reward, 0)
+        current_length += retained.float()
         current_return = torch.where(done, 0, current_return)
         current_length = torch.where(done, 0, current_length)
         episode_start = done
@@ -215,7 +233,7 @@ def run_episodes(
         raise RuntimeError("not every pair completed the requested episodes")
 
     values = None
-    if not bool(torch.isnan(start_values).all()):
+    if start_values is not None:
         if bool(torch.isnan(start_values).any()):
             raise RuntimeError("critic values were missing at some episode starts")
         values = start_values.cpu().numpy()
@@ -360,15 +378,22 @@ def evaluate_method(
     requirements = config["paper_run_requirements"]
     required_steps = int(requirements["environment_steps"])
     required_envs = int(requirements["parallel_envs"])
+    # ``parallel_envs`` is a shared resource ceiling, not a requirement that
+    # every algorithm collect at the same width. Methods such as BodyGen need
+    # temporal depth and may therefore use fewer simultaneous VSim lanes.
+    environment_width_matches = 0 < method.parallel_envs <= required_envs
     budget_matches = (
         method.training_steps == required_steps
-        and method.parallel_envs == required_envs
+        and environment_width_matches
+        and bool(getattr(method, "paper_eligible", True))
     )
     if config["checks"]["enforce_training_budget"] and not budget_matches:
         raise ValueError(
             "training budget mismatch: "
-            f"checkpoint has {method.training_steps:,} steps/{method.parallel_envs:,} envs; "
-            f"benchmark requires {required_steps:,} steps/{required_envs:,} envs"
+            f"checkpoint has {method.training_steps:,} steps/"
+            f"{method.parallel_envs:,} envs; "
+            f"benchmark requires exactly {required_steps:,} steps and "
+            f"0 < peak envs <= {required_envs:,}, from a paper-eligible run"
         )
 
     reporting_seed = method.training_seed

@@ -15,9 +15,40 @@ def _np(x):
 
 
 class AntCodesignEnv(AntMultiMorphEnv):
-    def __init__(self, num_envs, device, *, base_legs=(1, 4, 6), **kwargs):
+    def __init__(
+        self,
+        num_envs,
+        device,
+        *,
+        base_legs=(1, 4, 6),
+        initial_designs=None,
+        **kwargs,
+    ):
+        """Create the typed-body environment.
+
+        ``initial_designs=(counts, eff_sub, cap_sub)`` builds those bodies
+        directly. Without it, construction keeps the historical canonical
+        body and callers may later use ``set_next(); resample()``.
+        """
         self._base_legs = frozenset(base_legs)
-        self._next_bodies = None                   # list[(eff_types, cap_types)], len total_num_envs
+        if initial_designs is None:
+            self._next_bodies = None
+        else:
+            if len(initial_designs) != 3:
+                raise ValueError(
+                    "initial_designs must be (counts, eff_sub, cap_sub)"
+                )
+            counts, eff_sub, cap_sub = initial_designs
+            self._next_bodies = designs_from_arrays(
+                _np(counts),
+                _np(eff_sub),
+                _np(cap_sub),
+                _N_LIMBS,
+            )
+            if len(self._next_bodies) != int(num_envs):
+                raise ValueError(
+                    "initial_designs must contain one body per environment"
+                )
         kwargs.setdefault("sample_morphs", True)    # unlocks resample(); _draw_morphs is overridden
         super().__init__(num_envs, device, **kwargs)
 

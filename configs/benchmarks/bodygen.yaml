@@ -1,0 +1,116 @@
+# Faithful BodyGen on the shared typed-ant task. This file is deliberately
+# standalone so the full algorithm and budget can be reviewed without YAML
+# inheritance.
+method: bodygen
+seed: 42
+
+runtime:
+  device: cuda:0
+  # The camera-ready implementation trains BodyGen in double precision.
+  dtype: float64
+  # The launcher sets this only for --smoke. Paper evaluation rejects it.
+  development: false
+
+budget:
+  # Exact shared paper budget. Only VSim physics transitions increment this
+  # counter; the six simulator-free design decisions do not.
+  environment_steps: 196608000
+  # Shared paper cap, not BodyGen's actual rollout width. BodyGen uses twenty
+  # complete-episode streams and therefore remains far below this limit.
+  parallel_envs: 4096
+
+environment:
+  base_legs: [1, 4, 6]
+  max_episode_length: 1000
+  ctrl_cost_weight: 0.5
+  healthy_reward: 2.0
+  healthy_y_range: [0.3, 1.1]
+  reset_noise_scale: 1.0
+  timestep: 0.01667
+  frame_skip: 1
+  spacing: 3.0
+  max_contact_pairs_per_env: 64
+
+design:
+  # One BodyGen episode is one unified MDP: five topology decisions, one
+  # attribute decision, then a complete controller episode.
+  topology_steps: 5
+  attribute_steps: 1
+  max_effectors_per_limb: 3
+  root_slots: 8
+  root_add_order: first_empty
+  minimum_effectors: 1
+
+collection:
+  # Upstream launches twenty workers. Each worker keeps complete trajectories
+  # until it reaches floor(50,000 / 20) stored MDP transitions. The six design
+  # transitions count toward this threshold but not the physics-step budget.
+  logical_streams: 20
+  minimum_batch_transitions: 50000
+  minimum_transitions_per_stream: 2500
+  complete_episodes: true
+
+network:
+  # MoSAT / TopoPE camera-ready defaults.
+  hidden_size: 64
+  blocks: 3
+  attention_heads: 1
+  feed_forward_ratio: 4
+  topology_embeddings: 256
+  layer_norm: pre
+  activation: silu
+  critic_hidden: [512, 256]
+  # Pinned Crawler policy setting.
+  initial_control_log_std: -0.5
+
+training:
+  gamma: 0.995
+  gae_lambda: 0.95
+  ppo_clip: 0.2
+  actor_learning_rate: 5.0e-5
+  critic_learning_rate: 3.0e-4
+  optimization_epochs: 10
+  minibatch_size: 2048
+  gradient_clip: 40.0
+  normalize_observations: true
+  normalize_returns: true
+  normalize_advantages: true
+
+checkpoint:
+  # Match upstream's 100-update save interval. Every saved update is a complete
+  # between-batch resume boundary; final.pth is also written when the exact
+  # budget ends inside a batch.
+  every_updates: 100
+
+native_evaluation:
+  # Optional upstream-style greedy/mean diagnostic. It is uncharged and never
+  # selects final.pth. best.pth, when enabled, is diagnostic only.
+  enabled: false
+  every_updates: 1
+  episodes: 20
+  evaluate_final: true
+  morphology_seed: 30001
+  rollout_seed: 40001
+
+training_evaluation:
+  # Optional shared benchmark monitoring under rewards/step_eval. It restores
+  # every RNG afterward and does not consume the training budget.
+  enabled: false
+  every_updates: 1
+  evaluate_final: true
+  pairs: 16
+  episodes_per_pair: 2
+  seeds:
+    morphology: 10001
+    rollout: 20001
+
+logging:
+  # TensorBoard is required. Optional W&B mirrors exactly the same scalar
+  # names and uses benchmark/training/environment_steps as its primary axis.
+  tensorboard: true
+  wandb:
+    enabled: false
+    mode: offline
+    project: null
+    entity: null
+    group: null

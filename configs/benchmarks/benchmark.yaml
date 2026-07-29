@@ -1,6 +1,8 @@
 # One readable source of truth for the benchmark. Method-specific settings are
 # grouped at the bottom instead of inherited from another YAML file.
-protocol_version: 1
+# Version 2 excludes VSim's delayed reset-notification reward and length from
+# every completed evaluation episode. Version-1 CSVs must not be mixed with it.
+protocol_version: 2
 method: codesign
 
 # The evaluator does not train anything. These are only the conditions a saved
@@ -34,7 +36,8 @@ evaluation:
     paper:
       # A "pair" is one sampled morphology and its method-native controller.
       # CoDesign uses the checkpoint's shared controller for every sampled body;
-      # future NGE/BodyGen bodies may each have their own controller.
+      # BodyGen also uses one checkpoint-wide controller; NGE rows route to
+      # the sampled species' own controller.
       pairs: 128
       # Every pair is held fixed and run for this many complete VSim episodes.
       episodes_per_pair: 32
@@ -110,6 +113,16 @@ nge:
   # NerveNet++ controller per species. Numeric --epochs values select NGE
   # generations; --epochs final selects checkpoints/final.pth.
   run_root: runs/benchmarks/nge/nge_nervenetpp
+  run_dir: null
+  run_config: null
+  checkpoint: final
+
+bodygen:
+  # BodyGen checkpoints retain its topology, attribute, and control
+  # actor/critic networks plus the observation and return normalisers.
+  # Numeric --epochs values select native PPO updates; --epochs final selects
+  # checkpoints/final.pth.
+  run_root: runs/benchmarks/bodygen/bodygen_mosat
   run_dir: null
   run_config: null
   checkpoint: final

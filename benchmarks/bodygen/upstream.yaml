@@ -1,0 +1,26 @@
+method: BodyGen
+paper:
+  title: "BodyGen: Advancing Towards Efficient Embodiment Co-Design"
+  venue: ICLR 2025
+  project_url: https://genesisorigin.github.io/
+  arxiv_url: https://arxiv.org/abs/2503.00533
+  openreview_url: https://openreview.net/forum?id=cTR17xl89h
+implementation:
+  repository: https://github.com/Josh00-Lu/BodyGen
+  commit: 4e0bdc0c1e528174e19bbe62633f5316f6283db6
+  commit_date: "2025-02-11T23:12:50+08:00"
+license:
+  spdx: Apache-2.0
+  local_copy: LICENSE.upstream
+  # The local bytes are an exact copy from the pinned tree.
+  sha256: 43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1
+  upstream_sha256: 43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1
+reference_files:
+  design_opt/agents/genesis_agent.py:
+    sha256: cdd9667cf788d5fae6ab5d9c5ebd42d33e7953a66e4a753162211837a6236298
+  design_opt/models/bodygen_policy.py:
+    sha256: 9aa7f4fdb12786b988cb045f6443f7322a143a4538faa822bf47c97f75611cd4
+  design_opt/models/bodygen_critic.py:
+    sha256: 279bbb0092ae7d626a0ed9a963a9fb2acaf9019cc03c1635ae857204ecf31bc1
+  design_opt/models/transformer.py:
+    sha256: 5ed98f1b92f4ae651b3b2aff37d3cc7c0f9d84498823a0cddc109b3ab40f2280

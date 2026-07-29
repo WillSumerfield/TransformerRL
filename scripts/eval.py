@@ -126,13 +126,17 @@ def _rollout(net, obs_norm, env, device, *, episodes):
         obs, rew, term, trunc, _ = env.step(mu)
         rew = rew.squeeze(-1) if rew.ndim > 1 else rew
         done = term | trunc
-        cur += torch.where(collecting, rew, torch.zeros_like(rew))
-        curlen += collecting.float()
-        finish = done & collecting                          # a within-budget episode just ended
+        # VSim reports done one call late, after resetting the lane. Finish
+        # from the already accumulated real transitions and exclude this
+        # notification call's reset reward and extra step.
+        finish = done & collecting
         ret_sum += torch.where(finish, cur, torch.zeros_like(cur))
         len_sum += torch.where(finish, curlen, torch.zeros_like(curlen))
         term_sum += (term & finish).float()
-        ep_done += done.float()
+        ep_done += finish.float()
+        retained = collecting & ~done
+        cur += torch.where(retained, rew, torch.zeros_like(rew))
+        curlen += retained.float()
         cur = torch.where(done, torch.zeros_like(cur), cur)
         curlen = torch.where(done, torch.zeros_like(curlen), curlen)
         at_s0 = done

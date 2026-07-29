@@ -8,7 +8,7 @@ retains every sampled body and episode.
 
 Usage:
   python scripts/benchmark_eval.py RUN [RUN ...]
-      [--method codesign|fixed_body|uniform_action|nge]
+      [--method codesign|fixed_body|uniform_action|nge|bodygen]
       [--epochs final|N,N,...] [--preset paper|smoke]
       [--episodes N] [--top-k K] [--num-envs N] [--out DIRECTORY]
 
@@ -16,18 +16,19 @@ An unprefixed RUN uses ``--method`` (or the YAML's ``method``). To compare
 different methods in one result, prefix each run, for example:
 
   python scripts/benchmark_eval.py \
-      codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C nge=RUN_D
+      codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C \
+      nge=RUN_D bodygen=RUN_E
 
 For matched progress checkpoints, put that method's checkpoint labels before
-the equals sign. CoDesign/fixed/uniform labels are epochs; NGE labels are
-generations:
+the equals sign. CoDesign/fixed/uniform labels are epochs, NGE labels are
+generations, and BodyGen labels are PPO updates:
 
   python scripts/benchmark_eval.py \
-      codesign@200,400=RUN_A uniform_action@200,400=RUN_C nge@5,10=RUN_D
+      codesign@200,400=RUN_A nge@5,10=RUN_D bodygen@100,200=RUN_E
 
 ``final`` is the paper default. Numeric epochs are intended for development and
 normally require ``--allow-incomplete-training``. For NGE, numeric values name
-saved generations rather than rl_games epochs.
+saved generations; for BodyGen, they name saved PPO updates.
 """
 import os
 import sys
@@ -87,6 +88,10 @@ import yaml
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
+from benchmarks.bodygen import (  # noqa: E402
+    checkpoints_for_bodygen_run,
+    load_bodygen,
+)
 from benchmarks.codesign import (  # noqa: E402
     checkpoints_for_run,
     load_codesign,
@@ -106,6 +111,12 @@ _METHOD_LOADERS = {
     "fixed_body": load_fixed_body,
     "uniform_action": load_uniform_action,
     "nge": load_nge,
+    "bodygen": load_bodygen,
+}
+
+_NATIVE_CHECKPOINT_RESOLVERS = {
+    "nge": checkpoints_for_nge_run,
+    "bodygen": checkpoints_for_bodygen_run,
 }
 
 
@@ -138,7 +149,7 @@ def _parser() -> argparse.ArgumentParser:
         default="final",
         help=(
             "'final' (default) or comma-separated epoch numbers "
-            "(generation numbers for NGE)"
+            "(generations for NGE; PPO updates for BodyGen)"
         ),
     )
     parser.add_argument(
@@ -199,10 +210,9 @@ def _jobs(
             default_checkpoints=epochs,
         )
         method_config = config[method_name]
-        checkpoint_resolver = (
-            checkpoints_for_nge_run
-            if method_name == "nge"
-            else checkpoints_for_run
+        checkpoint_resolver = _NATIVE_CHECKPOINT_RESOLVERS.get(
+            method_name,
+            checkpoints_for_run,
         )
         for label, checkpoint in checkpoint_resolver(
             method_config,
