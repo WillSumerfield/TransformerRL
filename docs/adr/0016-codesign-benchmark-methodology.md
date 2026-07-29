@@ -71,7 +71,11 @@ Statistical summaries treat the five independently trained reporting seeds as th
 The paper evaluation preset uses 128 native pairs per method and reporting seed, 32 deterministic episodes per pair, `K=10`, and 4,096 design-only samples for distribution and diversity estimates. Cross-method diversity is reported as (1) the unique fraction in those samples, (2) empirical entropy and its effective-body-count transform from sample frequencies, and (3) mean normalized typed-token distance between sampled bodies in the canonical grammar encoding. Codesign committance remains a method-specific diagnostic rather than a shared diversity result. Codesign, faithful NGE, and faithful BodyGen each receive exactly 30 complete candidate configurations, with every configuration run at the same full proxy environment-step budget on the same three fixed tuning seeds: 90 proxy runs per method. Early pruning and discretionary early stopping are disabled. Candidates are ranked by their mean primary benchmark score across the three tuning seeds, which are disjoint from reporting seeds `[42, 43, 44, 45, 46]`. The fixed and uniform controls inherit the selected codesign controller settings.
 
 Training reward curves remain diagnostics because their episode sampling differs
-between algorithms. For readable matched-step progress, the shared fixed-pair
+between algorithms. BodyGen writes its rolling complete-trajectory return to
+`rewards/step` and `rewards/time` after each synchronous collection wave, while
+`rewards/iter` remains once per native PPO update; multiple waves do not invent
+policy iterations while the policy is unchanged. For readable matched-step
+progress, the shared fixed-pair
 rollout core may optionally run at configured checkpoint boundaries and log the
 probability-weighted complete-episode return as `rewards/step_eval` against the
 checkpoint's charged training environment-step count. This monitoring is

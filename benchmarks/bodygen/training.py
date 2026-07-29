@@ -590,13 +590,7 @@ class TrainingLogger:
             if np.isfinite(value):
                 self.writer.add_scalar(name, value, environment_steps)
         if completed_reward is not None:
-            self.writer.add_scalar(
-                "rewards/step",
-                completed_reward,
-                environment_steps,
-            )
             self.writer.add_scalar("rewards/iter", completed_reward, update)
-            self.writer.add_scalar("rewards/time", completed_reward, wall_seconds)
         self.writer.flush()
 
         if self.wandb_run is not None:
@@ -615,14 +609,64 @@ class TrainingLogger:
                 }
             )
             if completed_reward is not None:
-                payload.update(
-                    {
-                        "rewards/step": completed_reward,
-                        "rewards/iter": completed_reward,
-                        "rewards/time": completed_reward,
-                    }
-                )
+                payload["rewards/iter"] = completed_reward
             self.wandb_run.log(payload)
+
+    def log_collection_rewards(
+        self,
+        *,
+        environment_steps: int,
+        update: int,
+        wall_seconds: float,
+        completed_episodes: int,
+        rolling_reward: float,
+        wave_reward: float,
+    ) -> None:
+        """Log complete training returns as soon as one VSim wave finishes.
+
+        A BodyGen PPO update contains many complete-episode collection waves.
+        Step and wall-time curves can therefore report each wave. Iteration
+        rewards remain update-level because the policy does not change between
+        those waves.
+        """
+        self.writer.add_scalar(
+            "rewards/step",
+            rolling_reward,
+            environment_steps,
+        )
+        self.writer.add_scalar(
+            "rewards/time",
+            rolling_reward,
+            wall_seconds,
+        )
+        self.writer.add_scalar(
+            "bodygen/collection/wave_return_mean",
+            wave_reward,
+            environment_steps,
+        )
+        self.writer.add_scalar(
+            "bodygen/collection/wave_completed_episodes",
+            completed_episodes,
+            environment_steps,
+        )
+        self.writer.flush()
+
+        if self.wandb_run is not None:
+            self.wandb_run.log(
+                {
+                    "benchmark/training/environment_steps": float(
+                        environment_steps
+                    ),
+                    "benchmark/training/update": float(update),
+                    "benchmark/training/wall_seconds": float(wall_seconds),
+                    "rewards/step": rolling_reward,
+                    "rewards/time": rolling_reward,
+                    "bodygen/collection/wave_return_mean": wave_reward,
+                    "bodygen/collection/wave_completed_episodes": float(
+                        completed_episodes
+                    ),
+                }
+            )
 
     def log_evaluation(
         self,
@@ -1005,6 +1049,19 @@ class BodyGenTrainer:
             for stream, episode in completed:
                 streams[stream].append(episode)
                 stored[stream] += episode.stored_transitions
+            wave_returns = tuple(
+                episode.episode_return for _, episode in completed
+            )
+            if wave_returns:
+                self.reward_window.extend(wave_returns)
+                self.logger.log_collection_rewards(
+                    environment_steps=self.environment_steps + physics_steps,
+                    update=self.completed_updates,
+                    wall_seconds=self.wall_seconds,
+                    completed_episodes=len(wave_returns),
+                    rolling_reward=float(np.mean(self.reward_window)),
+                    wave_reward=float(np.mean(wave_returns)),
+                )
             wave_number += 1
             stored_values = tuple(stored.values())
             ready_streams = sum(
@@ -1924,7 +1981,6 @@ class BodyGenTrainer:
                         episode.episode_return
                         for episode in collection.episodes
                     )
-                    self.reward_window.extend(partial_returns)
                     rolling_reward = (
                         float(np.mean(self.reward_window))
                         if self.reward_window
@@ -1973,7 +2029,6 @@ class BodyGenTrainer:
                 prepared = self._prepare_batch(collection.episodes)
                 ppo_metrics = self._ppo_update(prepared)
                 self.completed_updates += 1
-                self.reward_window.extend(prepared.completed_returns)
                 rolling_reward = (
                     float(np.mean(self.reward_window))
                     if self.reward_window

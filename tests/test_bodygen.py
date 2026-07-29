@@ -472,6 +472,55 @@ class BodyGenTrainingTests(unittest.TestCase):
                 width = choose_wave_width(active, remaining)
                 self.assertEqual(width, min(active, remaining))
 
+    def test_collection_wave_logs_complete_returns_on_step_and_time_axes(
+        self,
+    ) -> None:
+        class CapturingLogger:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, float]] = []
+
+            def log_collection_rewards(self, **values: float) -> None:
+                self.calls.append(values)
+
+        trainer = BodyGenTrainer.__new__(BodyGenTrainer)
+        trainer.config = {
+            "collection": {
+                "logical_streams": 2,
+                "minimum_batch_transitions": 16,
+            }
+        }
+        trainer.environment_steps = 100
+        trainer.target_environment_steps = 1_000
+        trainer.completed_updates = 3
+        trainer.reward_window = deque(maxlen=100)
+        trainer.accumulated_wall_seconds = 0.0
+        trainer.started = time.perf_counter()
+        trainer.logger = CapturingLogger()
+
+        first = Episode(design=None, design_trace=None)
+        first.rewards = [torch.tensor(1.0), torch.tensor(2.0)]
+        second = Episode(design=None, design_trace=None)
+        second.rewards = [torch.tensor(4.0), torch.tensor(5.0)]
+        trainer._collect_wave = lambda stream_ids, remaining_steps: (
+            [(0, first), (1, second)],
+            10,
+            4,
+            6,
+            12,
+        )
+
+        collection = trainer.collect_batch()
+
+        self.assertTrue(collection.complete)
+        self.assertEqual(list(trainer.reward_window), [3.0, 9.0])
+        self.assertEqual(len(trainer.logger.calls), 1)
+        logged = trainer.logger.calls[0]
+        self.assertEqual(logged["environment_steps"], 110)
+        self.assertEqual(logged["update"], 3)
+        self.assertEqual(logged["completed_episodes"], 2)
+        self.assertEqual(logged["rolling_reward"], 6.0)
+        self.assertEqual(logged["wave_reward"], 6.0)
+
     def test_batch_design_groups_each_stage_after_shuffle(self) -> None:
         stages = np.asarray(
             [TOPOLOGY, CONTROL, ATTRIBUTE, TOPOLOGY, CONTROL]
