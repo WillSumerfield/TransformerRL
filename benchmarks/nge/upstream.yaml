@@ -1,0 +1,23 @@
+method: Neural Graph Evolution
+short_name: NGE
+paper:
+  title: "Neural Graph Evolution: Towards Efficient Automatic Robot Design"
+  venue: ICLR 2019
+  project_url: https://www.cs.toronto.edu/~henryzhou/NGE_website/
+  pdf_url: https://www.cs.toronto.edu/~henryzhou/NGE/nge.pdf
+  openreview_url: https://openreview.net/forum?id=BkgWHnR5tm
+implementation:
+  repository: https://github.com/WilsonWangTHU/neural_graph_evolution
+  commit: 9142b7f1c32c476aa44c83da38d3f0bacc276d73
+  commit_date: "2019-11-19T17:42:17-05:00"
+license:
+  spdx: MIT
+  local_copy: LICENSE.upstream
+  sha256: c820f3d7d31184afc7938449efa5d1796bd6790ce4748fd0629808620978952a
+reference_files:
+  network/nervenetplus_policy.py:
+    sha256: b1661b47f0f1c540fa893843378c14678069aef29c483362a7e513d762aba5e6
+  agent/pruning_agent.py:
+    sha256: 1d1245c77338e84dfd6afb4987b86ede69283d36a320566aa6e6e492acb91ec3
+  evolution/species_bank.py:
+    sha256: 90d9bd823c866353fae54957e9d480f4d6bc0b3534f6bb9d31c3b29ec0daeb0d

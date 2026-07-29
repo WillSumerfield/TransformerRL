@@ -1,0 +1,107 @@
+# Search-space contract for the paper NGE sweep.
+#
+# This file deliberately contains ranges, while nge.yaml contains one runnable
+# configuration. A sweep launcher must copy nge.yaml, apply one sampled
+# candidate, set budget.environment_steps to proxy_environment_steps, and call
+# validate_nge_config before starting VSim. Infeasible samples do not count
+# toward the 30 completed candidates.
+study:
+  method: nge
+  base_config: configs/benchmarks/nge.yaml
+  candidates: 30
+  tuning_seeds: [142, 143, 144]
+  proxy_environment_steps: 78643200
+  objective: benchmark/return/expected
+  early_pruning: false
+
+params:
+  # Controller learning.
+  - path: training.policy_learning_rate
+    type: float
+    low: 1.0e-4
+    high: 1.0e-3
+    log: true
+
+  - path: training.value_learning_rate
+    type: float
+    low: 1.0e-4
+    high: 1.0e-3
+    log: true
+
+  - path: training.ppo_clip
+    type: float
+    low: 0.1
+    high: 0.3
+
+  - path: training.optimization_epochs
+    type: categorical
+    choices: [5, 10, 15]
+
+  # Morphology-update cadence and complete-return selection sampling.
+  - path: training.rollout_steps
+    type: categorical
+    choices: [32, 64]
+
+  - path: training.updates_per_generation
+    type: categorical
+    choices: [9, 14, 19, 24]
+
+  - path: selection_evaluation.environments_per_species
+    type: categorical
+    choices: [2, 4, 8]
+
+  - path: selection_evaluation.rollout_steps
+    type: categorical
+    choices: [1024, 1280, 1536, 2048]
+
+  # Evolution pressure. The four mutation probabilities remain pinned because
+  # independently sweeping a probability simplex would need a separate
+  # parameterisation.
+  - path: population.elimination_rate
+    type: float
+    low: 0.15
+    high: 0.35
+
+# These named conditions are the readable sweep contract. The same conditions
+# are enforced in benchmarks/nge/training.py, so direct training cannot bypass
+# them. Names below refer to their full YAML paths.
+constraints:
+  - name: ppo_batch_has_upstream_sample_count
+    expression: >-
+      (budget.parallel_envs / population.size) *
+      training.rollout_steps >=
+      fidelity_constraints.minimum_transitions_per_species_batch
+
+  - name: selection_has_complete_temporal_episode
+    expression: >-
+      selection_evaluation.rollout_steps >
+      environment.max_episode_length
+
+  - name: selection_batch_has_upstream_sample_count
+    expression: >-
+      selection_evaluation.environments_per_species *
+      selection_evaluation.rollout_steps >=
+      fidelity_constraints.minimum_transitions_per_species_batch
+
+  - name: selection_respects_parallel_environment_cap
+    expression: >-
+      population.size *
+      selection_evaluation.environments_per_species <=
+      budget.parallel_envs
+
+  - name: recurrent_chunks_are_exact
+    expression: >-
+      training.rollout_steps % training.sequence_length == 0
+
+  - name: proxy_budget_ends_after_a_complete_generation
+    expression: >-
+      study.proxy_environment_steps %
+      (
+        budget.parallel_envs *
+        training.rollout_steps *
+        training.updates_per_generation
+        +
+        population.size *
+        selection_evaluation.environments_per_species *
+        selection_evaluation.rollout_steps
+      ) == 0

@@ -1,0 +1,160 @@
+# Faithful NGE on the shared typed-ant task.  This file is intentionally
+# standalone: a reviewer can see the full algorithm and budget without
+# resolving YAML inheritance.
+method: nge
+seed: 42
+
+runtime:
+  device: cuda:0
+
+budget:
+  # Exact shared paper budget. Every VSim transition, including the separate
+  # complete-episode species-selection pass, increments this counter.
+  environment_steps: 196608000
+  # Maximum parallel VSim environments, and the width of each PPO rollout.
+  # The temporally deeper selection pass uses only 64 * 2 = 128 of this cap.
+  parallel_envs: 4096
+
+environment:
+  # All initial species use this exact morphology. Evolution starts only after
+  # their first measured generation of policy learning.
+  base_legs: [1, 4, 6]
+  max_episode_length: 1000
+  ctrl_cost_weight: 0.5
+  healthy_reward: 2.0
+  healthy_y_range: [0.3, 1.1]
+  reset_noise_scale: 1.0
+  timestep: 0.01667
+  frame_skip: 1
+  spacing: 3.0
+  max_contact_pairs_per_env: 64
+
+network:
+  # Pinned NerveNet++ default: 64-D node embeddings/recurrent states.
+  hidden_size: 64
+
+training:
+  # 64 species x 64 envs/species. 32 simulator ticks provide 2,048 physics
+  # transitions per species, the closest exact vectorized form of upstream's
+  # timesteps_per_batch=2000.
+  rollout_steps: 32
+  # Upstream uses 20 batches per generation. We spend 19 on PPO and reserve
+  # one equally sized 2,048-transition batch for complete-episode selection:
+  # (19 * 2,048) + 2,048 = 40,960 transitions/species/generation.
+  updates_per_generation: 19
+  # NerveNet++ truncates recurrent backpropagation into four-step sequences.
+  sequence_length: 4
+
+  # Upstream PPO defaults.
+  gamma: 0.99
+  gae_lambda: 0.95
+  ppo_clip: 0.2
+  policy_learning_rate: 3.0e-4
+  value_learning_rate: 3.0e-4
+  optimization_epochs: 10
+  # Number of recurrent sequences, not individual timesteps.
+  minibatch_sequences: 64
+  gradient_clip: 5.0
+  target_kl: 0.01
+  target_kl_high: 2.0
+  target_kl_low: 0.5
+
+selection_evaluation:
+  # This is NGE's internal species-fitness pass, not the held-out paper
+  # benchmark. Two environments run for 1,024 ticks per species, giving 2,048
+  # paid transitions/species and enough temporal depth to observe every
+  # initial 1,000-step episode finish. Exactly the first complete return from
+  # each environment is averaged, so every species has two equally weighted
+  # ranking episodes. Later auto-reset activity is ignored for ranking but its
+  # physics transitions remain charged.
+  environments_per_species: 2
+  rollout_steps: 1024
+  # NGE selects with samples from its Gaussian controller. "deterministic" is
+  # available for an explicit ablation, but is not the faithful default.
+  action_mode: stochastic
+
+fidelity_constraints:
+  # Both (envs/species * ticks) products above must meet this sample count.
+  # The validator also requires selection rollout_steps > max_episode_length:
+  # parallelism cannot replace enough temporal depth to finish an episode.
+  minimum_transitions_per_species_batch: 2000
+
+population:
+  # Full NGE setting used by the official experiment command.
+  size: 64
+  elimination_rate: 0.30
+  # GM-UC over-generates until survivors+candidates totals 200, then retains
+  # exactly enough children to restore a 64-species population.
+  candidate_pool_size: 200
+  # The upstream implementation samples Add and Delete explicitly and assigns
+  # the remaining mass to Perturb; Add-Graph is the self-cross branch of Add.
+  # Splitting Add's 0.30 mass evenly gives both paper add primitives 0.15.
+  mutation_probabilities:
+    add_node: 0.15
+    add_graph: 0.15
+    del_graph: 0.15
+    pert_graph: 0.55
+  # Pinned implementation's recursive per-node perturbation probability.
+  node_perturb_probability: 0.10
+
+gm_uc:
+  enabled: true
+  hidden_size: 64
+  # Paper Appendix F / pinned implementation inference-dropout rate.
+  dropout: 0.5
+  learning_rate: 3.0e-4
+  batch_size: 64
+  # The pinned pruning agent applies one averaged regression gradient per
+  # generation.
+  gradient_steps: 1
+  temperature: 0.1
+
+checkpoint:
+  # Each saved file is a complete between-generation resume boundary. Keep
+  # every generation while the port is being validated; final.pth is always
+  # written.
+  every_generations: 1
+
+training_evaluation:
+  # Optional, directly comparable evaluation curve while training. This uses
+  # the same fixed-morphology, complete-episode runner as benchmark_eval.py and
+  # writes its expected return as rewards/step_eval. It does not update the
+  # controller and its simulator transitions do not count toward the training
+  # budget.
+  enabled: false
+
+  # Run after every N complete NGE generations. One NGE generation currently
+  # equals 2,621,440 training environment steps, or 40 rl_games epochs.
+  every_generations: 1
+  # Also evaluate the final checkpoint when it is not on the interval above.
+  evaluate_final: true
+
+  # These can be small for live monitoring. Final paper results must still use
+  # the paper preset in configs/benchmarks/benchmark.yaml.
+  pairs: 16
+  episodes_per_pair: 2
+  # Fixed seeds make different checkpoints measure progress on the same
+  # sampling protocol. They are deliberately separate from the final paper
+  # evaluation seeds in benchmark.yaml and are used exactly as written.
+  seeds:
+    morphology: 10001
+    rollout: 20001
+
+logging:
+  # Every PPO update writes rewards/*, nge/*, and benchmark/training/* to
+  # TensorBoard. When W&B is enabled, the same scalar names are mirrored there.
+  #
+  # rewards/{step,iter,time} is the same rolling mean of completed raw episode
+  # returns used by rl_games, plotted against environment steps, PPO updates,
+  # and wall time respectively. Its peaks are still rolling training values,
+  # not benchmark measurements. rewards/step_eval is present only when
+  # training_evaluation.enabled=true and is the complete-episode shared
+  # evaluation return. rewards/rollout_return_estimate is only a short-rollout
+  # diagnostic; nge/selection/return_mean is complete-return selection fitness.
+  tensorboard: true
+  wandb:
+    enabled: false
+    mode: offline
+    project: null
+    entity: null
+    group: null

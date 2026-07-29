@@ -8,7 +8,7 @@ retains every sampled body and episode.
 
 Usage:
   python scripts/benchmark_eval.py RUN [RUN ...]
-      [--method codesign|fixed_body|uniform_action]
+      [--method codesign|fixed_body|uniform_action|nge]
       [--epochs final|N,N,...] [--preset paper|smoke]
       [--episodes N] [--top-k K] [--num-envs N] [--out DIRECTORY]
 
@@ -16,10 +16,18 @@ An unprefixed RUN uses ``--method`` (or the YAML's ``method``). To compare
 different methods in one result, prefix each run, for example:
 
   python scripts/benchmark_eval.py \
-      codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C
+      codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C nge=RUN_D
+
+For matched progress checkpoints, put that method's checkpoint labels before
+the equals sign. CoDesign/fixed/uniform labels are epochs; NGE labels are
+generations:
+
+  python scripts/benchmark_eval.py \
+      codesign@200,400=RUN_A uniform_action@200,400=RUN_C nge@5,10=RUN_D
 
 ``final`` is the paper default. Numeric epochs are intended for development and
-normally require ``--allow-incomplete-training``.
+normally require ``--allow-incomplete-training``. For NGE, numeric values name
+saved generations rather than rl_games epochs.
 """
 import os
 import sys
@@ -83,14 +91,21 @@ from benchmarks.codesign import (  # noqa: E402
     checkpoints_for_run,
     load_codesign,
 )
-from benchmarks.evaluate import evaluate_runs, load_config, validate_config  # noqa: E402
+from benchmarks.evaluate import (  # noqa: E402
+    evaluate_runs,
+    load_config,
+    parse_run_job,
+    validate_config,
+)
 from benchmarks.fixed_body import load_fixed_body  # noqa: E402
+from benchmarks.nge import checkpoints_for_nge_run, load_nge  # noqa: E402
 from benchmarks.uniform_action import load_uniform_action  # noqa: E402
 
 _METHOD_LOADERS = {
     "codesign": load_codesign,
     "fixed_body": load_fixed_body,
     "uniform_action": load_uniform_action,
+    "nge": load_nge,
 }
 
 
@@ -103,8 +118,8 @@ def _parser() -> argparse.ArgumentParser:
         "runs",
         nargs="*",
         help=(
-            "run directory, optionally prefixed with codesign=, fixed_body= "
-            "or uniform_action="
+            "run directory, optionally METHOD=RUN or "
+            "METHOD@CHECKPOINTS=RUN for a per-method checkpoint list"
         ),
     )
     parser.add_argument(
@@ -121,7 +136,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--epochs",
         default="final",
-        help="'final' (default) or comma-separated epoch numbers",
+        help=(
+            "'final' (default) or comma-separated epoch numbers "
+            "(generation numbers for NGE)"
+        ),
     )
     parser.add_argument(
         "--preset",
@@ -174,16 +192,22 @@ def _jobs(
     """Load one policy at a time, matching the job loop in ``scripts/eval.py``."""
     default_method = config["method"]
     for specification in runs:
-        prefix, separator, value = specification.partition("=")
-        if separator and prefix in _METHOD_LOADERS:
-            method_name, run = prefix, value
-        else:
-            method_name, run = default_method, specification
+        method_name, run, requested_checkpoints = parse_run_job(
+            specification,
+            methods=set(_METHOD_LOADERS),
+            default_method=default_method,
+            default_checkpoints=epochs,
+        )
         method_config = config[method_name]
-        for label, checkpoint in checkpoints_for_run(
+        checkpoint_resolver = (
+            checkpoints_for_nge_run
+            if method_name == "nge"
+            else checkpoints_for_run
+        )
+        for label, checkpoint in checkpoint_resolver(
             method_config,
             run,
-            epochs,
+            requested_checkpoints,
         ):
             print(
                 f"[benchmark] {method_name}: {Path(run).name} @ {label}: "

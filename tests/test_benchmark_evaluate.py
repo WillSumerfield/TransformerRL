@@ -11,8 +11,10 @@ import torch
 from benchmarks.data import EvaluationPairs
 from benchmarks.evaluate import (
     evaluation_seeds,
+    evaluate_return,
     evaluate_runs,
     load_config,
+    parse_run_job,
     run_episodes,
 )
 
@@ -114,6 +116,28 @@ class _ExclusiveMethod(_Method):
 
 
 class BenchmarkEvaluationTests(unittest.TestCase):
+    def test_run_job_can_override_checkpoints_for_one_method(self) -> None:
+        methods = {"codesign", "fixed_body", "uniform_action", "nge"}
+
+        self.assertEqual(
+            parse_run_job(
+                "nge@5,10=/tmp/nge-run",
+                methods=methods,
+                default_method="codesign",
+                default_checkpoints="final",
+            ),
+            ("nge", "/tmp/nge-run", "5,10"),
+        )
+        self.assertEqual(
+            parse_run_job(
+                "/tmp/codesign-run",
+                methods=methods,
+                default_method="codesign",
+                default_checkpoints="final",
+            ),
+            ("codesign", "/tmp/codesign-run", "final"),
+        )
+
     def test_config_uses_the_seed_values_exactly_as_written(self) -> None:
         config = load_config(CONFIG, preset="smoke")
         self.assertEqual(config["method"], "codesign")
@@ -147,6 +171,21 @@ class BenchmarkEvaluationTests(unittest.TestCase):
         np.testing.assert_allclose(results.lengths, [[2, 2], [2, 2]])
         np.testing.assert_allclose(results.start_values, 3)
 
+    def test_training_and_final_evaluation_share_expected_return(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            method = _Method(Path(temporary))
+            expected_return, pairs, episodes = evaluate_return(
+                method,
+                pairs=2,
+                episodes_per_pair=2,
+                morphology_seed=1,
+                rollout_seed=1,
+            )
+
+        self.assertEqual(expected_return, 3.0)
+        self.assertEqual(pairs.size, 2)
+        self.assertEqual(episodes.returns.shape, (2, 2))
+
     def test_multiple_runs_produce_one_comparison_table_and_raw_files(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -173,6 +212,10 @@ class BenchmarkEvaluationTests(unittest.TestCase):
             self.assertTrue((destination / "summary.csv").is_file())
             self.assertTrue((destination / "tensorboard").is_dir())
             self.assertEqual(len(summaries), 2)
+            self.assertEqual(
+                summaries[0]["rewards/step_eval"],
+                summaries[0]["benchmark/return/expected"],
+            )
             raw_file = destination / summaries[0]["raw_results"]
             with np.load(raw_file, allow_pickle=False) as arrays:
                 self.assertEqual(arrays["episode_returns"].shape, (4, 2))

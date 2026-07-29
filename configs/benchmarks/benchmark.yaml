@@ -9,7 +9,8 @@ method: codesign
 paper_run_requirements:
   # Required physics-step budget: 3000 epochs * 4096 envs * horizon 16.
   environment_steps: 196608000
-  # Required number of parallel VSim environments used during training.
+  # Shared parallel-environment cap (and normal controller-rollout width).
+  # A method-native complete-episode pass may use less width, never more.
   parallel_envs: 4096
   # Five independent training seeds used for the final paper results.
   training_seeds: [42, 43, 44, 45, 46]
@@ -103,6 +104,15 @@ uniform_action:
   run_config: null
   checkpoint: final
   training_seed: null
+
+nge:
+  # NGE checkpoints contain the complete surviving population, including one
+  # NerveNet++ controller per species. Numeric --epochs values select NGE
+  # generations; --epochs final selects checkpoints/final.pth.
+  run_root: runs/benchmarks/nge/nge_nervenetpp
+  run_dir: null
+  run_config: null
+  checkpoint: final
 
 # Numerical tolerances used by tests comparing CoDesign action/value outputs
 # against scripts/eval.py. They do not change normal evaluation results.

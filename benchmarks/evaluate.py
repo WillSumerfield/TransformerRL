@@ -39,6 +39,35 @@ class JobResult:
     pairs: EvaluationPairs
     episodes: EpisodeResults
     diversity_pairs: EvaluationPairs
+    provenance_paths: tuple[Path, ...]
+
+
+def parse_run_job(
+    specification: str,
+    *,
+    methods: set[str],
+    default_method: str,
+    default_checkpoints: str,
+) -> tuple[str, str, str]:
+    """Parse ``METHOD@CHECKPOINTS=RUN`` while keeping plain RUNs simple.
+
+    The optional per-run checkpoint list lets one invocation compare methods
+    whose checkpoint counters use different units, such as CoDesign epochs and
+    NGE generations.
+    """
+    prefix, separator, run = specification.partition("=")
+    method, marker, checkpoints = prefix.partition("@")
+    if separator and method in methods:
+        if not run:
+            raise ValueError(f"run path is empty in {specification!r}")
+        if marker and not checkpoints:
+            raise ValueError(f"checkpoint list is empty in {specification!r}")
+        return (
+            method,
+            run,
+            checkpoints if marker else default_checkpoints,
+        )
+    return default_method, specification, default_checkpoints
 
 
 def load_config(path: str | Path, *, preset: str | None = None) -> dict[str, Any]:
@@ -64,10 +93,10 @@ def load_config(path: str | Path, *, preset: str | None = None) -> dict[str, Any
 
 def validate_config(config: dict[str, Any]) -> None:
     """Check only comparison rules whose violation could invalidate a result."""
-    methods = {"codesign", "fixed_body", "uniform_action"}
+    methods = {"codesign", "fixed_body", "uniform_action", "nge"}
     if config.get("method") not in methods:
         raise ValueError(
-            "method must be codesign, fixed_body or uniform_action"
+            "method must be codesign, fixed_body, uniform_action or nge"
         )
 
     requirements = config.get("paper_run_requirements", {})
@@ -133,6 +162,9 @@ def run_episodes(
 
     method.install_pairs(environment, pairs)
     observation, _ = environment.reset()
+    begin_rollout = getattr(method, "begin_rollout", None)
+    if callable(begin_rollout):
+        begin_rollout(pairs)
     device = observation.device
     shape = (pairs.size, episodes_per_pair)
     returns = torch.full(shape, torch.nan, device=device)
@@ -160,6 +192,9 @@ def run_episodes(
         observation, reward, terminated, truncated, _ = environment.step(action)
         reward = reward.squeeze(-1) if reward.ndim > 1 else reward
         done = terminated | truncated
+        reset_controllers = getattr(method, "reset_controllers", None)
+        if callable(reset_controllers):
+            reset_controllers(done)
         current_return += torch.where(active, reward, 0)
         current_length += active.float()
 
@@ -190,6 +225,38 @@ def run_episodes(
         lengths.cpu().numpy(),
         values,
     )
+
+
+def evaluate_return(
+    method: Any,
+    *,
+    pairs: int,
+    episodes_per_pair: int,
+    morphology_seed: int,
+    rollout_seed: int,
+) -> tuple[float, EvaluationPairs, EpisodeResults]:
+    """Run the common fixed-pair evaluation and return its expected return.
+
+    This is the small reusable core shared by the final benchmark and optional
+    evaluations during training. Evaluation simulator steps are deliberately
+    not added to a method's training budget.
+    """
+    sampled_pairs = method.sample_pairs(int(pairs), int(morphology_seed))
+    environment = method.create_environment(int(pairs), int(rollout_seed))
+    try:
+        episodes = run_episodes(
+            method,
+            environment,
+            sampled_pairs,
+            int(episodes_per_pair),
+        )
+    finally:
+        close_environment = getattr(environment, "close", None)
+        if callable(close_environment):
+            close_environment()
+    pair_returns = episodes.returns.mean(axis=1)
+    expected_return = float(np.sum(pair_returns * sampled_pairs.weights))
+    return expected_return, sampled_pairs, episodes
 
 
 def _checkpoint_hash(path: Path) -> str:
@@ -315,28 +382,19 @@ def evaluate_method(
         method.training_seed,
         reporting_seed,
     )
-    pairs = method.sample_pairs(int(evaluation["pairs"]), seeds["morphology"])
+    started = time.perf_counter()
+    expected_return, pairs, episodes = evaluate_return(
+        method,
+        pairs=int(evaluation["pairs"]),
+        episodes_per_pair=int(evaluation["episodes_per_pair"]),
+        morphology_seed=seeds["morphology"],
+        rollout_seed=seeds["rollout"],
+    )
     diversity_pairs = method.sample_designs(
         int(evaluation["design_samples"]),
         seeds["diversity"],
     )
-    environment = method.create_environment(
-        int(evaluation["pairs"]),
-        seeds["rollout"],
-    )
 
-    started = time.perf_counter()
-    try:
-        episodes = run_episodes(
-            method,
-            environment,
-            pairs,
-            int(evaluation["episodes_per_pair"]),
-        )
-    finally:
-        close_environment = getattr(environment, "close", None)
-        if callable(close_environment):
-            close_environment()
     wall_seconds = time.perf_counter() - started
     metrics = calculate_metrics(
         pairs,
@@ -344,6 +402,9 @@ def evaluate_method(
         diversity_pairs,
         top_k=int(evaluation["top_k"]),
     )
+    if not np.isclose(metrics["benchmark/return/expected"], expected_return):
+        raise RuntimeError("shared evaluation return calculation disagrees")
+    metrics["rewards/step_eval"] = expected_return
     metrics.update(
         {
             "benchmark/eval/wall_seconds": wall_seconds,
@@ -382,6 +443,9 @@ def evaluate_method(
         pairs=pairs,
         episodes=episodes,
         diversity_pairs=diversity_pairs,
+        provenance_paths=tuple(
+            Path(path) for path in getattr(method, "provenance_paths", ())
+        ),
     )
 
 
@@ -462,6 +526,10 @@ def evaluate_runs(
                 "budget_compliant": result.budget_compliant,
                 "seeds": result.seeds,
                 "raw_results": str(raw_path),
+                "provenance": {
+                    str(path): _checkpoint_hash(path)
+                    for path in getattr(result, "provenance_paths", ())
+                },
             }
         )
         del result, method
