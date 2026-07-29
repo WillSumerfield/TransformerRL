@@ -1361,6 +1361,12 @@ class BodyGenTrainer:
         else:
             # Upstream deliberately drops the shuffled remainder.
             minibatches = total_size // minibatch_size
+        total_minibatches = epochs * minibatches
+        completed_minibatches = 0
+        optimization_started = time.perf_counter()
+        # Four progress reports per pass are frequent enough to show that PPO
+        # is alive without printing one line for every 2,048-transition batch.
+        report_every = max(1, minibatches // 4)
 
         metrics: dict[str, list[float]] = {
             "policy_loss": [],
@@ -1379,7 +1385,7 @@ class BodyGenTrainer:
                 ),
             )
         ).detach().cpu().numpy()
-        for _ in range(epochs):
+        for epoch in range(epochs):
             grouped = stage_grouped_permutation(
                 self.rng.permutation(total_size),
                 stages,
@@ -1478,6 +1484,27 @@ class BodyGenTrainer:
                 metrics["approximate_kl"].append(
                     float((old_log_prob - log_prob).mean().detach())
                 )
+                completed_minibatches += 1
+                pass_minibatch = minibatch + 1
+                if (
+                    pass_minibatch % report_every == 0
+                    or pass_minibatch == minibatches
+                ):
+                    elapsed = time.perf_counter() - optimization_started
+                    progress = (
+                        100.0
+                        * completed_minibatches
+                        / total_minibatches
+                    )
+                    print(
+                        "[bodygen] PPO "
+                        f"update={self.completed_updates + 1} "
+                        f"pass={epoch + 1}/{epochs} "
+                        f"minibatch={pass_minibatch}/{minibatches} "
+                        f"overall={progress:.1f}% "
+                        f"elapsed={elapsed:.0f}s",
+                        flush=True,
+                    )
 
         return {
             f"bodygen/ppo/{name}": float(np.mean(values))
