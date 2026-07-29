@@ -18,12 +18,16 @@ Standalone headless checkpoint evaluation, decoupling a **control policy** from 
 _Avoid_: calling it a "run mode" — it is a separate script, deliberately not a `train_ant_*.py` positional mode.
 
 **Benchmark eval**:
-The `scripts/benchmark_eval.py` companion to **Eval**, deliberately using the same interface shape: positional `RUN [RUN ...]`, `--epochs`, evaluation-size overrides, a side-by-side console table, and one multi-row CSV. It preserves every method's native morphology–controller pairs and adds paper checks plus raw episodes. Stage 1 implements codesign: it reads the single `configs/benchmarks/benchmark.yaml`, requires `--epochs final` by default, uses the literal configured morphology/rollout/diversity seeds, and writes one comparison directory. `--seed N` sets all three directly to `N`; `--preset smoke` selects the cheap preset; numeric epochs require an explicit development budget exemption when incomplete. Each sequential checkpoint closes its VSim environment after rollout before the next job creates the one permitted `GymSingleton`. When invoked directly with `.venv/bin/python`, the launcher restarts once with this virtualenv's CUDA 13 and VLearn native-library directories prepended to `LD_LIBRARY_PATH`, avoiding accidental resolution through an older Conda VLearn installation. It remains separate from Eval until GPU/VSim parity is demonstrated.
+The `scripts/benchmark_eval.py` companion to **Eval**, deliberately using the same interface shape: positional `RUN [RUN ...]`, `--epochs`, evaluation-size overrides, a side-by-side console table, and one multi-row CSV. It preserves every method's native morphology–controller pairs and adds paper checks plus raw episodes. Stage 1 implements codesign: it reads the single `configs/benchmarks/benchmark.yaml`, requires `--epochs final` by default, uses the literal configured morphology/rollout/diversity seeds, and writes one comparison directory. `--seed N` sets all three directly to `N`; `--preset smoke` selects the cheap preset; numeric epochs require an explicit development budget exemption when incomplete. Its probability-weighted expected return is also written as `rewards/step_eval`, with the selected checkpoint's charged training environment steps as the TensorBoard/W&B x-axis; this is the same tag used by optional NGE training-progress evaluation. Each sequential checkpoint closes its VSim environment after rollout before the next job creates the one permitted `GymSingleton`. When invoked directly with `.venv/bin/python`, the launcher restarts once with this virtualenv's CUDA 13 and VLearn native-library directories prepended to `LD_LIBRARY_PATH`, avoiding accidental resolution through an older Conda VLearn installation. It remains separate from Eval until GPU/VSim parity is demonstrated.
 The fixed-base-morph stage adds `--method fixed_body` for an unprefixed run. Mixed comparisons use
 explicit positional labels, for example `codesign=RUN_A fixed_body=RUN_B`, and still produce one
 comparison artifact through the same evaluator.
 The uniform-action stage adds `--method uniform_action`; all three can be compared in one invocation
 with `codesign=RUN_A fixed_body=RUN_B uniform_action=RUN_C`.
+For convergence comparisons, a positional label may include its method-native checkpoint list:
+`codesign@200,400=RUN_A uniform_action@200,400=RUN_C nge@5,10=RUN_D`. The resulting rows retain
+their authoritative training environment-step counts, so checkpoints are aligned by consumed
+physics rather than by unlike epoch/generation numbers.
 
 **Fixed-body training**:
 `scripts/train_ant_fixed_body.py` pairs with `configs/ppo_ant_fixed_body.yaml`. The config inherits
@@ -68,31 +72,31 @@ One independently trained reporting seed. Paper summaries show all five seed-lev
 _Avoid_: treating sampled bodies or rollout episodes as additional independent training runs
 
 **Benchmark logging**:
-The shared experiment-tracking contract for every benchmark method. TensorBoard is the durable local record; W&B is a YAML-enabled, lazy-loaded optional second view with online and offline modes. It is disabled by default and credentials do not activate it. Comparable outputs use identical `benchmark/...` names in TensorBoard, W&B, and local summaries; algorithm internals use `method/<method>/...`.
-_Avoid_: method-specific metric names, W&B-only runs
+The shared experiment-tracking contract for every benchmark method. TensorBoard is the durable local record; W&B is a YAML-enabled, lazy-loaded optional second view with online and offline modes. It is disabled by default and credentials do not activate it. Comparable outputs use identical `benchmark/...` names in TensorBoard, W&B, and local summaries; algorithm internals use their explicit method namespace, such as `nge/...`.
+_Avoid_: method-specific names for comparable outputs, W&B-only runs
 
 **Benchmark output layout**:
 Generated training runs use `runs/benchmarks/<method>/<run-id>/s<seed>/`; tuning studies use `logs/tune/benchmarks/<method>/`; cross-method comparison bundles use `evals/benchmarks/<evaluation-id>/`. The source `benchmarks/` package contains no generated state.
 _Avoid_: writing results into source, scattering one comparison across method-specific eval directories
 
 **Benchmark config**:
-`configs/benchmarks/benchmark.yaml` is the single readable authority for shared settings and the selected method's settings. Explicit CLI flags cover common development changes; the complete resolved config is saved with every result.
-_Avoid_: YAML inheritance, duplicated budgets, hiding protocol values in Python constants
+`configs/benchmarks/benchmark.yaml` is the readable authority for evaluation and paper-run eligibility checks; each native trainer has its own directly runnable method YAML, which is stamped into the run and checked against those requirements. Explicit CLI flags cover common development changes and every result saves its resolved evaluation config.
+_Avoid_: YAML inheritance, unchecked budget drift, hiding protocol values in Python constants
 
 **Benchmark tuning**:
-Equal-budget hyperparameter selection for codesign, faithful NGE, and faithful BodyGen: exactly 30 complete candidate configurations × the same three fixed tuning seeds at the full proxy environment-step budget, or 90 proxy runs per adaptive method. Candidates are ranked by mean primary benchmark score; tuning seeds are disjoint from the five reporting seeds. Fixed-base-morph and uniform-action controls inherit the selected codesign controller settings.
+Equal-budget hyperparameter selection for codesign, faithful NGE, and faithful BodyGen: exactly 30 complete candidate configurations × the same three fixed tuning seeds at the full proxy environment-step budget, or 90 proxy runs per adaptive method. Each adaptive method pairs a runnable `configs/benchmarks/<method>.yaml` with search ranges and named feasibility rules in `configs/benchmarks/tune_<method>.yaml`; the method validator checks resolved candidates again. Candidates are ranked by mean primary benchmark score; invalid proposals do not count, tuning seeds are disjoint from reporting seeds, and fixed/uniform controls inherit selected codesign settings.
 _Avoid_: tuning on reporting seeds, tuning only codesign, early pruning, discretionary stopping
 
 **Native benchmark training**:
-Each benchmark method retains its published or existing optimisation machinery while receiving the same locomotion task reward. The common benchmark evaluator is external to training and cannot supply reporting samples or objectives to a method.
-_Avoid_: forcing the final comparison score into every training loop, leaking reporting evaluation into training
+Each benchmark method retains its published or existing optimisation machinery while receiving the same locomotion task reward. The final evaluator remains external to optimisation. Optional progress monitoring may reuse its rollout core with separate seeds, but cannot supply objectives, charged learning data, or a selected headline checkpoint to a method.
+_Avoid_: optimising against progress evaluation, leaking final reporting samples into training
 
 **Benchmark environment step**:
 Any physics transition consumed before a method's final checkpoint, including controller learning, morphology fitness or selection, GM-UC labels, and BodyGen design evaluation. All such transitions draw from one shared per-run budget; simulator-free design-network computation does not.
 _Avoid_: counting only policy-gradient batches, hiding morphology-search simulation in a separate allowance
 
 **Benchmark resource parity**:
-Methods receive equal physics environment-step and parallel-environment budgets but retain their native architecture sizes. Trainable parameters, wall time, peak RAM/VRAM, and environment-step throughput are reported outcomes.
+Methods receive equal physics environment-step budgets and the same maximum parallel-environment cap but retain their native architecture sizes. A method may use less width when its native algorithm requires temporal depth; trainable parameters, wall time, peak RAM/VRAM, and environment-step throughput are reported outcomes.
 _Avoid_: resizing faithful methods to match codesign, substituting wall-clock matching for the primary budget
 
 **Primary benchmark score**:
@@ -153,6 +157,34 @@ _Avoid_: uniform random bodies, uniform morphology sampling, random eval (an eva
 **Faithful NGE**:
 The full Neural Graph Evolution method, including its native graph controller, parent-to-child policy sharing, population selection, and Graph Mutation with Uncertainty, adapted only to the shared task and morphology design space.
 _Avoid_: NGE-style, generic genetic algorithm, NGE search with the codesign controller
+
+The readable training entry point is:
+
+```bash
+python scripts/train_ant_nge.py train --seed 42 --name s42
+```
+
+Before committing GPU time, exercise the same end-to-end path with the explicit
+non-paper smoke preset:
+
+```bash
+python scripts/train_ant_nge.py train --seed 42 --name smoke_s42 --smoke
+```
+
+Resume only from a saved between-generation boundary:
+
+```bash
+python scripts/train_ant_nge.py train \
+  --resume runs/benchmarks/nge/nge_nervenetpp/s42/checkpoints/generation_0005.pth
+```
+
+Evaluate the frozen surviving population through the same comparison script:
+
+```bash
+python scripts/benchmark_eval.py \
+  nge=runs/benchmarks/nge/nge_nervenetpp/s42 \
+  --epochs final
+```
 
 **NGE graph mutations**:
 The four NGE mutation classes—**Add-Node**, **Add-Graph**, **Del-Graph**, and **Pert-Graph**—interpreted as grammar-preserving operations on the benchmark's typed radial limb chains.

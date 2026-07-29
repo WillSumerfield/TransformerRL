@@ -22,6 +22,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │       ├── ant.py                    (classic 4-limb ant)
 │       ├── ant_multimorph.py         (multi-morphology base; full ant = all 131 stable)
 │       ├── ant_codesign.py           (codesign env; generator-driven bodies per resample)
+│       ├── ant_nge.py                (NGE population-group routing)
 │       ├── build_vsim.py             (programmatic vsim per limb subset)
 │       └── assets/
 ├── transformer_rl/                   ← Control context
@@ -40,21 +41,23 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── codesign.py                   (CoDesign + shared controller loading)
 │   ├── fixed_body.py                 (fixed-base-morph control)
 │   ├── uniform_action.py             (uniform grammar-action control)
+│   ├── nge/                           (faithful NGE training + evaluation)
 │   ├── evaluate.py                   (shared rollout/artifact flow)
 │   ├── metrics.py
 │   └── data.py
 ├── scripts/                          ← Training context
 │   ├── CONTEXT.md
 │   ├── train_ant_*.py
+│   ├── train_ant_nge.py              (faithful NGE trainer)
 │   ├── benchmark_eval.py             (ADR-0016 method-agnostic evaluator)
 │   ├── eval.py                       (legacy CoDesign evaluator)
 │   ├── activate_uv.sh                (manual UV/VLearn activation)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
-│   ├── benchmarks/                   (shared benchmark protocol)
+│   ├── benchmarks/                   (shared protocol + native NGE/tuning configs)
 │   ├── ppo_ant*.yaml
 │   └── tune_config.yaml
-├── tests/                             ← Benchmark contract tests
+├── tests/                             ← Benchmark and NGE contract tests
 ├── experiments/                      ← Analysis context
 │   ├── CONTEXT.md
 │   └── attention_over_time.py
