@@ -1,18 +1,17 @@
-# Codesign tuning base (proxy for scripts/tune.py, configs/tune_config.yaml). Identical to
-# ppo_ant_codesign_single.yaml EXCEPT: max_epochs trimmed to the 1200-epoch proxy (~19 resample
-# windows; with n_pretrain<=10 that leaves >=9 RL windows so the last-5-window objective always
-# lands in the RL phase), and checkpointing pushed past the proxy (tuner reads TB summaries only,
-# not .pth). The sweep overrides the tuned knobs per trial; the values here serve as trial-0
-# defaults. The real-run config (3000 epochs) stays untouched.
+# FD/FK tuning base (proxy for scripts/tune.py, configs/tune_config.yaml). Identical to
+# ppo_ant_codesign_single.yaml EXCEPT: max_epochs trimmed to 2000 (the tuning budget) and
+# checkpointing pushed past it (tuner reads TB summaries only, not .pth). The study overrides the
+# five FD/FK knobs per trial (fd.enabled, fd.coef, fd_variant, fk.enabled, fk.coef); the values
+# here are the trial-0 / anchor defaults. The real-run config (3000 epochs) stays untouched.
 env:
-  sample_morphs: true
-  base_legs: [1, 4, 6]
+  sample_morphs: true       # unlocks resample(); AntCodesignEnv overrides _draw_morphs (rng unused)
+  base_legs: [1, 4, 6]      # initial build + warmup SEED (must match generator.base_legs)
 
 params:
   seed: 42
 
   algo:
-    name: codesign_continuous
+    name: codesign_continuous   # selects CodesignAgent
 
   network:
     transformer:
@@ -20,7 +19,12 @@ params:
       n_heads: 8
       n_layers: 1
       ffn: 640
-      codesign_tokens: true
+      codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
+      max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
+      fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target; SWEPT
+      use_rope: true            # 3a WINNER (rew 2366 vs 1998 base): depth-only RoPE on module Q/K
+      reg_mode: none            # 3b: none|dropout|attention_drop (mutually exclusive)
+      dropout: 0.1              # 3b: prob used by whichever reg_mode is active (ignored if none)
 
   config:
     num_actors: 4096
@@ -28,29 +32,44 @@ params:
       scale_value: 0.01
     gamma: 0.98
     tau: 0.95
+    weight_decay: 0.01        # 3b WINNER: AdamW (CodesignAgent), 2 param groups; 0 == plain Adam
+    lr_warmup: true           # 3c WINNER (short ramp): linear 0->peak over warmup_epochs, then AKL.
+    warmup_epochs: 64         # 3c: ramp DURATION in epochs. 64 (~1 window) beat control.
     learning_rate: 1.0e-3
     kl_threshold: 0.0083
-    max_epochs: 1200          # proxy (real run = 3000); see header
-    save_best_after: 100000   # checkpointing off within the proxy (tuner uses TB only)
+    max_epochs: 2000          # tuning budget (real run = 3000); ~32 resample windows
+    save_best_after: 100000   # checkpointing off within the study (tuner uses TB only)
     save_frequency: 100000
     grad_norm: 1.45
     entropy_coef: 0.0055
     e_clip: 0.15
-    resample_interval: 1
+    resample_interval: 1     # one generator window per ~62-epoch rebuild window
     horizon_length: 16
-    minibatch_size: 32768
+    minibatch_size: 16384
     mini_epochs: 4
     critic_coef: 3.25
     bounds_loss_coef: 0.0005
 
-    generator:
+    generator:               # generator heads share the trunk/optimizer (no separate net/lr)
       base_legs: [1, 4, 6]
-      desirable_flip_prob: 0.10
-      n_pretrain: 8
-      epochs: 4
+      teacher: parts         # parts-copy warmup teacher (the generator's post-warmup BC prior)
+      copy_prob: 0.6         # p: slot keeps its OWN seed limb template (else copies another slot's)
+      len_keep_prob: 0.6     # q: P(per-limb length offset == 0); sets the Gaussian sigma
+      prob_invalid: 0.1      # keep an UNSTABLE body w.p. this (GenCrit needs negatives)
+      type_flip_prob: 0.10   # Phase-5 per-token TYPE flip: seeds the BC prior with real type diversity
+      n_pretrain: 8          # warmup windows (BC toward the teacher draw + value fit; ramp gen-frac 0->1)
+      epochs: 16             # BC epochs/window; each REDRAWS the teacher, so 16 = 4x fresh data
       minibatches: 4
-      clip: 0.2
-      entropy_coef: 0.01
-      gencrit_coef: 0.5
-      beta: 1.0
-      lam: 1.0
+      clip: 0.2              # GenAct PPO-clip
+      entropy_coef: 0.05      # RL-only (0 in warmup: BC is max-likelihood, teacher is the diversity source)
+      gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
+      beta: 1.0             # control-actor KL clone coefficient
+      lam: 1.0             # control-critic MSE clone coefficient
+
+    fd:                      # Phase 2b Forward Dynamics aux, FUSED into the PPO loss (0 extra passes)
+      enabled: true          # false == phase-1 baseline (get_aux_loss -> None); SWEPT by the study
+      coef: 1.0              # cosine loss in [0,4] (latent variant); may retune vs raw-FD MSE scale; SWEPT
+
+    fk:                      # Phase 2b Forward Kinematics aux, FUSED (0 extra passes); own torso-frame
+      enabled: true          # pose (pos+rot6D+vel, 15). Stays RAW (latent FK is degenerate); SWEPT
+      coef: 1.0              # weight on the FK MSE (per-depth normalized target space); SWEPT

@@ -654,13 +654,18 @@ def main():
     n_remaining = max(0, sc["n_trials"] - len(study.trials))
 
     if len(study.trials) == 0:
-        defaults = {}
-        for p in tune_cfg["params"]:
-            d = base_cfg
-            for k in p["path"].split("."):
-                d = d[k]
-            defaults[p["path"]] = d
-        study.enqueue_trial(defaults)
+        enqueue = sc.get("enqueue_trials")
+        if enqueue:
+            for t in enqueue:              # explicit anchors (fully-specified path->value dicts)
+                study.enqueue_trial(t)
+        else:
+            defaults = {}
+            for p in tune_cfg["params"]:
+                d = base_cfg
+                for k in p["path"].split("."):
+                    d = d[k]
+                defaults[p["path"]] = d
+            study.enqueue_trial(defaults)
 
     log_file = open(output_dir / "trials.jsonl", "a")
     tick = 0

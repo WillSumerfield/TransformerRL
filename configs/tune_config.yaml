@@ -1,127 +1,70 @@
-# Codesign hyperparameter sweep (Optuna TPE via scripts/tune.py). Finetunes the single-network
-# codesign model: tunes the never-swept generator/clone knobs plus the few control-PPO knobs most
-# affected by the shared trunk. Objective = quality/R_mean (the body-quality target), reduced over a
-# DERIVED tail window (see score_mode=final_frac below): the converged RL state, not a lucky spike.
+# FD/FK aux-head tuning (Optuna TPE via scripts/tune.py). Tunes the Phase-2b Forward Dynamics and
+# Forward Kinematics auxiliary heads on the single-network codesign model: each on/off, its loss
+# coef, and the FD target variant. Objective = task reward (control), NOT quality/R_mean: FD/FK are
+# control-side auxiliaries, so the most direct "did the aux help" signal is the recovered reward.
 #
 #   run:    python scripts/tune.py            # this file is the default
 #   resume: same command (study.db);  --reset to start over
 #
-# Cadence: quality/R_mean logs once per resample window (pretrain windows included). Window LENGTH
-# scales with resample_interval: ~62 epochs at interval=1, so the 1200-epoch proxy is ~19 windows at
-# interval=1, ~9 at 2, ~6 at 3. n_pretrain (in windows) eats the first ones; the rest are RL windows.
+# Flat 5-param space with EXPLICIT on/off booleans (fd.enabled, fk.enabled). Consequence: only ~25%
+# of sampled trials have both heads on, so the 5 enqueued anchors below pin the clean 2x2 on/off
+# ablation (+ both-on x {latent,raw}) at default coef=1.0 regardless of how TPE spends the rest.
+# fd.coef is log-uniform so one range covers both the latent (cosine, ~[0,4]) and raw (MSE) scales.
 #
-# resample_interval is now SWEPT, so a fixed "last 5 windows" objective would land in the warmup phase
-# at high interval. Instead score_mode=final_frac averages the last floor(score_frac * N) logged
-# windows (N = total logged) but never more than the RL windows (N - n_pretrain), floored at eval_min.
-# The feasibility_expr prunes (interval, n_pretrain) combos with too few RL windows BEFORE training,
-# so no GPU is wasted on a config whose eval window can't land in the RL phase.
-#
-# Pruning OFF (ADR-0009): n_pretrain is tuned, so the RL phase starts at a different epoch per trial
-# and same-epoch median comparison would be unfair. quality/R_mean is sparse+noisy (one point/window)
-# so we force the final_frac tail objective instead of a max-over-training one.
+# Pruning OFF: every trial runs the full 2000 epochs. n_pretrain is fixed (8), so the RL phase starts
+# at the same epoch every trial; the objective is the recovered level = mean reward over the last
+# `score_window` epochs (score_mode=recovered), not a lucky max spike.
 study:
-  name: codesign_ant_tune
-  n_trials: 200                 # generous ceiling; cancel early when satisfied (resumes from study.db)
-  output_dir: logs/tune/codesign_ant_tune
+  name: codesign_fdfk_tune
+  n_trials: 20                  # incl. the 5 enqueued anchors (-> ~15 TPE trials); ~30h at ~1.5h/trial
+  output_dir: logs/tune/codesign_fdfk_tune
   script: scripts/train_ant_codesign_single.py
   base_config: configs/ppo_ant_codesign_tune.yaml
-  trial_timeout_seconds: 3600   # wall-clock safety net; max_epochs (1200) is the real limiter.
-                                # Must exceed full-proxy time: the objective scores the LAST windows,
-                                # so a premature timeout would cut off exactly what we score on.
-  metric_key: "quality/R_mean"
-  score_mode: final_frac        # tail = last max(eval_min, min(floor(score_frac*N), N-n_pretrain)) windows
-  score_frac: 0.20              # eval window = 20% of the N total logged windows...
-  eval_min: 1                   # ...but at least this many (also the min RL windows the guard requires)
-  max_episode_length: 1000      # ant env horizon (for the feasibility guard's windows-per-trial math)
-  # Prune (interval, n_pretrain) combos whose eval window can't reach the RL phase, BEFORE training.
-  # predicted total windows = max_epochs // (resample_interval * max_episode_length / horizon_length).
-  feasibility_expr: "(max_epochs // (resample_interval * max_episode_length / horizon_length)) - n_pretrain >= eval_min"
+  trial_timeout_seconds: 9000   # wall-clock safety net (~2.5h); max_epochs (2000) is the real limiter.
+                                # Must exceed full-run time: the objective scores the LAST epochs.
+  metric_key: "rewards/iter"    # vlearn's per-epoch mean episode reward (== rewards/step|time, diff x-axis)
+  score_mode: recovered         # recovered level = mean of the last `score_window` logged epochs
+  score_window: 100
   experiment_name_path: params.config.full_experiment_name
   train_dir_path: params.config.train_dir
   summaries_subdir: summaries
   sampler_seed: 42              # reproducible TPE (single-seed tuning)
+  # Corner anchors (guaranteed sampled first): both-off baseline, FD-only, FK-only, both-on(latent),
+  # both-on(raw). Each is fully specified so Optuna does not random-fill the irrelevant knobs.
+  enqueue_trials:
+    - {params.config.fd.enabled: false, params.config.fk.enabled: false, params.network.transformer.fd_variant: latent, params.config.fd.coef: 1.0, params.config.fk.coef: 1.0}
+    - {params.config.fd.enabled: true,  params.config.fk.enabled: false, params.network.transformer.fd_variant: latent, params.config.fd.coef: 1.0, params.config.fk.coef: 1.0}
+    - {params.config.fd.enabled: false, params.config.fk.enabled: true,  params.network.transformer.fd_variant: latent, params.config.fd.coef: 1.0, params.config.fk.coef: 1.0}
+    - {params.config.fd.enabled: true,  params.config.fk.enabled: true,  params.network.transformer.fd_variant: latent, params.config.fd.coef: 1.0, params.config.fk.coef: 1.0}
+    - {params.config.fd.enabled: true,  params.config.fk.enabled: true,  params.network.transformer.fd_variant: raw,    params.config.fd.coef: 1.0, params.config.fk.coef: 1.0}
 
 pruner:
   enabled: false
 
 params:
-  # ── control PPO (shared-trunk-sensitive subset) ──
-  - path: params.config.learning_rate
-    type: float
-    low: 2.0e-4
-    high: 1.5e-3
-    log: true
+  # ── on/off ──
+  - path: params.config.fd.enabled
+    type: categorical
+    choices: [true, false]
 
-  - path: params.config.entropy_coef
-    type: float
-    low: 1.0e-3
-    high: 3.0e-2
-    log: true
+  - path: params.config.fk.enabled
+    type: categorical
+    choices: [true, false]
 
-  - path: params.config.critic_coef
-    type: float
-    low: 1.0
-    high: 5.0
+  # ── FD target variant (only meaningful when fd.enabled) ──
+  - path: params.network.transformer.fd_variant
+    type: categorical
+    choices: [latent, raw]
 
-  - path: params.config.grad_norm
+  # ── aux loss coefs (log: one range spans latent-cosine and raw-MSE scales) ──
+  - path: params.config.fd.coef
     type: float
-    low: 0.5
-    high: 2.0
-
-  # ── generator + clone (codesign-specific, never tuned) ──
-  # GenCrit/V1.0 fit weight: too low -> dead value head (no marginal signal); too high -> starves
-  # GenAct/control on the shared step.
-  - path: params.config.generator.gencrit_coef
-    type: float
-    low: 0.1
-    high: 4.0
-    log: true
-
-  # Control-actor KL clone: too low -> control drifts at resample (saw-tooth); too high -> trunk
-  # can't move for the generator.
-  - path: params.config.generator.beta
-    type: float
-    low: 0.1
+    low: 0.05
     high: 5.0
     log: true
 
-  # Control-critic MSE clone (V0.98 preservation).
-  - path: params.config.generator.lam
+  - path: params.config.fk.coef
     type: float
-    low: 0.1
+    low: 0.05
     high: 5.0
     log: true
-
-  # Generator on/stop exploration: too low -> premature mode collapse; too high -> never commits.
-  - path: params.config.generator.entropy_coef
-    type: float
-    low: 1.0e-3
-    high: 1.0e-1
-    log: true
-
-  - path: params.config.generator.clip
-    type: float
-    low: 0.1
-    high: 0.3
-
-  - path: params.config.generator.epochs
-    type: categorical
-    choices: [2, 4, 6, 8]
-
-  # Warmup windows. At high resample_interval a large n_pretrain leaves too few RL windows for the
-  # eval tail; feasibility_expr prunes those combos pre-launch (not a hard cap here). Why pruning off.
-  - path: params.config.generator.n_pretrain
-    type: categorical
-    choices: [4, 6, 8, 10]
-
-  # ── aux frequency + gen-update granularity (newly swept) ──
-  # resample_interval = "aux freq": rebuild/generator windows are `interval` episode-lengths long, so
-  # higher interval = more control PPO between morphology updates (fewer, longer windows in-budget).
-  - path: params.config.resample_interval
-    type: categorical
-    choices: [1, 2, 3]
-
-  # GenAct/GenCrit minibatch count over the resample buffer.
-  - path: params.config.generator.minibatches
-    type: categorical
-    choices: [2, 4, 8]
