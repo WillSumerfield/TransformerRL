@@ -3,7 +3,10 @@
 # Link an existing worktree's machine-local state to the primary checkout.
 #
 # Usage:
-#   scripts/share_worktree_state.sh [--migrate-existing] [WORKTREE]
+#   alex/share_worktree_state.sh [--migrate-existing] [WORKTREE]
+#
+# Example:
+#   alex/share_worktree_state.sh --migrate-existing .
 #
 # New worktrees have no local artifacts and need no flag. For an established
 # worktree, --migrate-existing first checks for collisions, copies its artifacts
@@ -52,6 +55,7 @@ shared_resources=(
     .venv
     .envrc
     TurboActivate.dat
+    alex/commands.sh
 )
 
 same_link() {
@@ -173,6 +177,7 @@ for name in "${shared_resources[@]}"; do
     if same_link "$destination" "$source"; then
         echo "[worktree] already shared $name"
     elif [[ -e $source || -L $source ]]; then
+        mkdir -p "$(dirname "$destination")"
         ln -s "$source" "$destination"
         echo "[worktree] shared $name"
     else

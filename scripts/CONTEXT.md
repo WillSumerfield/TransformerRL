@@ -11,15 +11,17 @@ The first positional arg to any `train_ant_*.py`: `train` (default), `play`, or 
 The leaf label identifying a single training run, the last segment of its output dir (`runs/<env>/<model>/<run-name>`). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.
 
 **Shared worktree state**:
-`scripts/create_worktree.sh PATH BRANCH [START_POINT]` creates a Git worktree
+`alex/create_worktree.sh PATH BRANCH [START_POINT]` creates a Git worktree
 and links its machine-local runtime state to the primary checkout. Generated
 `runs`, `evals`, `logs`, `videos`, and `data`, plus `.venv`, `.envrc`, and
-`TurboActivate.dat`, are shared; caches, generated simulator assets, `uv.lock`,
-and arbitrary untracked source files remain worktree-local. The primary
+`TurboActivate.dat`, are shared. The personal `alex/commands.sh` is linked
+inside the otherwise tracked `alex/` helper directory. Caches, generated
+simulator assets, `uv.lock`, and arbitrary untracked source files remain
+worktree-local. The primary
 checkout owns the real shared directories, so removing an experimental
 worktree cannot remove their contents.
 For an existing worktree, run
-`scripts/share_worktree_state.sh --migrate-existing WORKTREE` after stopping
+`alex/share_worktree_state.sh --migrate-existing WORKTREE` after stopping
 its trainers. It refuses conflicting files, copies non-conflicting artifacts
 into the primary directories, and retains the original directories under the
 ignored `.worktree-state-backup/`.

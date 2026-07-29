@@ -4,11 +4,11 @@
 # TransformerRL checkout.
 #
 # Usage:
-#   scripts/create_worktree.sh PATH BRANCH [START_POINT]
+#   alex/create_worktree.sh PATH BRANCH [START_POINT]
 #
 # Examples:
-#   scripts/create_worktree.sh ../TransformerRL-bodygen alex/bodygen alex/phase-2
-#   scripts/create_worktree.sh ../TransformerRL-review alex/existing-branch
+#   alex/create_worktree.sh ../TransformerRL-bodygen alex/bodygen alex/phase-2
+#   alex/create_worktree.sh ../TransformerRL-review alex/existing-branch
 #
 # If BRANCH already exists, it is checked out. Otherwise it is created from
 # START_POINT, which defaults to the current HEAD.
