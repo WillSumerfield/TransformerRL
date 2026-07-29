@@ -10,6 +10,17 @@ The first positional arg to any `train_ant_*.py`: `train` (default), `play`, or 
 **Run name**:
 The leaf label identifying a single training run, the last segment of its output dir (`runs/<env>/<model>/<run-name>`). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.
 
+**Shared worktree state**:
+`scripts/create_worktree.sh PATH BRANCH [START_POINT]` creates a Git worktree
+and links its machine-local runtime state to the primary checkout. Generated
+`runs`, `evals`, `logs`, `videos`, and `data`, plus `.venv`, `.envrc`, and
+`TurboActivate.dat`, are shared; caches, generated simulator assets, `uv.lock`,
+and arbitrary untracked source files remain worktree-local. The primary
+checkout owns the real shared directories, so removing an experimental
+worktree cannot remove their contents.
+_Avoid_: automatically linking every ignored or untracked path; some are
+branch-specific mutable state rather than shared experiment artifacts.
+
 **`--num-episodes`**:
 In `play` mode: stops the player after `num_episodes × max_episode_length` total steps (default: runs until window closed). When `--video` is set in `play` or `random` mode: bounds recording duration (default 1 episode when unset).
 
