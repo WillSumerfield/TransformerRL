@@ -4,9 +4,7 @@
 # matching a directory-only pattern such as `runs/`.
 /logs
 /runs
-/alex/*
-!/alex/create_worktree.sh
-!/alex/share_worktree_state.sh
+/alex
 uv.lock
 /data
 /videos
