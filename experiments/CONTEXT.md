@@ -37,7 +37,7 @@ The [free_entropy finding](#): under training the **skeleton commits** (effectiv
 A single entry of the encoder's attention tensor `(n_layers, n_heads, n_tokens, n_tokens)` — how much one token attends to another, collected per env step over rollout episodes.
 
 **Attention over time**:
-The time series of attention weights across an episode (and across seeds), saved as `attention_over_time_seed*.npz`. The primary raw artifact.
+The time series of attention weights across an episode (and across seeds), saved as `attention_over_time_seed*.npz`. **Historical**: the collector was retired with the classic ant, so these are frozen artifacts read by `notebooks/attention_over_time.ipynb`, not something regenerable.
 
 **Attention–reward correlation**:
 Correlation between attention weights and reward, computed two ways: **episode-level** (one value per episode) and **step-level** (per env step). Rendered as `heatmap_corr_episode*` / `heatmap_corr_step*` and `scatter_attention_reward_*`.
