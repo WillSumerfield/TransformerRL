@@ -26,7 +26,9 @@ from rl_games.algos_torch import torch_ext
 from rl_games.common.a2c_common import swap_and_flatten01
 from rl_games.common.schedulers import RLScheduler, AdaptiveScheduler
 
-from .vocab import GEN_EFF, GEN_CAP, N_SUB, EFF_SWING, EFF_KNEE, CAP_BARE, EFF_NAMES, CAP_NAMES
+from codesigner.components.interfaces import ModuleType
+
+from .vocab import GEN_EFF, GEN_CAP, N_SUB
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
 from experiments.diversity_p5 import population_to_repr, redundancy, rao_blackwell_h_body
@@ -103,8 +105,20 @@ class CodesignAgent(LoggingA2CAgent):
         self._max_len = net.max_limb_length
         self._max_eff = net.max_effectors      # max_len-1: the deepest slot is grammar-forced to a cap
 
-        env = self._env()                                  # base_legs from the ENV -> window-0 match
-        self._base_legs = tuple(sorted(getattr(env, '_base_legs', cd.get('base_legs', (1, 4, 6)))))
+        env = self._env()
+        assert env is not None, "CodesignAgent requires a live codesign env (module_library/base body)"
+        self._ml = env.module_library
+        # Per-type subtype name tuples, derived once from the ModuleLibrary's public modules API
+        # (self._ml.names) rather than hardcoded per-type constants -- cached here since
+        # _frontier_rollout (hot path) needs the plain ints, not a name lookup per call. "swing"/
+        # "knee"/"bare" are OUR choice of canonical/fallback body (matches env.base_morphology's own
+        # literal vocabulary, e.g. AntCodesignEnv._BASE_MORPHOLOGY), not something the library hands
+        # out -- ModuleLibrary has no concept of "canonical", only the type vocabulary itself.
+        self._eff_names = self._ml.names(ModuleType.EFFECTOR)
+        self._cap_names = self._ml.names(ModuleType.CAP)
+        self._eff_swing = self._eff_names.index("swing")
+        self._eff_knee = self._eff_names.index("knee")
+        self._cap_bare = self._cap_names.index("bare")
         self._flip = float(cd.get('desirable_flip_prob', 0.10))    # per-token grow/stop flip prob
         # Phase-5 teacher knob #2: per-token TYPE flip. On a flip the emitted subtype is redrawn
         # uniformly over the grammar-valid kinds for the category actually emitted. p = q = 0
@@ -121,7 +135,7 @@ class CodesignAgent(LoggingA2CAgent):
         self._prob_invalid = float(cd.get('prob_invalid', 0.1))    # keep an UNSTABLE body w.p. this
         # sigma solved from q = P(round(N(0,sigma)) == 0) = erf(0.5/(sigma*sqrt2))
         self._len_sigma = 0.5 / (math.sqrt(2) * torch.erfinv(torch.tensor(self._len_keep)).item())
-        bset = set(self._base_legs)
+        bset = set(env.base_morphology.limbs)
         # base morph = base_legs @ count-2 (1 swing + 1 knee). Per-token flip noise around this target
         # length gives P(limb differs by +-1 token)=flip, +-2=flip^2, ... (presence + length unified).
         self._base_target = torch.tensor(
@@ -170,8 +184,8 @@ class CodesignAgent(LoggingA2CAgent):
         self._cur_eff = torch.full((N, _N_LIMBS, self._max_len), -1, dtype=torch.long, device=dev)
         for d in range(self._max_len):
             self._cur_eff[:, :, d] = torch.where(
-                self._cur_counts > d, EFF_SWING if d == 0 else EFF_KNEE, -1)
-        self._cur_cap = torch.where(self._cur_counts > 0, CAP_BARE, -1)
+                self._cur_counts > d, self._eff_swing if d == 0 else self._eff_knee, -1)
+        self._cur_cap = torch.where(self._cur_counts > 0, self._cap_bare, -1)
         self._cur_trace = None                             # last sample() trace (RL update input)
         self._base_draw = None                             # last base+-flip ramp draws (counts, pretrain)
         self._gen_window = 0
@@ -214,9 +228,6 @@ class CodesignAgent(LoggingA2CAgent):
         self._ep_ret = torch.zeros(N, device=dev)
         self._win_ret_sum = torch.zeros(N, device=dev)
         self._win_ret_cnt = torch.zeros(N, device=dev)
-
-    def _env(self):
-        return getattr(getattr(self.vec_env, 'envs', None), 'env', None)
 
     def _net(self):
         return self.model.a2c_network.net
@@ -413,9 +424,9 @@ class CodesignAgent(LoggingA2CAgent):
                 s_eff = eff_types[arange, slot, depth.clamp(max=max_len - 1)]
                 s_cap = cap_types[arange, slot]
             else:                                            # canonical chain + bare cap
-                s_eff = torch.where(depth == 0, depth.new_full((), EFF_SWING),
-                                    depth.new_full((), EFF_KNEE))
-                s_cap = depth.new_full((N,), CAP_BARE)
+                s_eff = torch.where(depth == 0, depth.new_full((), self._eff_swing),
+                                    depth.new_full((), self._eff_knee))
+                s_cap = depth.new_full((N,), self._cap_bare)
             s = torch.where(c == GEN_EFF, s_eff, s_cap)
             sm = sub_mask[arange, c]                                          # (N, N_SUB) valid set
             if type_flip > 0 and eff_types is None:
@@ -715,9 +726,10 @@ class CodesignAgent(LoggingA2CAgent):
         eff, cap = self._cur_eff, self._cur_cap
         n_eff = (eff >= 0).sum().clamp(min=1)
         n_cap = (cap >= 0).sum().clamp(min=1)
-        out = {f'eff/{EFF_NAMES[t]}': ((eff == t).sum() / n_eff).item() for t in range(len(EFF_NAMES))}
-        out.update({f'cap/{CAP_NAMES[t]}': ((cap == t).sum() / n_cap).item()
-                    for t in range(len(CAP_NAMES))})
+        eff_names, cap_names = self._eff_names, self._cap_names
+        out = {f'eff/{eff_names[t]}': ((eff == t).sum() / n_eff).item() for t in range(len(eff_names))}
+        out.update({f'cap/{cap_names[t]}': ((cap == t).sum() / n_cap).item()
+                    for t in range(len(cap_names))})
         return out
 
     @staticmethod
@@ -757,8 +769,6 @@ class CodesignAgent(LoggingA2CAgent):
         if not interval:
             return
         env = self._env()
-        if env is None or not getattr(env, '_sample_morphs', False):
-            return
         self._steps_since_resample += self.horizon_length
         if self._steps_since_resample < interval * env.max_episode_length:
             return

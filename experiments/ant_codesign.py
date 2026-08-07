@@ -133,19 +133,18 @@ def base_eval(seeds):
     import torch
     import yaml
     from experiments.ppg_parity import _load_policy, _rollout_return   # reuse proven machinery
-    from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
-    from envs.ant_envs.build_vsim import Morphology
+    from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+    from task_envs.modular_libraries.simple import Morphology
 
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
     cfg = yaml.safe_load((_ROOT / CONFIG).read_text())
-    base_legs = tuple(cfg.get("env", {}).get("base_legs", (1, 4, 6)))
     value_size = int(cfg.get("env", {}).get("value_size", 1))   # 2 => V1.0 head (+progress obs dim)
     net_params = cfg["params"]["network"]
 
     # One fixed-base env, reused across every checkpoint (1 group, BASE_ENVS envs).
-    env = AntMultiMorphEnv(BASE_ENVS, device, morphologies=[Morphology.from_legs(base_legs)],
-                           sample_morphs=False, rendering=False, raise_exception=False,
+    env = AntCodesignEnv(BASE_ENVS, device, morphologies=AntCodesignEnv._BASE_MORPHOLOGY,
+                           rendering=False, raise_exception=False,
                            seed=EVAL_SEED, with_window=False, value_size=value_size)
 
     out = {}
@@ -164,7 +163,7 @@ def base_eval(seeds):
         out[f"s{seed}__ret_std"] = np.array(stds, dtype=np.float32)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(DATA_DIR / "base_eval.npz",
-                        seeds=np.array(seeds), base_legs=np.array(base_legs), **out)
+                        seeds=np.array(seeds), **out)
     print(f"[codesign] base_eval -> {DATA_DIR / 'base_eval.npz'}")
 
 

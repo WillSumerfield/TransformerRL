@@ -48,8 +48,8 @@ from experiments.ppg_parity import _load_policy
 from experiments.diversity_p5 import population_to_repr, rao_blackwell_h_body, redundancy
 from experiments.diversity import within_run_metrics
 from transformer_rl.models import _raw_tail
-from envs.ant_envs.ant_codesign import AntCodesignEnv
-from envs.ant_envs.ant_multimorph import _OBS_TOTAL, _N_DOFS_FULL
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+from task_envs.codesign_environment import _OBS_TOTAL, _N_DOFS_FULL
 
 RUN_ROOT = _ROOT / "runs/ant_codesign/codesign_single_transformer"
 EVAL_SEED = 123
@@ -307,7 +307,7 @@ def main():
     n_envs = args.num_envs or int(jobs[0][3]["params"]["config"]["num_actors"])
     print(f"[eval] {n_envs} bodies x {args.episodes} episodes/body x 3 sources; seed={EVAL_SEED}",
           flush=True)
-    env = AntCodesignEnv(n_envs, device, sample_morphs=True, rendering=False,
+    env = AntCodesignEnv(n_envs, device, rendering=False,
                          raise_exception=False, seed=EVAL_SEED, with_window=False)
 
     rows = []

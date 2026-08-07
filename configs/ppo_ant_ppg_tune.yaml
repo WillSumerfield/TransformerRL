@@ -4,9 +4,6 @@
 # this sweep tunes the 6 shared PPO/GAE loss knobs (e_clip, entropy_coef,
 # bounds_loss_coef, grad_norm, gamma, tau) overridden per-trial by the tuner.
 # critic_coef/scale_value are NOT tuned: dead under Adam + adv/value normalization.
-env:
-  sample_morphs: true
-
 params:
   seed: 42                   # single fixed seed across trials (tuning is single-seed)
 

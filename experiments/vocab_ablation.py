@@ -22,6 +22,7 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import numpy as np
+from codesigner.components.interfaces import ModuleType
 
 RUN = "runs/ant_codesign/codesign_single_transformer/phase5_s{seed}"
 N_SAMPLE = 4096          # bodies drawn from the converged generator (to find the modal skeleton)
@@ -40,21 +41,25 @@ def _final_ckpt(run_dir: Path):
 
 # ---- variant construction -------------------------------------------------------
 
-def _variants(counts, rng):
+def _variants(counts, rng, ml):
     """Named subtype variants at ONE fixed skeleton `counts` (8,) of per-limb effector counts.
-    Returns [(name, contrast, effector_types dict, cap_types dict)]."""
-    from transformer_rl.vocab import (EFF_SWING, EFF_KNEE, EFF_TWIST, CAP_BARE, CAP_FOOT,
-                                      CAP_PAD, CAP_BALL, canonical_eff, CAP_NAMES)
+    Returns [(name, contrast, effector_types dict, cap_types dict)]. ml = the env's ModuleLibrary
+    (subtype names come from its public `names` API; "swing"/"knee"/"bare" below are OUR choice of
+    canonical body, matching AntCodesignEnv._BASE_MORPHOLOGY's own literal vocabulary, not library
+    data)."""
+    eff_names = ml.names(ModuleType.EFFECTOR)
+    SWING, KNEE, TWIST = eff_names
     limbs = {i + 1: int(k) for i, k in enumerate(counts) if k > 0}
+    BARE = "bare"
 
     EFF = {
-        "canon":      lambda k: [canonical_eff(d) for d in range(k)],   # swing then knees
-        "canon_twist": lambda k: [EFF_SWING] + [EFF_TWIST] * (k - 1),   # len-matched vs canon
-        "all_knee":   lambda k: [EFF_KNEE] * k,
-        "all_twist":  lambda k: [EFF_TWIST] * k,                        # len-matched vs all_knee
-        "all_swing":  lambda k: [EFF_SWING] * k,                        # LENGTH-CONFOUNDED
+        "canon":      lambda k: (["swing"] + ["knee"] * (k - 1)),   # swing then knees
+        "canon_twist": lambda k: [SWING] + [TWIST] * (k - 1),   # len-matched vs canon
+        "all_knee":   lambda k: [KNEE] * k,
+        "all_twist":  lambda k: [TWIST] * k,                        # len-matched vs all_knee
+        "all_swing":  lambda k: [SWING] * k,                        # LENGTH-CONFOUNDED
     }
-    caps = [CAP_BARE, CAP_FOOT, CAP_PAD, CAP_BALL]
+    caps = list(ml.names(ModuleType.CAP))
     out = []
 
     def add(name, contrast, eff_key, cap_fn):
@@ -63,10 +68,10 @@ def _variants(counts, rng):
 
     # (a) CAP axis -- cleanest single variable (cap masses equalized). Uniform cap, canonical eff.
     for c in caps:
-        add(f"cap_{CAP_NAMES[c]}", "cap", "canon", lambda n, c=c: c)
+        add(f"cap_{c}", "cap", "canon", lambda n, c=c: c)
     # cap axis re-run under an all-knee body, to check the cap effect isn't canon-specific
     for c in caps[1:]:
-        add(f"cap_{CAP_NAMES[c]}@knee", "cap_knee", "all_knee", lambda n, c=c: c)
+        add(f"cap_{c}@knee", "cap_knee", "all_knee", lambda n, c=c: c)
     # mixed caps: per-limb random draw, canonical effectors -> isolates the CAP sub-axis under
     # realistic (non-uniform) assignments.
     for j in range(N_DRAW):
@@ -74,13 +79,13 @@ def _variants(counts, rng):
         add(f"cap_mixed{j}", "cap_mixed", "canon", lambda n, d=draw: d[n])
 
     # (b) EFFECTOR, LENGTH-MATCHED (knee <-> twist): same module lengths, different joint axis.
-    add("eff_all_knee", "eff_matched", "all_knee", lambda n: CAP_BARE)
-    add("eff_all_twist", "eff_matched", "all_twist", lambda n: CAP_BARE)
-    add("eff_canon_twist", "eff_matched", "canon_twist", lambda n: CAP_BARE)
+    add("eff_all_knee", "eff_matched", "all_knee", lambda n: BARE)
+    add("eff_all_twist", "eff_matched", "all_twist", lambda n: BARE)
+    add("eff_canon_twist", "eff_matched", "canon_twist", lambda n: BARE)
     # canonical/bare (== cap_bare above) is the 4th member of this contrast; reused, not rebuilt.
 
     # (c) EFFECTOR, LENGTH-CONFOUNDED (swing <-> knee): 2.24x module-length change.
-    add("eff_all_swing", "eff_confounded", "all_swing", lambda n: CAP_BARE)
+    add("eff_all_swing", "eff_confounded", "all_swing", lambda n: BARE)
 
     # (d) FAIRNESS CONTROL. The uniform variants above set ALL limbs alike -- something the
     # generator never emits, so a collapse there may be off-distribution rather than real axis
@@ -91,13 +96,13 @@ def _variants(counts, rng):
         if f >= len(ordered):
             continue
         sw = set(ordered[:f])
-        et = {n: ([EFF_SWING] + [EFF_TWIST] * (k - 1) if n in sw
-                  else [canonical_eff(d) for d in range(k)]) for n, k in limbs.items()}
-        out.append((f"eff_twist_{f}limb", "eff_graded", et, {n: CAP_BARE for n in limbs}))
-    rnd_eff = lambda k: [rng.choice([EFF_SWING, EFF_KNEE, EFF_TWIST]) for _ in range(k)]
+        et = {n: ([SWING] + [TWIST] * (k - 1) if n in sw
+                  else ["swing"] + ["knee"] * (k - 1)) for n, k in limbs.items()}
+        out.append((f"eff_twist_{f}limb", "eff_graded", et, {n: BARE for n in limbs}))
+    rnd_eff = lambda k: [rng.choice(eff_names) for _ in range(k)]
     for j in range(N_DRAW):     # EFFECTOR sub-axis alone (caps held bare)
         out.append((f"eff_mixed{j}", "eff_mixed", {n: rnd_eff(k) for n, k in limbs.items()},
-                    {n: CAP_BARE for n in limbs}))
+                    {n: BARE for n in limbs}))
     for j in range(N_DRAW):     # BOTH sub-axes -- the full in-distribution subtype spread
         out.append((f"both_mixed{j}", "both_mixed", {n: rnd_eff(k) for n, k in limbs.items()},
                     {n: rng.choice(caps) for n in limbs}))
@@ -106,14 +111,24 @@ def _variants(counts, rng):
 
 # ---- main -----------------------------------------------------------------------
 
-def run_seed(seed, epm, n_skel, device):
+def _probe_env_dims(device):
+    """One throwaway 1-env AntCodesignEnv, just to read the (obs_total, n_act) layout -- these are
+    computed at construction from module_library.root_axes, not stale hardcoded constants."""
+    import vlearn as v
+    from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+    env = AntCodesignEnv(1, device, rendering=False, with_window=False, raise_exception=False, seed=0)
+    dims = (env.observation_space.shape[0], env.action_space.shape[0])
+    env.gym = None; del env; gc.collect(); v.delete_gym()
+    return dims
+
+
+def run_seed(seed, epm, n_skel, device, ml, obs_base, n_act):
     import torch
     import yaml
     import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
-    from envs.ant_envs.ant_multimorph import (AntMultiMorphEnv, _OBS_TOTAL as OBS_BASE,
-                                              _MASK_DIM as MASK_DIM, _N_DOFS_FULL as N_ACT)
-    from envs.ant_envs.build_vsim import Morphology
+    from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+    from task_envs.modular_libraries.simple import Morphology
 
     run_dir = _ROOT / RUN.format(seed=seed)
     ckpt = _final_ckpt(run_dir)
@@ -122,7 +137,7 @@ def run_seed(seed, epm, n_skel, device):
     value_size = int(cfg.get("env", {}).get("value_size", 1))
     net_params = cfg["params"]["network"]
     net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size,
-                                 obs_base=OBS_BASE, n_act=N_ACT)
+                                 obs_base=obs_base, n_act=n_act)
     print(f"[vocab] s{seed} ckpt={ckpt.name}", flush=True)
 
     torch.manual_seed(EVAL_SEED)          # reproducible modal skeleton across reruns
@@ -137,28 +152,32 @@ def run_seed(seed, epm, n_skel, device):
           f"{len(pats)} distinct", flush=True)
     # what subtypes does the generator actually emit? (context for the entropy claim)
     es, cs = smp["eff_sub"].cpu().numpy(), smp["cap_sub"].cpu().numpy()
-    eff_hist = np.bincount(es[es >= 0].ravel(), minlength=3) / max(1, (es >= 0).sum())
-    cap_hist = np.bincount(cs[cs >= 0].ravel(), minlength=4) / max(1, (cs >= 0).sum())
+    n_eff = len(ml.names(ModuleType.EFFECTOR))
+    n_cap = len(ml.names(ModuleType.CAP))
+    eff_hist = np.bincount(es[es >= 0].ravel(), minlength=n_eff) / max(1, (es >= 0).sum())
+    cap_hist = np.bincount(cs[cs >= 0].ravel(), minlength=n_cap) / max(1, (cs >= 0).sum())
 
     rng = random.Random(EVAL_SEED + seed)
-    variants = _variants(modal, rng)
+    variants = _variants(modal, rng, ml)
     skels = [pats[i] for i in order[:n_skel]]                    # in-distribution skeleton spread
 
     bodies, labels = [], []
     for name, contrast, et, ct in variants:
-        bodies.append(Morphology.from_design(et, ct)); labels.append((name, contrast))
+        bodies.append(Morphology.from_design(ml, et, ct)); labels.append((name, contrast))
     for j, s in enumerate(skels):
-        bodies.append(Morphology.from_counts({i + 1: int(k) for i, k in enumerate(s) if k > 0}))
+        counts = {i + 1: int(k) for i, k in enumerate(s) if k > 0}
+        et = {n: (["swing"] + ["knee"] * (k - 1)) for n, k in counts.items()}
+        bodies.append(Morphology.from_design(ml, et, {}))
         labels.append((f"skel{j}", "skeleton"))
     # skel0 == modal skeleton at canonical subtypes == variant "cap_bare": an intentional duplicate
     # body evaluated twice -> a direct read of the rollout noise floor.
 
     print(f"[vocab] s{seed} building {len(bodies)} bodies x {epm} envs", flush=True)
-    env = AntMultiMorphEnv(len(bodies) * epm, device, morphologies=bodies, sample_morphs=False,
+    env = AntCodesignEnv(len(bodies) * epm, device, morphologies=bodies,
                            rendering=False, raise_exception=False, seed=EVAL_SEED,
                            with_window=False, value_size=value_size)
     e = env.envs_per_morph
-    ep = _rollout_return(net, obs_norm, env, device, obs_base=OBS_BASE, mask_dim=MASK_DIM)
+    ep = _rollout_return(net, obs_norm, env, device)
 
     rows = []
     for i, (name, contrast) in enumerate(labels):
@@ -213,9 +232,12 @@ def main():
     a = ap.parse_args()
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
+    from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+    ml = AntCodesignEnv._MODULE_LIBRARY
+    obs_base, n_act = _probe_env_dims(device)
     out = []
     for s in a.seeds:
-        out.append(summarize(run_seed(s, a.epm, a.n_skel, device)))
+        out.append(summarize(run_seed(s, a.epm, a.n_skel, device, ml, obs_base, n_act)))
         sp = out[-1]["spread"]
         print(f"[vocab] s{s} spread std: " +
               " ".join(f"{k}={v['std']:.2f}" for k, v in sp.items()) +

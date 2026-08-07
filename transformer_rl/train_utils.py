@@ -669,7 +669,7 @@ def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
         # tripping env.render_finished (which would raise via raise_exception).
         recorder = _VideoRecorder(video_path, max_frames=num_episodes * max_ep, stop_env=False)
     _attach_render_callback(env, recorder)
-    from envs.multigroup_environment import RenderFinished
+    from task_envs.multigroup_environment import RenderFinished
     try:
         while not env.render_finished:
             if recorder is not None and recorder.done:
@@ -882,6 +882,17 @@ def run_training(
         "seed": resolved_seed,
         **config.get("env", {}),
     }
+    ml_name = env_kwargs.pop("module_library", None)
+    ml_kwargs = env_kwargs.pop("module_library_kwargs", {})
+    if ml_name is not None:      # unset -> env_class's own default module_library instance
+        from task_envs.modular_libraries import REGISTRY as ml_registry
+        env_kwargs["module_library"] = ml_registry[ml_name](**ml_kwargs)
+
+    bm_cfg = env_kwargs.pop("base_morphology", None)
+    if bm_cfg is not None:       # unset -> env_class's own default base morphology
+        assert ml_name is not None, "env.base_morphology requires an explicit env.module_library"
+        from task_envs.modular_libraries.simple import Morphology
+        env_kwargs["base_morphology"] = Morphology.from_design(env_kwargs["module_library"], **bm_cfg)
 
     # --- Video recorder setup ---
     recorder = None
@@ -899,7 +910,9 @@ def run_training(
     def create_envs(n, **kw):
         assert torch.cuda.is_available()
         device = torch.device("cuda:0")
-        envs = env_class(n, device, **env_kwargs)
+        env_kwargs["num_envs"] = n
+        env_kwargs["device"] = device
+        envs = env_class(**env_kwargs)
         if mode == "play":
             envs.inference_mode_post_init_callback()
         if switch is not None:                       # drop arch-incompatible runs (mixed-gen dirs)
@@ -989,7 +1002,7 @@ def run_training(
             print(f"[play] Loading model from checkpoint: {checkpoint}")
         else:
             print("[play] No checkpoint provided; running with randomly initialized model")
-    from envs.multigroup_environment import RenderFinished
+    from task_envs.multigroup_environment import RenderFinished
     try:
         runner.run(run_args)
     except RenderFinished:

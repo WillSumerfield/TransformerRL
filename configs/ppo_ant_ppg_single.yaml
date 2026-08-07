@@ -2,9 +2,6 @@
 # interference managed by detaching the value gradient at the trunk in the policy phase.
 # Identical to ppo_ant_ppg.yaml (the dual-net baseline) except ppg.shared_trunk=true, so the
 # comparison isolates the architecture. Shared boilerplate lives in configs/defaults/base.yaml.
-env:
-  sample_morphs: true       # sample num_envs variable-length bodies (one per env), seeded
-
 params:
   seed: 42                   # seeds morphology sampling for reproducible runs
 

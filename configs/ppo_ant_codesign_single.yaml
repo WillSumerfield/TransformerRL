@@ -8,10 +8,6 @@
 # loss, 0 extra passes; config.fd/fk). Aux is still gated -- `--set params.config.fd.enabled=false`
 # (and fk) reproduces the phase-1 baseline. Generator warmup = parts teacher, entropy RL-only, BC on
 # the teacher draw (see the generator block). Override any knob with --set (e.g. fd_variant=raw).
-env:
-  sample_morphs: true       # unlocks resample(); AntCodesignEnv overrides _draw_morphs (rng unused)
-  base_legs: [1, 4, 6]      # initial build + warmup SEED (must match generator.base_legs)
-
 params:
   seed: 42
 
@@ -57,7 +53,6 @@ params:
     bounds_loss_coef: 0.0005
 
     generator:               # generator heads share the trunk/optimizer (no separate net/lr)
-      base_legs: [1, 4, 6]
       # Warmup teacher = the generator's post-warmup PRIOR (it is behaviour-cloned onto it).
       # parts-copy: each slot copies a limb template from the seed, then takes a length offset;
       # unstable draws are rejection-resampled but kept w.p. prob_invalid (GenCrit needs negatives).

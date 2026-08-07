@@ -1,4 +1,4 @@
-"""PPG training on AntMultiMorphEnv (disjoint policy/value nets; see ppg_agent.py).
+"""PPG training on AntCodesignEnv (disjoint policy/value nets; see ppg_agent.py).
 
 Same env/network as train_ant_full.py; algo.name=ppg_continuous in the config
 selects PPGAgent, which builds the value net internally (multimorph_limb_value).
@@ -11,15 +11,15 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
 from transformer_rl import MultiMorphLimbTransformerBuilder
 
 run_training(
     default_config="ppo_ant_ppg.yaml",
     train_dir="runs/ant_ppg",
     name="ant_ppg_transformer",
-    env_class=AntMultiMorphEnv,
-    env_name="ant-multimorph-env",
+    env_class=AntCodesignEnv,
+    env_name="ant-codesign-env",
     network=("multimorph_limb_transformer", MultiMorphLimbTransformerBuilder),
     model="transformer_masked_a2c_logstd",
 )

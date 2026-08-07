@@ -1,4 +1,4 @@
-"""Single-network PPG training on AntMultiMorphEnv (one shared trunk; see ppg_agent.py
+"""Single-network PPG training on AntCodesignEnv (one shared trunk; see ppg_agent.py
 sec 3.6 path). Same env/network/agent as train_ant_ppg.py; the config's ppg.shared_trunk=true
 makes PPGAgent build one net and detach the value gradient at the trunk in the policy phase.
 """
@@ -10,15 +10,15 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from envs.ant_envs.ant_multimorph import AntMultiMorphEnv
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
 from transformer_rl import MultiMorphLimbTransformerBuilder
 
 run_training(
     default_config="ppo_ant_ppg_single.yaml",
     train_dir="runs/ant_ppg_single",
     name="ant_ppg_single_transformer",
-    env_class=AntMultiMorphEnv,
-    env_name="ant-multimorph-env",
+    env_class=AntCodesignEnv,
+    env_name="ant-codesign-env",
     network=("multimorph_limb_transformer", MultiMorphLimbTransformerBuilder),
     model="transformer_masked_a2c_logstd",
 )

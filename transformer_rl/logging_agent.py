@@ -74,6 +74,9 @@ class LoggingA2CAgent(A2CAgent):
             torch.cuda.synchronize()
             self._timings[key] = self._timings.get(key, 0.0) + (time.perf_counter() - self._tics[key])
 
+    def _env(self):
+        return getattr(getattr(self.vec_env, 'envs', None), 'env', None)
+
     @contextlib.contextmanager
     def _prof(self, key):
         """Region profiler: accumulates synced time (perf/t_<key>) and, under mem_profile,
@@ -189,7 +192,7 @@ class LoggingA2CAgent(A2CAgent):
         if not interval:
             return
         env = getattr(getattr(self.vec_env, 'envs', None), 'env', None)
-        if env is None or not getattr(env, '_sample_morphs', False):
+        if env is None:
             return
         self._steps_since_resample += self.horizon_length
         if self._steps_since_resample < interval * env.max_episode_length:
@@ -300,7 +303,7 @@ class LoggingA2CAgent(A2CAgent):
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
 
-    # ---- per-morphology performance (multi-morph AntMultiMorphEnv only) -------------
+    # ---- per-morphology performance (multi-morph AntCodesignEnv only) -------------
 
     def _morph_metadata(self):
         """Detect a multi-morph env and cache per-morph layout/labels. Returns dict or False."""
@@ -310,7 +313,7 @@ class LoggingA2CAgent(A2CAgent):
         if env is None or not hasattr(env, 'envs_per_morph') or not hasattr(env, 'groups'):
             self._morph_meta = False
             return False
-        morphs = [sorted(g['morph'].legs) for g in env.groups]
+        morphs = [sorted(g['morph'].limbs) for g in env.groups]
         by_limbs: dict[int, list[int]] = {}
         for i, m in enumerate(morphs):
             by_limbs.setdefault(len(m), []).append(i)

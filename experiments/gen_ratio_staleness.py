@@ -80,7 +80,7 @@ def main():
     import torch
     import yaml
     from experiments.ppg_parity import _load_policy
-    from envs.ant_envs.ant_multimorph import _OBS_TOTAL as OBS_BASE, _N_DOFS_FULL as N_ACT
+    from task_envs.codesign_environment import _OBS_TOTAL as OBS_BASE, _N_DOFS_FULL as N_ACT
 
     device = torch.device("cuda:0")
     gaps = [int(g) for g in args.gaps.split(",")]

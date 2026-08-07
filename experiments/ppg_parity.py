@@ -32,7 +32,7 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 
 from transformer_rl.models import MultiMorphLimbTransformerBuilder, _raw_tail
 from transformer_rl.tokenize import OBS_DIM_8, LEN_DIM_8, MASK_DIM_8
-from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _stable_morphologies
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
 
 _OBS_TOTAL = OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8   # 139
 _MASK_DIM  = MASK_DIM_8                            # 16
@@ -59,6 +59,26 @@ CURVE_TAGS = [
     "perf/peak_mem_mib",
 ]
 DATA_DIR = _ROOT / "data" / "ppg_parity"
+
+
+def stable_morphologies(
+    min_limbs: int = 3,
+    max_limbs: int = 8,
+    max_gap_deg: float = 135.0,
+) -> list[frozenset]:
+    """Enumerate limb-presence patterns (8-bit masks) viable as a walker: min_limbs..max_limbs
+    limbs present, no circular gap between adjacent limbs > max_gap_deg. Presence-only."""
+    result = []
+    for mask in range(1, 256):
+        active = frozenset(i + 1 for i in range(8) if (mask >> i) & 1)
+        if not (min_limbs <= len(active) <= max_limbs):
+            continue
+        angles = sorted((n - 1) * 45.0 for n in active)
+        gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
+        gaps.append(360.0 - angles[-1] + angles[0])
+        if max(gaps) <= max_gap_deg:
+            result.append(active)
+    return result
 
 
 # ---- 1. training -----------------------------------------------------------------
@@ -155,8 +175,10 @@ def run_inference(seeds):
     device = torch.device("cuda:0")
     bodies = _stable_morphologies()
     bcount = np.array([len(b) for b in bodies])
-    env = AntMultiMorphEnv(len(bodies) * ENVS_PER, device, morphologies=bodies,
-                           sample_morphs=False, rendering=False, raise_exception=False,
+    # TODO: broken -- CodesignEnvironmentGpu has no `morphologies=` kwarg (bodies now only change
+    # via resample()/set_next()); this needs redesigning against the generator-driven codesign env.
+    env = AntCodesignEnv(len(bodies) * ENVS_PER, device, morphologies=bodies,
+                           rendering=False, raise_exception=False,
                            seed=EVAL_SEED, with_window=False)
     EPM = env.envs_per_morph
 

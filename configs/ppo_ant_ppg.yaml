@@ -1,9 +1,6 @@
 # PPG controller (Cobbe 2020): disjoint policy/value nets. Mirrors ppo_ant_full.yaml
 # (the PPO parity baseline) + algo.name=ppg_continuous + a config.ppg block.
 # Shared rl_games boilerplate lives in configs/defaults/base.yaml (merged at load).
-env:
-  sample_morphs: true       # sample num_envs variable-length bodies (one per env), seeded
-
 params:
   seed: 42                   # seeds morphology sampling for reproducible runs
 

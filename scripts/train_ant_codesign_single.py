@@ -9,7 +9,7 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from envs.ant_envs.ant_codesign import AntCodesignEnv
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
 from transformer_rl import MultiMorphLimbTransformerBuilder
 
 run_training(

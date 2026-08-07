@@ -119,9 +119,9 @@ def eval_all(seeds):
     import yaml
     import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
-    from envs.ant_envs.ant_multimorph import (AntMultiMorphEnv, _OBS_TOTAL as OBS_BASE,
+    from task_envs.ant_envs.ant_multimorph import (AntCodesignEnv, _OBS_TOTAL as OBS_BASE,
                                               _MASK_DIM as MASK_DIM, _N_DOFS_FULL as N_ACT)
-    from envs.ant_envs.build_vsim import Morphology
+    from task_envs.build_vsim import Morphology
 
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
@@ -147,8 +147,8 @@ def eval_all(seeds):
 
         bodies = [Morphology.from_counts({i + 1: int(c) for i, c in enumerate(row) if c > 0})
                   for row in kept_pat]                   # 1-based limb ids; count 0 = absent
-        env = AntMultiMorphEnv(len(bodies) * EVAL_EPM, device, morphologies=bodies,
-                               sample_morphs=False, rendering=False, raise_exception=False,
+        env = AntCodesignEnv(len(bodies) * EVAL_EPM, device, morphologies=bodies,
+                               rendering=False, raise_exception=False,
                                seed=EVAL_SEED, with_window=False, value_size=value_size)
         epm = env.envs_per_morph
         ep = _rollout_return(net, obs_norm, env, device,
@@ -170,7 +170,7 @@ def eval_all(seeds):
               f"| {len(patterns)} distinct, nmodes={wm['div_nmodes']:.2f}", flush=True)
         # vsim gym is a licensed per-process singleton: must tear down before the next seed's
         # create_gym (else "License validation failed"). Drain in-flight work first, mirroring
-        # AntMultiMorphEnv._rebuild, so delete_gym doesn't free vsim buffers under a live async op.
+        # AntCodesignEnv._rebuild, so delete_gym doesn't free vsim buffers under a live async op.
         torch.cuda.synchronize()
         for _fn in ("end_streaming", "_check_for_cuda_errors"):
             try: getattr(env.gym, _fn)()

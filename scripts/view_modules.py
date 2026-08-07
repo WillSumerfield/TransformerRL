@@ -21,49 +21,53 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import torch
 import vlearn as v
+from codesigner.components.interfaces import ModuleType
 
-from envs.ant_envs.ant_multimorph import AntMultiMorphEnv, _N_LIMBS, _N_DOFS_FULL, _slot
-from envs.ant_envs.build_vsim import Morphology, _CAP_PITCH
-from transformer_rl.vocab import (EFF_SWING, EFF_KNEE, EFF_TWIST, EFF_NAMES,
-                                  CAP_BARE, CAP_FOOT, CAP_PAD, CAP_BALL, CAP_NAMES)
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+from task_envs.codesign_environment import _N_LIMBS, _N_DOFS_FULL, _slot
+from task_envs.modular_libraries.simple import Morphology
 
 _LIMBS = range(1, _N_LIMBS + 1)
+# Nominal stance knee bend (rad) -- the angle a cap's pitch is built to cancel, i.e. where caps sit
+# flat. Matches SimpleModuleLibrary's internal _KNEE_NOMINAL_BEND (dev-tool default only, not read
+# from the library -- ModuleLibrary doesn't expose it).
+_NOMINAL_KNEE_BEND = 1.134464045365651486
 
 
-def _uniform(chain, cap) -> Morphology:
+def _uniform(ml, chain, cap) -> Morphology:
     """Body where every limb carries the same effector chain and the same cap."""
-    return Morphology.from_design({n: list(chain) for n in _LIMBS}, {n: cap for n in _LIMBS})
+    return Morphology.from_design(ml, {n: list(chain) for n in _LIMBS}, {n: cap for n in _LIMBS})
 
 
-def gallery() -> list:
-    """(label, morphology) per grid cell: 3 effector demos then 4 cap demos."""
-    cells = [(f"eff:{EFF_NAMES[e]}", _uniform([e], CAP_BARE))
-             for e in (EFF_SWING, EFF_KNEE, EFF_TWIST)]
-    cells += [(f"cap:{CAP_NAMES[c]}", _uniform([EFF_SWING, EFF_KNEE], c))
-              for c in (CAP_BARE, CAP_FOOT, CAP_PAD, CAP_BALL)]
+def gallery(ml) -> list:
+    """(label, morphology) per grid cell: 3 effector demos then 4 cap demos. "swing"/"knee"/"bare"
+    are OUR choice of canonical chain/cap (matches AntCodesignEnv._BASE_MORPHOLOGY's own literal
+    vocabulary), not something queried from the library."""
+    cells = [(f"eff:{e}", _uniform(ml, [e], "bare")) for e in ml.names(ModuleType.EFFECTOR)]
+    cells += [(f"cap:{c}", _uniform(ml, ["swing", "knee"], c))
+              for c in ml.names(ModuleType.CAP)]
     return cells
 
 
 def main():
     p = ArgumentParser()
-    p.add_argument("--knee", type=float, default=_CAP_PITCH,
+    p.add_argument("--knee", type=float, default=_NOMINAL_KNEE_BEND,
                    help="knee angle (rad) to hold every limb at; defaults to the nominal bend the "
                         "cap pitch is built around, i.e. the pose where caps sit flat. 0 = splayed")
     p.add_argument("--fall", action="store_true", help="enable gravity (default: float in place)")
     p.add_argument("--spacing", type=float, default=3.0)
     args = p.parse_args()
 
-    cells = gallery()
+    cells = gallery(AntCodesignEnv._MODULE_LIBRARY)
     cols = max(1, ceil(len(cells) ** 0.5))
     print(f"[gallery] {len(cells)} cells, {cols} per row (+x = column, +z = row):")
     for i, (label, m) in enumerate(cells):
         print(f"  [{i // cols},{i % cols}] {label}")
 
     device = torch.device("cuda:0")
-    env = AntMultiMorphEnv(
+    env = AntCodesignEnv(
         len(cells), device,
-        morphologies=[m for _, m in cells],
-        sample_morphs=False,
+        morphologies=[m for _, m in cells],   # 1 env/cell, explicit per-group bodies
         rendering=True,
         with_window=True,
         raise_exception=False,
@@ -76,10 +80,10 @@ def main():
     )
 
     # Hold the knees at a fixed angle by writing the reset DOF pose (zero gravity + zero torque, so
-    # the bodies just sit there). Limbs 4 and 6 have a negated ankle axis, hence a negated angle.
+    # the bodies just sit there).
     pose = torch.zeros((env.total_num_envs, _N_DOFS_FULL), device=device)
     for n in _LIMBS:
-        pose[:, _slot(n, 2)] = -args.knee if n in (4, 6) else args.knee
+        pose[:, _slot(n, 2)] = args.knee
     env._flat_dof_init[:] = pose.reshape(-1)[env._motor_src_idx]
 
     act = torch.zeros_like(pose)

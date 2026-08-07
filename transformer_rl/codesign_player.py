@@ -28,7 +28,7 @@ class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
     @torch.no_grad()
     def env_reset(self, env):
         e = self._env()
-        if self._gen and getattr(e, '_sample_morphs', False):
+        if self._gen:
             tr = self.model.a2c_network.net.sample(e.total_num_envs)
             counts = tr['counts'].long()
             e.set_next(counts, tr['eff_sub'], tr['cap_sub'])

@@ -3,10 +3,6 @@
 # checkpointing pushed past it (tuner reads TB summaries only, not .pth). The study overrides the
 # five FD/FK knobs per trial (fd.enabled, fd.coef, fd_variant, fk.enabled, fk.coef); the values
 # here are the trial-0 / anchor defaults. The real-run config (3000 epochs) stays untouched.
-env:
-  sample_morphs: true       # unlocks resample(); AntCodesignEnv overrides _draw_morphs (rng unused)
-  base_legs: [1, 4, 6]      # initial build + warmup SEED (must match generator.base_legs)
-
 params:
   seed: 42
 
@@ -51,7 +47,6 @@ params:
     bounds_loss_coef: 0.0005
 
     generator:               # generator heads share the trunk/optimizer (no separate net/lr)
-      base_legs: [1, 4, 6]
       teacher: parts         # parts-copy warmup teacher (the generator's post-warmup BC prior)
       copy_prob: 0.6         # p: slot keeps its OWN seed limb template (else copies another slot's)
       len_keep_prob: 0.6     # q: P(per-limb length offset == 0); sets the Gaussian sigma

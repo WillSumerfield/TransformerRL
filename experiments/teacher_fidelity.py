@@ -45,6 +45,7 @@ import numpy as np
 from experiments.diversity import counts_to_repr
 from experiments.diversity_p5 import (encode_population, limb_entropies, pairwise_d_struct,
                                       population_to_repr)
+from task_envs.ant_envs.ant_codesign import AntCodesignEnv
 
 RUN_DIR = _ROOT / "runs/ant_codesign/codesign_single_transformer"
 # phase 3 clamps parts-copy lengths to max_limb_length (4); phase 5 to max_effectors (3).
@@ -54,10 +55,10 @@ MAX_EFF = {"phase3": 4, "phase5": 3}
 class _TeacherShim:
     """Carries exactly the attributes `_draw_parts_counts` / `_is_stable` read."""
 
-    def __init__(self, base_legs, copy_prob, len_keep, prob_invalid, max_eff, device):
+    def __init__(self, copy_prob, len_keep, prob_invalid, max_eff, device):
         import torch
         n = 8
-        self._base_target = torch.tensor([2 if (i + 1) in set(base_legs) else 0 for i in range(n)],
+        self._base_target = torch.tensor([2 if (i + 1) in set(AntCodesignEnv._BASE_MORPHOLOGY.legs) else 0 for i in range(n)],
                                          dtype=torch.long, device=device)
         self._copy_prob, self._prob_invalid = copy_prob, prob_invalid
         # phase 5's method clamps to _max_eff, phase 3's (root) to _max_len -- set both so the shim
@@ -69,7 +70,7 @@ class _TeacherShim:
 def _make_teacher(cfg, max_eff, device):
     from transformer_rl.codesign_agent import CodesignAgent
     cd = cfg["params"]["config"]["generator"]
-    sh = _TeacherShim(cd["base_legs"], float(cd.get("copy_prob", 0.6)),
+    sh = _TeacherShim(float(cd.get("copy_prob", 0.6)),
                       float(cd.get("len_keep_prob", 0.6)), float(cd.get("prob_invalid", 0.1)),
                       max_eff, device)
     # bind the REAL implementations -- never a copy
@@ -134,7 +135,7 @@ def main():
         gens = {}
         if ck:
             from experiments.ppg_parity import _load_policy
-            from envs.ant_envs.ant_multimorph import _OBS_TOTAL as OB, _N_DOFS_FULL as NA
+            from task_envs.codesign_environment import _OBS_TOTAL as OB, _N_DOFS_FULL as NA
             for tag, ep in (("gen@pre", min(ck, key=lambda e: abs(e - args.pre_epoch))),
                             ("gen@end", max(ck))):
                 try:

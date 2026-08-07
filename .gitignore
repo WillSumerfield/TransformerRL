@@ -6,7 +6,7 @@ data/
 videos/
 .claude/
 TurboActivate.dat
-envs/ant_envs/assets/generated/
+**generated/
 imgui.ini
 .vscode/
 temp/

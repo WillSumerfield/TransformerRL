@@ -10,7 +10,9 @@ from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_dims, lim
                        contact_mask,
                        ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM, ROOT_DIM_P2)
 from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
-                    GEN_EFF, GEN_CAP, N_GEN_CAT, N_EFF, N_SUB, CAP_BARE)
+                    GEN_EFF, GEN_CAP, N_GEN_CAT, N_SUB)
+from task_envs.modular_libraries import REGISTRY as _ML_REGISTRY
+from codesigner.components.interfaces import ModuleType
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
@@ -150,12 +152,20 @@ class LimbTransformer(nn.Module):
         use_rope: bool = False,
         reg_mode: str = 'none',
         dropout: float = 0.1,
+        module_library: str = 'simple',
+        module_library_kwargs: dict = None,
     ):
         super().__init__()
         if use_rope and not codesign_tokens:
             raise ValueError("use_rope needs codesign_tokens (depth-only rotary needs limb-chain depth)")
         if reg_mode not in ('none', 'dropout', 'attention_drop'):
             raise ValueError(f"reg_mode must be 'none'|'dropout'|'attention_drop', got {reg_mode!r}")
+        ml = _ML_REGISTRY[module_library](**(module_library_kwargs or {}))
+        # generator/tokenizer subtype vocabulary, derived from the public modules API (not hardcoded).
+        # "bare" is OUR choice of the constrained decoder's default/no-cap type (matches the literal
+        # vocabulary used everywhere else, e.g. AntCodesignEnv._BASE_MORPHOLOGY), not library data.
+        self.n_eff = len(ml.names(ModuleType.EFFECTOR))
+        self.cap_bare = ml.names(ModuleType.CAP).index("bare")
         self.n_limbs = n_limbs
         self.has_policy_head = policy_head
         self.has_value_head = value_head
@@ -328,7 +338,7 @@ class LimbTransformer(nn.Module):
         return torch.cat([pad, dep], dim=0).unsqueeze(0)
 
     def _tokenize_modules(self, obs):
-        return tokenize_modules(obs, self.n_limbs, self.max_limb_length, self.angle_enc)
+        return tokenize_modules(obs, self.n_limbs, self.max_limb_length, self.cap_bare, self.angle_enc)
 
     # ---- classic (non-codesign) legacy path -----------------------------------------------------
     def _encode_legacy(self, root, eff0_tok, eff1_tok, active_mask, B):
@@ -459,7 +469,7 @@ class LimbTransformer(nn.Module):
         masks last-horizon-step + `done`. torch.compiled -> fuses the target-derivation + masked MSE."""
         B, n, D = next_obs.shape[0], self.n_limbs, self.max_limb_length
         # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
-        _, mod_t, *_ = tokenize_modules(next_obs, n, D)
+        _, mod_t, *_ = tokenize_modules(next_obs, n, D, self.cap_bare)
         if self.fd_variant == 'latent':
             # JEPA target = content-only embed of next physical state: next_phys @ W_phys.T (drop the
             # constant type/mode one-hot cols + bias -> the fixed offset c the head could trivially fit).
@@ -474,7 +484,7 @@ class LimbTransformer(nn.Module):
         # predict contact is the one that observes it (Phase 5; == terminal effector when all caps
         # are bare, i.e. phase-1-identical).
         cfrc_tgt = mod_t[..., 4:10]                                     # (B, n_dof, 6)
-        cont = contact_mask(next_obs, n, D)                             # (B, n_dof)
+        cont = contact_mask(next_obs, n, D, self.cap_bare)               # (B, n_dof)
         v = valid.float().unsqueeze(-1)
         geom_mm, cfrc_mm = active_mask * v, cont * v                    # (B, n_dof) each
         geom_mse = (((mod_pred[..., :15] - geom_tgt) ** 2).mean(-1) * geom_mm).sum() / geom_mm.sum().clamp(min=1)
@@ -635,8 +645,8 @@ class LimbTransformer(nn.Module):
         # (unreachable with max_limb_length >= 2, but keeps the row from being fully masked).
         cap_ok = (~force_grow) | (~eff_ok)
         cat_mask = torch.stack([eff_ok, cap_ok], dim=-1)                 # (N, N_GEN_CAT)
-        sub_eff = (torch.arange(N_SUB, device=dev) < N_EFF).expand(N, N_SUB)
-        cap_bare = F.one_hot(torch.full((N,), CAP_BARE, device=dev), N_SUB).bool()
+        sub_eff = (torch.arange(N_SUB, device=dev) < self.n_eff).expand(N, N_SUB)
+        cap_bare = F.one_hot(torch.full((N,), self.cap_bare, device=dev), N_SUB).bool()
         sub_cap = torch.where((depth == 0).unsqueeze(-1), cap_bare,
                               torch.ones(N, N_SUB, dtype=torch.bool, device=dev))
         return cat_mask, torch.stack([sub_eff, sub_cap], dim=-2)         # (N, N_GEN_CAT, N_SUB)

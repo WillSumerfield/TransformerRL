@@ -1,11 +1,11 @@
-"""Phase-5 (5a stages 1+2) module-type vocabulary — the single source of truth shared by the model
-(token one-hots + constrained decoder), the agent (BC teacher), and the env/builder (physics).
+"""Token CATEGORY vocabulary -- shared/global across every ModuleLibrary (CONTEXT.md "Type
+embedding"). Which SUBTYPES fill the width below, and what each one physically is, is owned by the
+active ModuleLibrary (task_envs/modular_libraries/) instead -- see
+docs/adr/0016-modulelibrary-abstraction.md.
 
-Torch-free on purpose: envs/ant_envs/build_vsim.py imports it.
-
-Two SEPARATE one-hots ride each token (CONTEXT.md "Type embedding"):
+Two SEPARATE one-hots ride each token:
   category  {root, start, effector, cap}   -- splits phase-1's single `module` type
-  subtype   shared index, width 4          -- effector 0..2, cap 0..3, root/start/pad = null (zeros)
+  subtype   shared index, width N_SUB      -- meaning is per-ModuleLibrary
 
 GenAct is FACTORED, not flat: a category choice {effector, cap} (positionally grammar-masked), then
 a subtype choice masked to that category's kinds. logp = logp(cat) + logp(sub | cat).
@@ -21,27 +21,5 @@ N_CAT = 4
 GEN_EFF, GEN_CAP = 0, 1
 N_GEN_CAT = 2
 
-# --- SUBTYPE one-hot: SHARED index space, width = max per category ----------------------------
-# effector = (local joint axis, limits, fixed default length). Axes are given in the LIMB-LOCAL
-# frame (x = along-limb outward, y = tangent, z = up); build_vsim rotates them by _CYL_ROT[n], so
-# effector types are position-independent (verified: _ANKLE_AXIS[n] == R_z(theta_n) . (0,1,0)).
-EFF_SWING, EFF_KNEE, EFF_TWIST = 0, 1, 2
-N_EFF = 3
-# cap = passive terminal module. bare == today's zero-morphology stop (contact stays on the last
-# effector); the other three are real terminal BODIES (contact moves to the cap). Caps never
-# actuate -- no DOF, no action -- so effector <-> DOF stays 1:1.
-CAP_BARE, CAP_FOOT, CAP_PAD, CAP_BALL = 0, 1, 2, 3
-N_CAP = 4
-N_SUB = 4                       # max(N_EFF, N_CAP) -- the shared index width
-
-EFF_NAMES = ('swing', 'knee', 'twist')
-CAP_NAMES = ('bare', 'foot', 'pad', 'ball')
-
-
-def canonical_eff(depth0: int) -> int:
-    """Phase-1-equivalent effector type at 0-based depth: swing proximal, knee distal. With the
-    canonical cap (bare), a canonical design reproduces the phase-1 body EXACTLY."""
-    return EFF_SWING if depth0 == 0 else EFF_KNEE
-
-
-CANON_CAP = CAP_BARE
+# --- SUBTYPE one-hot width: SHARED index space, sized to the largest ModuleLibrary in use ------
+N_SUB = 4
