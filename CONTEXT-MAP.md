@@ -22,21 +22,12 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │       ├── determinism_bf16_nan.md  (why --seed drops deterministic algos)
 │       ├── resample_rebuild_crash.md (intermittent gym-rebuild race)
 │       └── adaptive_ant_fixes.md
-├── task_envs/                         ← Morphology context
-│   ├── CONTEXT.md
-│   ├── multigroup_environment.py
-│   ├── codesign_environment.py       (CodesignEnvironmentGpu: shared base, one group per morphology)
-│   ├── build_vsim.py                 (programmatic vsim per limb subset; generic over ModuleLibrary)
-│   ├── modular_libraries/            (ModuleLibrary: per-robot-family module vocabulary + root mounting; ADR-0016)
-│   ├── ant_envs/
-│   │   ├── ant_codesign.py           (codesign env; generator-driven bodies per resample)
-│   │   └── assets/
-│   └── dexman_envs/
-│       └── grasp_codesign.py         (object-grasping codesign env; hand = world-mounted root)
 ├── transformer_rl/                   ← Control context
 │   ├── CONTEXT.md
 │   ├── architectures.py              (LimbTransformer, MultiMorphLimbTransformer)
-│   ├── tokenize.py                   (obs → root/module tokens; codesign uniform module tokens)
+│   ├── tokenize.py                   (obs → root/module tokens, off the Task's published layout)
+│   ├── morphology.py                 (seed body, generator designs → Morphology, body sampling)
+│   ├── runtime.py                    (the run's one ModuleLibrary + seed body + obs layout)
 │   ├── models.py                     (rl_games model/network builders)
 │   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
@@ -60,21 +51,22 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ## Contexts
 
 - [CoDesigner](../SoftwarePackage/CONTEXT.md) *(upstream package)* — Task / ModuleLibrary / Algorithm interfaces, Module, Orientation, Morphology, attachment slot
-- [Morphology](./task_envs/CONTEXT.md) — the ant body design space: vsim physics builds, the morphology set, active/inactive DOFs, the DOF mask
 - [Control](./transformer_rl/CONTEXT.md) — the transformer policy that controls any morphology: tokenization, limb encoding, token masking, rl_games integration
 - [Training](./scripts/CONTEXT.md) — PPO training, Optuna tuning, play/render orchestration
 - [Analysis](./experiments/CONTEXT.md) — attention studies over trained policies
 
 ## Relationships
 
-- **Morphology → Control**: Morphology emits the **893-D codesign** observation (`AntCodesignEnv`, variable-length `module_lengths` + 32 DOF mask, layout from `tdims`); Control tokenizes it and reads the DOF mask to decide which limb/module tokens exist.
+- **CoDesigner → Control**: the package's `Ant` Task emits the **893-D codesign** observation (variable-length `module_lengths` + 32 DOF mask) and **publishes its layout** via `Task.obs_layout()`; Control tokenizes off that layout and reads the DOF mask to decide which limb/module tokens exist. Nothing on this side re-derives where the blocks are.
 - **Control → Training**: Control registers networks/models with rl_games under names Training selects via config `model.name` / `network.name`.
 - **Training → Analysis**: Training produces checkpoints; Analysis loads them to collect attention.
 - **Shared kernel** (below): Robot, Morphology, Limb, Module, Root, DOF, DOF mask, active/inactive, EnvironmentGroup, codesign, Task — defined once here, used identically across all contexts.
 
 ## Upstream — CoDesigner
 
-The **CoDesigner** package ([`../SoftwarePackage`](../SoftwarePackage/CONTEXT.md), installed editable as `codesigner`) owns the `Task` / `ModuleLibrary` / `Algorithm` interfaces this repo implements, and its [CONTEXT.md](../SoftwarePackage/CONTEXT.md) is the source of truth for their vocabulary. Migration in flight: our tasks (`task_envs/`) and module libraries (`task_envs/modular_libraries/`) move **into** the package; our codesign algorithm (the shared-trunk transformer + PPG agent) **stays here** and plugs in as one `Algorithm`.
+The **CoDesigner** package ([`../SoftwarePackage`](../SoftwarePackage/CONTEXT.md), installed editable as `codesigner`) owns the `Task` / `ModuleLibrary` / `Algorithm` interfaces this repo implements, and its [CONTEXT.md](../SoftwarePackage/CONTEXT.md) is the source of truth for their vocabulary. **The tasks and module libraries now live there**; this repo is a consumer. Our codesign algorithm — the shared-trunk transformer + PPG agent — **stays here** and plugs in as one `Algorithm`.
+
+A run names its library once, in the config's `env:` block. `run_training` constructs exactly one and hands it to the Task at `setup()` and to the network through `transformer_rl/runtime.py`, which exists because rl_games builds the network from a config dict and gives it no env to ask.
 
 ## Upstream — vlearn / VSim
 
