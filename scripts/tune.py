@@ -5,11 +5,15 @@ Usage: python tune.py [tune_config.yaml]
 """
 
 import json
+import os
+import random
+import re
+import signal
 import subprocess
 import sys
-import tempfile
 import threading
 import time
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -63,21 +67,38 @@ def _fmt_t(s: float) -> str:
     return f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
 
 
+class _TB:
+    """One cached EventAccumulator per trial. Building one costs ~0.34 s of directory scan;
+    Reload()ing an existing one costs ~0 s, and it picks up event files that appear later — which
+    is what makes a resumed trial's second event file readable through the same object. Constructing
+    a fresh accumulator per poll (as this did before) is what made polling look expensive at 8-wide."""
+
+    __slots__ = ("log_dir", "_ea")
+
+    def __init__(self, log_dir: Path):
+        self.log_dir = log_dir
+        self._ea = None
+
+    def series(self, metric: str) -> list[float]:
+        """The scalar series for `metric` in logging order (one point per epoch). [] until the
+        trainer has created the log dir and written its first event."""
+        if self._ea is None:
+            if not self.log_dir.exists():
+                return []
+            from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+            self._ea = EventAccumulator(str(self.log_dir))
+        try:
+            self._ea.Reload()
+        except Exception:
+            return []   # event file mid-creation or partially written this poll
+        if metric not in self._ea.Tags().get("scalars", []):
+            return []
+        return [s.value for s in self._ea.Scalars(metric)]
+
+
 def _tb_series(log_dir: Path, metric: str) -> list[float]:
-    """The scalar series for `metric` in logging order (one point per epoch). Re-reads the
-    whole (small) event file each call — safe to poll while the trainer still writes it.
-    Returns [] until the trainer has created the log dir / first event (early polls)."""
-    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-    if not log_dir.exists():
-        return []
-    ea = EventAccumulator(str(log_dir))
-    try:
-        ea.Reload()
-    except Exception:
-        return []   # dir/event file mid-creation or partially written this poll
-    if metric not in ea.Tags().get("scalars", []):
-        return []
-    return [s.value for s in ea.Scalars(metric)]
+    """One-shot read, for callers outside the poll loop (reporting)."""
+    return _TB(log_dir).series(metric)
 
 
 def _final_score(series: list[float], mode: str, window: int) -> float:
@@ -118,64 +139,236 @@ def _final_frac_score(series: list[float], params: dict, sc: dict, base_cfg: dic
     return sum(tail) / len(tail)
 
 
+# ── slot layer ────────────────────────────────────────────────────────
+# A SLOT is one unit of trial concurrency: a single pinned CUDA device running one trial process.
+# How slots are supplied is a property of the machine, not of the tuner -- the tuning server splits
+# its two cards by MIG into 8, a workstation offers one per GPU -- so everything below deals in
+# device STRINGS (what goes into CUDA_VISIBLE_DEVICES) and MIG is just one way to produce them.
+# A trial sees exactly one device and calls it cuda:0, which is why the hardcoded `cuda:0` sites in
+# train_utils/algorithm need no change. slots=1 reproduces the old serial tuner exactly.
+
+_MIG_RE = re.compile(r"UUID:\s*(MIG-[^)\s]+)")
+_GPU_RE = re.compile(r"^GPU\s+(\d+):.*UUID:\s*(GPU-[^)\s]+)")
+_EP_RE  = re.compile(r"_ep_(\d+)_")
+
+# Ordered most-specific first: an OOM often cascades into a generic CUDA error, so testing the
+# rebuild signatures first would misfile a genuine out-of-memory as a transient fault and resume it
+# forever. See docs/troubleshooting/resample_rebuild_crash.md for the rebuild signatures.
+_OOM_SIG     = ("CUDA out of memory", "torch.OutOfMemoryError", "CUDA error: out of memory")
+_REBUILD_SIG = ("Error deallocating pinned host memory", "CUDA error: invalid argument",
+                "AcceleratorError")
+
+
+class _Slot:
+    __slots__ = ("name", "device")
+
+    def __init__(self, name: str, device: str):
+        self.name   = name      # short display label for the slot table
+        self.device = device    # the CUDA_VISIBLE_DEVICES value
+
+
+def _smi(query: str) -> str:
+    """`nvidia-smi <query>` stdout, or "" if nvidia-smi is absent/fails (caller degrades)."""
+    try:
+        return subprocess.run(["nvidia-smi", *query.split()], capture_output=True,
+                              text=True, timeout=30).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _discover_devices() -> list[tuple[str, str]]:
+    """(name, device) for every schedulable device, MIG instances if the box is partitioned else
+    whole GPUs. Uses UUIDs, not indices: indices are reorderable by driver/env, UUIDs are not."""
+    out = _smi("-L")
+    devices, gpu_idx = [], -1
+    for line in out.splitlines():
+        g = _GPU_RE.match(line.strip())
+        if g:
+            gpu_idx = int(g.group(1))
+            devices.append((f"gpu{gpu_idx}", g.group(2)))
+            continue
+        m = _MIG_RE.search(line)
+        if m:                                    # indented MIG line: belongs to the GPU above it
+            devices.append((f"g{gpu_idx}m{sum(1 for n, _ in devices if n.startswith(f'g{gpu_idx}m'))}",
+                            m.group(1)))
+    migs = [d for d in devices if d[0].startswith("g") and "m" in d[0][1:]]
+    return migs if migs else [d for d in devices if d[0].startswith("gpu")]
+
+
+def _busy_devices() -> set[str]:
+    """UUIDs with a compute app on them right now. On a MIG box the driver may attribute an app to
+    the PARENT GPU rather than the instance, in which case no slot matches and nothing is skipped --
+    deliberately the safe direction: over-matching would mark all four slices of a card busy the
+    moment one is used, and leave the tuner with nothing to schedule. Unattributable apps are
+    reported by _make_slots so an operator can see the check is not biting."""
+    out = _smi("--query-compute-apps=gpu_uuid,pid --format=csv,noheader")
+    return {ln.split(",")[0].strip() for ln in out.splitlines() if ln.strip()}
+
+
+def _make_slots(spec, allow_busy: bool = False) -> list[_Slot]:
+    """spec: an explicit list of device strings (used verbatim, no idle check -- the operator's
+    override and the escape hatch if attribution misbehaves); an int N (first N idle discovered);
+    or None/"auto" (every idle discovered device). `allow_busy` keeps devices that already carry a
+    foreign compute app -- needed on a workstation, where a desktop session permanently occupies the
+    only GPU, and never wanted on the compute-only tuning server."""
+    if isinstance(spec, (list, tuple)) and spec:
+        return [_Slot(f"s{i}", str(d)) for i, d in enumerate(spec)]
+
+    found = _discover_devices()
+    if not found:
+        raise RuntimeError("no CUDA devices found via `nvidia-smi -L` (pass --slots to override)")
+    busy = set() if allow_busy else _busy_devices()
+    idle = [(n, d) for n, d in found if d not in busy]
+    stray = busy - {d for _, d in found}
+    if stray:
+        print(f"[slots] {len(stray)} compute app(s) on {', '.join(sorted(stray))} could not be "
+              f"attributed to a slot; idle-checking is not filtering them", flush=True)
+    for n, d in found:
+        if d in busy:
+            print(f"[slots] skipping busy slot {n} ({d})", flush=True)
+    if not idle:
+        raise RuntimeError(f"all {len(found)} discovered devices are busy")
+    if isinstance(spec, int) and spec > 0:
+        idle = idle[:spec]
+    return [_Slot(n, d) for n, d in idle]
+
+
+def _launch(cmd: list[str], device: str, log_path: Path, header: str):
+    """Start a trial pinned to `device`, streaming stdout+stderr to `log_path`. Own session
+    (setsid) so the scheduler can killpg the whole cohort without the signal racing its children.
+    Streams to a file rather than PIPE: the 64KB OS buffer would fill and deadlock the trainer."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    logf = open(log_path, "w")
+    logf.write(header)
+    logf.flush()
+    # Unbuffered: stdout block-buffers into a file, so a trial killed (timeout, Ctrl-C) would lose
+    # its last writes and the log would not be tailable while it runs. Tracebacks flush on their own
+    # at interpreter exit, so _classify_exit is safe either way -- this is for liveness.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES=device, PYTHONUNBUFFERED="1")
+    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True,
+                            env=env, start_new_session=True)
+    return proc, logf
+
+
+def _classify_exit(log_path: Path, tail_bytes: int = 200_000) -> str:
+    """Why a trial died: 'oom' (a real property of the hyperparameters -- score it, never relaunch),
+    'rebuild' (the known gym-teardown race -- resume from checkpoint), or 'unknown' (also resumed;
+    a config that is genuinely broken will just fail again and exhaust its attempts)."""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail_bytes))
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return "unknown"
+    if any(s in tail for s in _OOM_SIG):
+        return "oom"
+    if any(s in tail for s in _REBUILD_SIG):
+        return "rebuild"
+    return "unknown"
+
+
+def _newest_ckpt(nn_dir: Path) -> Path | None:
+    """Latest periodic checkpoint, by the `_ep_<N>_` field rather than mtime -- the filename also
+    carries a float reward, so the epoch must be matched anchored."""
+    best, best_ep = None, -1
+    for p in nn_dir.glob("last_*.pth"):
+        m = _EP_RE.search(p.name)
+        if m and int(m.group(1)) > best_ep:
+            best, best_ep = p, int(m.group(1))
+    return best
+
+
+def _purge_ckpts(nn_dir: Path, keep: int = 1) -> None:
+    """Drop all but the newest `keep` checkpoints in ONE trial's own nn/ dir. Tuning checkpoints
+    exist solely so a crashed trial can resume -- the tuner scores from TensorBoard and never reads
+    one -- so retaining every 19MB save would cost ~150GB over a full sweep. Only unlinks regular
+    files matching last_*.pth, by resolved name; never touches a directory."""
+    items = []
+    for p in nn_dir.glob("last_*.pth"):
+        m = _EP_RE.search(p.name)
+        if m:
+            items.append((int(m.group(1)), p))
+    for _, p in sorted(items, key=lambda x: x[0], reverse=True)[max(0, keep):]:
+        if p.is_file():
+            p.unlink(missing_ok=True)
+
+
 # ── state ─────────────────────────────────────────────────────────────
 
 class _Trial:
-    __slots__ = ("num", "params", "score", "status", "elapsed")
+    __slots__ = ("num", "params", "score", "status", "elapsed",
+                 "slot", "t0", "epoch", "ema", "attempt")
 
-    def __init__(self, num: int, params: dict):
+    def __init__(self, num: int, params: dict, slot: str = ""):
         self.num     = num
         self.params  = params
         self.score: float | None = None
         self.status  = "running"
         self.elapsed = 0.0
+        self.slot    = slot     # slot name it occupies (display only; "" once finished)
+        self.t0      = 0.0      # wall-clock start of the CURRENT attempt
+        self.epoch   = 0        # last epoch seen in TB (progress readout)
+        self.ema     = None     # smoothed metric, for the slot table and for pruning
+        self.attempt = 0
+
+    def elapsed_now(self) -> float:
+        return time.time() - self.t0 if self.t0 else 0.0
 
 
 class _State:
-    def __init__(self, n_trials: int, param_names: list[str]):
+    """What the TUI renders. Trials are keyed by number and several run at once, so nothing here
+    assumes a single current trial: `running` is the live set, one entry per occupied slot."""
+
+    def __init__(self, n_trials: int, param_names: list[str], slots: list[str] | None = None):
         self.n_trials   = n_trials
         self.param_names = param_names
+        self.slot_names = slots or []
         self.trials: list[_Trial] = []
-        self.current: _Trial | None = None
-        self._t0: float | None = None
+        self.running: dict[int, _Trial] = {}
         self._done_times: list[float] = []
 
-    def begin(self, num: int, params: dict):
-        t = _Trial(num, params)
-        self.trials.append(t)
-        self.current = t
-        self._t0 = time.time()
-
-    def retry(self, num: int):
+    def get(self, num: int) -> _Trial | None:
         for t in self.trials:
             if t.num == num:
-                t.status = "retrying"
-        self._t0 = time.time()
+                return t
+        return None
+
+    def begin(self, num: int, params: dict, slot: str = ""):
+        t = _Trial(num, params, slot)
+        t.t0 = time.time()
+        self.trials.append(t)
+        self.running[num] = t
+        return t
+
+    def retry(self, num: int, attempt: int, kind: str = "retrying"):
+        """A crashed trial is going round again on the same slot: `kind` distinguishes a resume
+        from checkpoint from a from-scratch retry, and the clock restarts either way."""
+        t = self.running.get(num) or self.get(num)
+        if t:
+            t.status, t.attempt, t.t0 = kind, attempt, time.time()
+            t.epoch = 0 if kind == "retrying" else t.epoch
 
     def end(self, num: int, score: float):
-        elapsed = time.time() - self._t0 if self._t0 else 0.0
-        for t in self.trials:
-            if t.num == num:
-                t.score   = score
-                t.status  = "done" if score > _NEGINF else "failed"
-                t.elapsed = elapsed
-        self._done_times.append(elapsed)
-        self.current = None
-        self._t0 = None
+        t = self.running.pop(num, None) or self.get(num)
+        if t:
+            t.score   = score
+            t.status  = "done" if score > _NEGINF else "failed"
+            t.elapsed = t.elapsed_now()
+            t.slot    = ""
+            self._done_times.append(t.elapsed)
 
     def prune(self, num: int):
-        elapsed = time.time() - self._t0 if self._t0 else 0.0
-        for t in self.trials:
-            if t.num == num:
-                t.status  = "pruned"
-                t.score   = None   # killed early -> no recovered-level score; excluded from best/worst
-                t.elapsed = elapsed
-        self._done_times.append(elapsed)
-        self.current = None
-        self._t0 = None
+        t = self.running.pop(num, None) or self.get(num)
+        if t:
+            t.status  = "pruned"
+            t.score   = None   # killed early -> no recovered-level score; excluded from best/worst
+            t.elapsed = t.elapsed_now()
+            t.slot    = ""
+            self._done_times.append(t.elapsed)
 
-    def elapsed_now(self) -> float:
-        return time.time() - self._t0 if self._t0 else 0.0
+    def by_slot(self) -> dict[str, _Trial]:
+        return {t.slot: t for t in self.running.values() if t.slot}
 
     def mean_time(self) -> float:
         return sum(self._done_times) / len(self._done_times) if self._done_times else 0.0
@@ -198,8 +391,11 @@ class _State:
         """Pre-populate from an existing study so the TUI shows prior trials on resume."""
         TS = optuna.trial.TrialState
         for t in sorted(study.trials, key=lambda x: x.number):
-            if t.state in (TS.RUNNING, TS.WAITING):
-                continue  # interrupted/stale; not a finished result
+            # FAIL is not a result: it marks a trial an interrupt killed, whose params were
+            # re-enqueued and will run again under a new number. Replaying it here would show it
+            # twice and count it against the budget the DB has already decided not to charge.
+            if t.state in (TS.RUNNING, TS.WAITING, TS.FAIL):
+                continue
             tr = _Trial(t.number, dict(t.params))
             if t.state == TS.COMPLETE and t.value is not None and t.value > _NEGINF:
                 tr.score, tr.status = t.value, "done"
@@ -233,25 +429,35 @@ def _build(state: _State, tick: int) -> Layout:
         border_style="blue",
     )
 
-    # ── current trial ──
-    cur = state.current
-    if cur:
-        pstr = "   ".join(
-            f"[cyan]{k.split('.')[-1]}[/cyan]=[yellow]{_fmt(v)}[/yellow]"
-            for k, v in cur.params.items()
+    # ── slot table ──
+    # One row per slot, always: an idle row is information (the pool is not saturated), so the
+    # table is built from the pool rather than from whatever happens to be running.
+    occ = state.by_slot()
+    slot_tbl = Table(box=box.SIMPLE_HEAD, expand=True, header_style="bold dim", show_edge=False)
+    slot_tbl.add_column("Slot",  justify="left",  width=6)
+    slot_tbl.add_column("Trial", justify="right", width=6)
+    slot_tbl.add_column("Epoch", justify="right", width=7)
+    slot_tbl.add_column("EMA",   justify="right", width=10)
+    slot_tbl.add_column("Elapsed", justify="right", width=9)
+    for name in state.slot_names:
+        t = occ.get(name)
+        if t is None:
+            slot_tbl.add_row(name, "—", "—", "—", "—", style="dim")
+            continue
+        ic = {"resuming": "⇄", "retrying": "↺"}.get(t.status, sp)
+        slot_tbl.add_row(
+            name, f"{ic} {t.num}", str(t.epoch),
+            f"{t.ema:.1f}" if t.ema is not None else "—",
+            _fmt_t(t.elapsed_now()),
+            style="magenta" if t.status in ("resuming", "retrying") else "yellow",
         )
-        ic  = "↺" if cur.status == "retrying" else sp
-        lbl = "Retrying" if cur.status == "retrying" else "Running"
-        cur_body = Text.from_markup(
-            f"[bold yellow]{ic} {lbl}[/bold yellow]   {pstr}\n\n"
-            f"  [dim]Elapsed[/dim] [white]{_fmt_t(state.elapsed_now())}[/white]"
-            f"    [dim]Mean[/dim] [white]"
-            + (_fmt_t(state.mean_time()) if state._done_times else "——")
-            + "[/white]"
-        )
-    else:
-        cur_body = Text("[dim]——[/dim]")
-    cur_panel = Panel(cur_body, title="[bold yellow]Current Trial[/bold yellow]", border_style="yellow")
+    mean_str = _fmt_t(state.mean_time()) if state._done_times else "——"
+    cur_panel = Panel(
+        slot_tbl,
+        title=f"[bold yellow]Slots[/bold yellow] [dim]({len(occ)}/{len(state.slot_names)} busy, "
+              f"mean {mean_str})[/dim]",
+        border_style="yellow",
+    )
 
     # ── all trials table ──
     tbl = Table(box=box.SIMPLE_HEAD, expand=True, header_style="bold dim", show_edge=False)
@@ -265,14 +471,17 @@ def _build(state: _State, tick: int) -> Layout:
     for t in reversed(state.trials):
         if t.score is not None and t.score > _NEGINF:
             sc_str = f"{t.score:.1f}"
-        elif t.status in ("running", "retrying"):
-            sc_str = sp if t.status == "running" else "↺"
+        elif t.status == "running":
+            sc_str = sp
+        elif t.status in ("retrying", "resuming"):
+            sc_str = "↺" if t.status == "retrying" else "⇄"
         elif t.status == "pruned":
             sc_str = "⊘"
         else:
             sc_str = "—"
 
-        if   t.status in ("running", "retrying"): row_style, icon = "yellow",       ""
+        if   t.status in ("running", "retrying", "resuming"):
+            row_style, icon = "yellow", ""
         elif t.status == "pruned":                row_style, icon = "dim magenta",  "⊘"
         elif t.status == "failed":                row_style, icon = "dim red",      "✗"
         elif best and t.num == best.num:          row_style, icon = "bold green",   "★"
@@ -337,7 +546,7 @@ def _build(state: _State, tick: int) -> Layout:
     left = Layout()
     left.split_column(
         Layout(prog,         name="progress", size=3),
-        Layout(cur_panel,    name="current",  size=6),
+        Layout(cur_panel,    name="current",  size=max(6, len(state.slot_names) + 5)),
         Layout(trials_panel, name="trials"),
     )
 
@@ -353,6 +562,179 @@ def _build(state: _State, tick: int) -> Layout:
     return layout
 
 
+def _headless_view(state: _State, stop: threading.Event, every: float = 60.0):
+    """Line logging for `--headless`. Live(screen=True) drives an alternate screen buffer and needs
+    a TTY, which a nohup'd/ssh'd sweep on the tuning box does not have. Prints one block per minute
+    and, in between, a line whenever a slot changes hands — the transitions are the part worth
+    keeping in a log file, the periodic block is just a heartbeat."""
+    last_seen: dict[str, str] = {}
+    last_block = 0.0
+    while not stop.is_set():
+        occ = state.by_slot()
+        now = {n: f"{t.num}:{t.status}" for n, t in occ.items()}
+        for name in state.slot_names:
+            was, isnow = last_seen.get(name), now.get(name)
+            if was != isnow:
+                print(f"[slot {name}] {was or 'idle'} -> {isnow or 'idle'}", flush=True)
+        last_seen = now
+
+        if time.time() - last_block >= every:
+            last_block = time.time()
+            best = state.best()
+            rows = "  ".join(
+                f"{n}=" + (f"{t.num}@{t.epoch}" + (f"/{t.ema:.0f}" if t.ema is not None else "")
+                           if (t := occ.get(n)) else "idle")
+                for n in state.slot_names
+            )
+            print(f"[tune] {state.n_done()}/{state.n_trials} done  "
+                  f"best={f'{best.score:.1f} (t{best.num})' if best else '——'}  "
+                  f"mean={_fmt_t(state.mean_time()) if state._done_times else '——'}  | {rows}",
+                  flush=True)
+        stop.wait(5.0)
+
+
+# ── winner selection ──────────────────────────────────────────────────
+
+def _topk(completed: list, k: int) -> list:
+    return sorted(completed, key=lambda t: t.value, reverse=True)[:k]
+
+
+def _median(v: list[float]) -> float:
+    s = sorted(v)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+
+def _centre_and_spread(top: list, tune_cfg: dict) -> tuple[dict, dict]:
+    """The winner as the CENTRE of the top-k cluster, plus how tight that cluster actually is.
+
+    Argmax picks the luckiest draw, and at a noise floor near the effect size that bias grows as the
+    sampler concentrates: the single best score is mostly a good seed. The per-parameter median (mode
+    for categoricals) over the top k averages that draw noise out.
+
+    The spread is not decoration — it is what says whether the centre means anything. A coordinate-
+    wise summary describes one blob; if the top-k is bimodal in a parameter the "centre" lands
+    between two clusters and assembles a config no trial ever ran. Reported per parameter as the
+    fraction of the search range the top-k covers (continuous, IQR-based) or the modal share
+    (categorical); wide spread means the parameter is undetermined, not that the centre is optimal."""
+    centre, spread = {}, {}
+    for p in tune_cfg["params"]:
+        path = p["path"]
+        vals = [t.params[path] for t in top if path in t.params]
+        if not vals:
+            continue
+        if p["type"] == "categorical":
+            counts = Counter(vals)
+            val, n = counts.most_common(1)[0]
+            centre[path] = val
+            spread[path] = (n / len(vals), f"{n}/{len(vals)} {_fmt(val)}"
+                            + (f"  (+{len(counts) - 1} other)" if len(counts) > 1 else ""))
+        else:
+            centre[path] = _median(vals)
+            if p["type"] == "int":
+                centre[path] = int(round(centre[path]))
+            lo, hi = float(p["low"]), float(p["high"])
+            s = sorted(vals)
+            q1, q3 = s[len(s) // 4], s[min(len(s) - 1, (3 * len(s)) // 4)]
+            if p.get("log", False) and lo > 0:
+                import math
+                frac = (math.log(max(q3, lo)) - math.log(max(q1, lo))) / (math.log(hi) - math.log(lo))
+            else:
+                frac = (q3 - q1) / (hi - lo) if hi > lo else 0.0
+            spread[path] = (1.0 - frac, f"IQR {_fmt(q1)}–{_fmt(q3)}  ({frac * 100:.0f}% of range)")
+    return centre, spread
+
+
+def _write_params(cfg_path: Path, base_cfg: dict, params: dict):
+    out = deepcopy(base_cfg)
+    for path, value in params.items():
+        _set(out, path.split("."), value)
+    with open(cfg_path, "w") as f:
+        yaml.dump(out, f)
+
+
+# ── noise floor ───────────────────────────────────────────────────────
+
+def _noise_metrics(tune_cfg: dict) -> list[tuple[str, int]]:
+    """(metric, tail window) pairs for the noise report. Each metric needs its OWN window: the study
+    objective is per-epoch (~2000 points, tail 100) while quality/R_mean is logged once per resample
+    window (~31 points), where a 100-point tail would silently average the entire run including
+    pretraining. Defaults cover the two metrics the codesign runs actually log."""
+    sc = tune_cfg["study"]
+    m = sc.get("noise_metrics")
+    if m:
+        return [(d["key"], int(d["window"])) for d in m]
+    return [(sc.get("metric_key", "rewards/iter"), sc.get("score_window", 100)),
+            ("quality/R_mean", 5)]
+
+
+def _cv(vals: list[float]) -> tuple[float, float, float]:
+    n = len(vals)
+    mean = sum(vals) / n
+    sd = (sum((v - mean) ** 2 for v in vals) / (n - 1)) ** 0.5 if n > 1 else 0.0
+    return mean, sd, (sd / mean if mean else float("nan"))
+
+
+def _wave_groups(study) -> dict[str, list]:
+    """Trials grouped into replicate sets — same hyperparameters, different seeds. Explicit wave
+    tags win; otherwise any params repeated across trials form a group, so a noise estimate is
+    available even from a sweep that happened to resample a point."""
+    tagged, byparams = {}, {}
+    for t in study.trials:
+        if t.state != optuna.trial.TrialState.COMPLETE or t.value is None or t.value <= _NEGINF:
+            continue
+        w = t.user_attrs.get("wave")
+        if w:
+            tagged.setdefault(w, []).append(t)
+        byparams.setdefault(tuple(sorted(t.params.items())), []).append(t)
+    if tagged:
+        return {k: v for k, v in tagged.items() if len(v) > 1}
+    return {f"replicates@{i}": v for i, v in enumerate(
+        [v for v in byparams.values() if len(v) > 1])}
+
+
+def _noise_report(study, tune_cfg: dict, output_dir: Path, c) -> None:
+    """The number every downstream decision depends on: the CV of the objective across seeds at
+    FIXED hyperparameters. If the across-hyperparameter spread of a sweep is not comfortably larger
+    than this, the sweep is ranking seeds rather than configs."""
+    from rich.table import Table
+    from rich import box as rbox
+
+    groups = _wave_groups(study)
+    if not groups:
+        return
+    metrics = _noise_metrics(tune_cfg)
+    sub = tune_cfg["study"].get("summaries_subdir", "")
+
+    tbl = Table(title="Noise floor (same config, different seeds)", box=rbox.SIMPLE_HEAD,
+                header_style="bold dim")
+    for col, j in (("Wave", "left"), ("Metric", "left"), ("n", "right"), ("Mean", "right"),
+                   ("SD", "right"), ("CV", "right"), ("± on CV", "right"), ("Scores", "left")):
+        tbl.add_column(col, justify=j)
+
+    for wave, trials in sorted(groups.items()):
+        for metric, window in metrics:
+            vals = []
+            for t in sorted(trials, key=lambda x: x.number):
+                d = output_dir / "runs" / f"tune_trial_{t.number}"
+                s = _tb_series(d / sub if sub else d, metric)
+                if s:
+                    vals.append(_final_score(s, "recovered", window))
+            if len(vals) < 2:
+                continue
+            mean, sd, cv = _cv(vals)
+            # An n-sample CV is itself an estimate: SE(CV) ~ CV/sqrt(2(n-1)). At n=8 that is ~27%
+            # of the CV, so 8 seeds fix the order of magnitude, not the value.
+            se = cv / (2 * (len(vals) - 1)) ** 0.5
+            tbl.add_row(wave, metric, str(len(vals)), f"{mean:.1f}", f"{sd:.1f}",
+                        f"{cv * 100:.0f}%", f"±{se * 100:.0f}%",
+                        " ".join(f"{v:.0f}" for v in vals))
+    if tbl.row_count:
+        c.print(tbl)
+        c.print("[dim]A sweep whose across-config spread is below its own CV is ranking seeds, "
+                "not hyperparameters.[/dim]")
+
+
 # ── results ───────────────────────────────────────────────────────────
 
 def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_dir: Path):
@@ -364,23 +746,44 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     from rich import box as rbox
 
     c = Console()
+    # OOM trials are COMPLETE with a scored 0.0 so the sampler learns to avoid that region, but they
+    # are not measurements of anything — keep them out of the winner, the top-k and the plots.
     completed = [
         t for t in study.trials
         if t.state == optuna.trial.TrialState.COMPLETE
         and t.value is not None and t.value > _NEGINF
+        and not t.user_attrs.get("failed")
     ]
+    n_oom = sum(1 for t in study.trials if t.user_attrs.get("failed") == "oom")
 
     if not completed:
         c.print("[dim]No successful trials.[/dim]")
         return
 
-    # save best_params.yaml
+    # ── winner: the centre of the top-k cluster, with the raw argmax kept alongside ──
+    k = tune_cfg["study"].get("top_k") or max(3, min(len(completed), round(len(completed) * 0.15)))
+    k = min(k, len(completed))
+    top_k = _topk(completed, k)
+    centre, spread = _centre_and_spread(top_k, tune_cfg)
     bt = study.best_trial
-    best_cfg = deepcopy(base_cfg)
-    for path, value in bt.params.items():
-        _set(best_cfg, path.split("."), value)
-    with open(output_dir / "best_params.yaml", "w") as f:
-        yaml.dump(best_cfg, f)
+
+    _write_params(output_dir / "best_params.yaml", base_cfg, centre)
+    _write_params(output_dir / "best_params_argmax.yaml", base_cfg, bt.params)
+
+    wt = Table(title=f"Winner — top-{k} centre vs argmax", box=rbox.SIMPLE_HEAD, header_style="bold dim")
+    wt.add_column("Parameter", justify="left")
+    wt.add_column(f"Centre (top-{k})", justify="right")
+    wt.add_column(f"Argmax (trial {bt.number})", justify="right")
+    wt.add_column("Top-k spread", justify="left")
+    for p in tune_cfg["params"]:
+        path = p["path"]
+        conc, desc = spread.get(path, (1.0, "—"))
+        wt.add_row(path.split(".")[-1], _fmt(centre.get(path, "—")), _fmt(bt.params.get(path, "—")),
+                   desc, style="" if conc >= 0.5 else "yellow")
+    c.print(wt)
+    c.print("[dim]best_params.yaml = centre (exported). best_params_argmax.yaml = single best trial.\n"
+            "Yellow rows are undetermined: the top-k covers most of the search range, so the centre "
+            "is a midpoint, not an optimum.[/dim]")
 
     # print top-10 table
     top = sorted(completed, key=lambda t: t.value, reverse=True)
@@ -397,6 +800,14 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
             style="bold green" if rank == 1 else "",
         )
     c.print(tbl)
+
+    # The across-config spread, to be read directly against the noise floor below it.
+    vals = [t.value for t in completed]
+    mean, sd, cv = _cv(vals)
+    c.print(f"[dim]Across-config spread: mean {mean:.1f}  SD {sd:.1f}  "
+            f"CV {cv * 100:.0f}%  over {len(completed)} trials"
+            + (f"   ({n_oom} OOM excluded)" if n_oom else "") + "[/dim]")
+    _noise_report(study, tune_cfg, output_dir, c)
     c.print(f"[dim]Output: {output_dir}/[/dim]")
 
     # plots: 2 rows (reward, time) × N params columns
@@ -485,28 +896,62 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
 
 # ── trial runner ──────────────────────────────────────────────────────
 
-def _kill(proc):
-    proc.terminate()
+def _kill(proc, grace: float = 30.0):
+    """SIGTERM the trial's whole process group, then SIGKILL whatever survives. Group-wide, not
+    proc.terminate(): a trial spawns its own children (compile workers, VSim threads) and signalling
+    only the leader leaves them alive holding the slot's GPU memory, so the next trial OOMs."""
     try:
-        proc.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        pgid = os.getpgid(proc.pid)
+    except OSError:
+        return
+    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 10.0)):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            return
+        try:
+            proc.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
 
 
-def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Path,
-         trial, attempt: int = 0) -> float:
+class _Job:
+    """One trial in flight on one slot: the process plus everything needed to score, resume or
+    kill it. Lives from the first launch to the final tell(), across any resumed attempts."""
+
+    __slots__ = ("trial", "num", "params", "seed", "slot", "proc", "logf", "cfg_path",
+                 "log_dir", "nn_dir", "t0", "attempt", "ema", "next_epoch", "tb")
+
+    def __init__(self, trial, num: int, params: dict, seed: int, slot: _Slot,
+                 cfg_path: Path, log_dir: Path, nn_dir: Path):
+        self.trial    = trial
+        self.num      = num
+        self.params   = params
+        self.seed     = seed
+        self.slot     = slot
+        self.cfg_path = cfg_path
+        self.log_dir  = log_dir
+        self.nn_dir   = nn_dir
+        self.tb       = _TB(log_dir)
+        self.proc     = None
+        self.logf     = None
+        self.t0       = 0.0
+        self.attempt  = 0
+        self.ema      = None
+        self.next_epoch = 0
+
+    def log_path(self, output_dir: Path) -> Path:
+        return output_dir / "logs" / f"trial_{self.num}_attempt{self.attempt}.log"
+
+
+def _write_trial_cfg(num: int, params: dict, seed: int, base_cfg: dict, tune_cfg: dict,
+                     output_dir: Path) -> tuple[Path, Path, Path]:
+    """Materialise this trial's config and return (cfg_path, summaries_dir, nn_dir). The config is
+    written under the study's own dir rather than to a temp file: a resumed attempt must relaunch
+    with byte-identical settings, the seed included, and a file that outlives the attempt is the
+    simplest way to guarantee that."""
     sc = tune_cfg["study"]
-    pc = tune_cfg.get("pruner", {})
-    pruning   = pc.get("enabled", False)
-    alpha     = pc.get("ema_alpha", 0.3)
-    poll_secs = pc.get("poll_seconds", 20)
-    warmup    = pc.get("n_warmup_steps", 0)
-    window    = sc.get("score_window", pc.get("score_window", 50))
-    # ADR-0009: default max objective when timing is tuned (pruning off). A study may force a
-    # final-level objective even with pruning off via study.score_mode (e.g. "final" -> mean of
-    # the last `score_window` logged points) — used for sparse per-window metrics like quality/R_mean.
-    score_mode = sc.get("score_mode", "recovered" if pruning else "max")
-
     trial_cfg = deepcopy(base_cfg)
     for path, value in params.items():
         _set(trial_cfg, path.split("."), value)
@@ -516,76 +961,236 @@ def _run(num: int, params: dict, base_cfg: dict, tune_cfg: dict, output_dir: Pat
         if isinstance(val, float) and val.is_integer():
             val = int(val)
         _set(trial_cfg, dp["path"].split("."), val)
-    exp_name_path = sc.get("experiment_name_path", "experiment.name").split(".")
-    train_dir_path = sc.get("train_dir_path", "experiment.directory").split(".")
-    _set(trial_cfg, exp_name_path, f"tune_trial_{num}")
-    _set(trial_cfg, train_dir_path, str(output_dir / "runs"))
 
-    metric = sc.get("metric_key", "Reward / Total reward (mean)")
-    summaries_subdir = sc.get("summaries_subdir", "")
-    log_dir = output_dir / "runs" / f"tune_trial_{num}"
-    if summaries_subdir:
-        log_dir = log_dir / summaries_subdir
+    # Seed goes through the CONFIG, never the trainer's --seed flag: --seed additionally forces
+    # cudnn.deterministic, CUBLAS_WORKSPACE_CONFIG and set_num_threads(1) (train_utils.py:835-851),
+    # which would make every trial slower and measure a machine the real runs never use.
+    _set(trial_cfg, sc.get("seed_path", "params.seed").split("."), seed)
 
-    log_path = output_dir / "logs" / f"trial_{num}_attempt{attempt}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    _set(trial_cfg, sc.get("experiment_name_path", "experiment.name").split("."), f"tune_trial_{num}")
+    _set(trial_cfg, sc.get("train_dir_path", "experiment.directory").split("."), str(output_dir / "runs"))
 
-    tmp = Path(tempfile.mktemp(suffix=".yaml", prefix=f"tune_{num}_"))
-    timeout = sc.get("trial_timeout_seconds", 300)
+    cfg_path = output_dir / "configs" / f"trial_{num}.yaml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(cfg_path, "w") as f:
+        yaml.dump(trial_cfg, f)
+
+    run_dir = output_dir / "runs" / f"tune_trial_{num}"
+    sub = sc.get("summaries_subdir", "")
+    return cfg_path, (run_dir / sub if sub else run_dir), run_dir / "nn"
+
+
+def _start(job: _Job, tune_cfg: dict, output_dir: Path, checkpoint: Path | None = None):
+    """Launch (or relaunch) a job's process on its slot. `checkpoint` resumes rl_games from a saved
+    state instead of starting over — the trainer takes it as the second positional argument."""
+    sc  = tune_cfg["study"]
+    cmd = [sys.executable, sc["script"]]
+    if checkpoint is not None:
+        cmd += ["train", str(checkpoint)]
+    cmd += ["--config", str(job.cfg_path)]
+    header = (f"# trial {job.num}  attempt {job.attempt}  slot {job.slot.name} ({job.slot.device})\n"
+              f"# seed {job.seed}  params: {job.params}\n"
+              + (f"# RESUMING from {checkpoint}\n" if checkpoint else "") + "\n")
+    job.proc, job.logf = _launch(cmd, job.slot.device, job.log_path(output_dir), header)
+    job.t0 = time.time()
+
+
+def _score_job(job: _Job, tune_cfg: dict, base_cfg: dict) -> float:
+    sc = tune_cfg["study"]
+    pruning = tune_cfg.get("pruner", {}).get("enabled", False)
+    # ADR-0009: default max objective when timing is tuned (pruning off). A study may force a
+    # final-level objective even with pruning off via study.score_mode (e.g. "final" -> mean of
+    # the last `score_window` logged points) — used for sparse per-window metrics like quality/R_mean.
+    mode   = sc.get("score_mode", "recovered" if pruning else "max")
+    window = sc.get("score_window", tune_cfg.get("pruner", {}).get("score_window", 50))
+    series = job.tb.series(sc.get("metric_key", "Reward / Total reward (mean)"))
+    if mode == "final_frac":
+        return _final_frac_score(series, job.params, sc, base_cfg)
+    return _final_score(series, mode, window)
+
+
+def _suggest(trial, tune_cfg: dict) -> dict:
+    params = {}
+    for p in tune_cfg["params"]:
+        path = p["path"]
+        match p["type"]:
+            case "float":
+                params[path] = trial.suggest_float(path, p["low"], p["high"], log=p.get("log", False))
+            case "int":
+                params[path] = trial.suggest_int(path, p["low"], p["high"], step=p.get("step", 1))
+            case "categorical":
+                params[path] = trial.suggest_categorical(path, p["choices"])
+    return params
+
+
+def _feasible(params: dict, tune_cfg: dict, base_cfg: dict) -> bool:
+    """Reject configs whose derived eval window can't reach the RL phase BEFORE spending any GPU
+    (the sampled params alone decide it). Expr sees each swept param by short name plus the injected
+    budget constants."""
+    sc = tune_cfg["study"]
+    fexpr = sc.get("feasibility_expr")
+    if not fexpr:
+        return True
+    cc  = base_cfg["params"]["config"]
+    fns = {p["path"].split(".")[-1]: params[p["path"]] for p in tune_cfg["params"]}
+    fns.update(max_epochs=cc["max_epochs"], horizon_length=cc["horizon_length"],
+               max_episode_length=sc.get("max_episode_length", 1000),
+               eval_min=sc.get("eval_min", 1))
+    return bool(eval(fexpr, {"__builtins__": {}}, fns))
+
+
+# ── scheduler ─────────────────────────────────────────────────────────
+
+def _schedule(study, state: _State, slots: list[_Slot], tune_cfg: dict, base_cfg: dict,
+              output_dir: Path, log_file, budget: int, rng: random.Random) -> None:
+    """The control loop. Owns the slot pool and drives Optuna by hand: ask() whenever a slot is free
+    and budget remains, launch a pinned process, poll every live trial, tell() on exit. The trials
+    run in parallel; the bookkeeping does not, so SQLite needs no concurrency story at all."""
+    TS = optuna.trial.TrialState
+    sc, pc  = tune_cfg["study"], tune_cfg.get("pruner", {})
+    pruning   = pc.get("enabled", False)
+    alpha     = pc.get("ema_alpha", 0.3)
+    poll_secs = pc.get("poll_seconds", 20)
+    warmup    = pc.get("n_warmup_steps", 0)
+    metric    = sc.get("metric_key", "Reward / Total reward (mean)")
+    timeout   = sc.get("trial_timeout_seconds", 300)
+    stagger   = sc.get("launch_stagger_seconds", 30)
+    max_att   = sc.get("max_attempts", 3)
+    keep_ck   = sc.get("keep_checkpoints", 2)
+
+    free: list[_Slot] = list(slots)
+    jobs: dict[int, _Job] = {}
+    launched, last_launch = 0, 0.0
+
+    def _record(num, params, score):
+        log_file.write(json.dumps({"trial": num, "params": params, "score": score}) + "\n")
+        log_file.flush()
+
+    def _release(job, note: str):
+        if job.logf:
+            job.logf.write(f"\n# {note}\n")
+            job.logf.close()
+            job.logf = None
+
+    def _retire(job, score: float, failed: str | None = None, note: str | None = None):
+        """Close a job out: tell Optuna, hand the slot back, and drop the trial's checkpoints —
+        they exist only to make a resume possible and this trial will never be resumed again."""
+        _release(job, note or (f"exit {job.proc.returncode}" if job.proc else "closed"))
+        if failed:
+            job.trial.set_user_attr("failed", failed)
+        study.tell(job.trial, score)
+        state.end(job.num, score)
+        _record(job.num, job.params, "oom" if failed == "oom" else score)
+        _purge_ckpts(job.nn_dir, keep=0)
+        free.append(job.slot)
+        jobs.pop(job.num, None)
+
     try:
-        with open(tmp, "w") as f:
-            yaml.dump(trial_cfg, f)
+        while launched < budget or jobs:
+            # ── fill idle slots ──
+            while free and launched < budget and time.time() - last_launch >= stagger:
+                trial = study.ask()
+                params = _suggest(trial, tune_cfg)
+                if not _feasible(params, tune_cfg, base_cfg):
+                    # No GPU spent, so no slot is taken and no stagger is owed.
+                    state.begin(trial.number, params)
+                    state.prune(trial.number)
+                    study.tell(trial, state=TS.PRUNED)
+                    _record(trial.number, params, "infeasible")
+                    launched += 1
+                    continue
+                seed = rng.randrange(1, 2 ** 31 - 1)
+                trial.set_user_attr("seed", seed)
+                slot = free.pop(0)
+                trial.set_user_attr("slot", slot.name)
+                cfg_path, log_dir, nn_dir = _write_trial_cfg(
+                    trial.number, params, seed, base_cfg, tune_cfg, output_dir)
+                job = _Job(trial, trial.number, params, seed, slot, cfg_path, log_dir, nn_dir)
+                jobs[trial.number] = job
+                state.begin(trial.number, params, slot.name)
+                _start(job, tune_cfg, output_dir)
+                launched += 1
+                last_launch = time.time()
 
-        # stdout+stderr stream straight to the log file: with PIPE the 64KB OS buffer would
-        # fill over a long run and deadlock the unread trainer.
-        logf = open(log_path, "w")
-        logf.write(f"# trial {num}  attempt {attempt}  params: {params}\n\n")
-        logf.flush()
-        proc = subprocess.Popen(
-            [sys.executable, sc["script"], "--config", str(tmp)],
-            stdout=logf, stderr=subprocess.STDOUT, text=True,
-        )
+            # ── poll live trials ──
+            for num, job in list(jobs.items()):
+                ret = job.proc.poll()
+                t   = state.running.get(num)
 
-        ema = None
-        next_epoch = 0      # first not-yet-reported epoch index (== position in the TB series)
-        timed_out = False
-        t0 = time.time()
-        while True:
-            ret = proc.poll()
-            if pruning:
-                series = _tb_series(log_dir, metric)
-                for e in range(next_epoch, len(series)):
-                    x = series[e]
-                    ema = x if ema is None else alpha * x + (1 - alpha) * ema
-                    trial.report(ema, e)
-                    if e >= warmup and trial.should_prune():
-                        _kill(proc)
-                        logf.write(f"\n# PRUNED at epoch {e} (ema={ema:.4g})\n")
-                        logf.close()
-                        raise optuna.TrialPruned()
-                next_epoch = len(series)
-            if ret is not None:
-                break
-            if time.time() - t0 > timeout:
-                timed_out = True
-                _kill(proc)
-                break
-            time.sleep(poll_secs)
+                series = job.tb.series(metric)
+                if len(series) > job.next_epoch:
+                    for e in range(job.next_epoch, len(series)):
+                        x = series[e]
+                        job.ema = x if job.ema is None else alpha * x + (1 - alpha) * job.ema
+                        if pruning:
+                            job.trial.report(job.ema, e)
+                            if e >= warmup and job.trial.should_prune():
+                                _kill(job.proc)
+                                _release(job, f"PRUNED at epoch {e} (ema={job.ema:.4g})")
+                                study.tell(job.trial, state=TS.PRUNED)
+                                state.prune(num)
+                                _record(num, job.params, "pruned")
+                                _purge_ckpts(job.nn_dir, keep=0)
+                                free.append(job.slot)
+                                jobs.pop(num, None)
+                                break
+                    job.next_epoch = len(series)
+                    if t:
+                        t.epoch, t.ema = len(series), job.ema
+                if num not in jobs:
+                    continue
+                _purge_ckpts(job.nn_dir, keep=keep_ck)
 
-        ok = (proc.returncode == 0) and not timed_out
-        logf.write(f"\n# {'TIMED OUT' if timed_out else f'exit {proc.returncode}'}\n")
-        logf.close()
+                if ret is None:
+                    if time.time() - job.t0 > timeout:
+                        # Soft cap: score the partial run rather than discard it. The timeout is a
+                        # wall-clock safety net, not a verdict on the hyperparameters.
+                        _kill(job.proc)
+                        _retire(job, _score_job(job, tune_cfg, base_cfg), note="TIMED OUT")
+                    continue
 
-        if not ok and not timed_out:
-            return _NEGINF  # real failure/crash: worst score, eligible for one retry
-        # Success OR soft-capped timeout: score on the TB log. A timed-out trial is scored on
-        # the partial run, not discarded — the timeout is a wall-clock safety net.
-        series = _tb_series(log_dir, metric)
-        if score_mode == "final_frac":
-            return _final_frac_score(series, params, sc, base_cfg)
-        return _final_score(series, score_mode, window)
-    finally:
-        tmp.unlink(missing_ok=True)
+                if ret == 0:
+                    _retire(job, _score_job(job, tune_cfg, base_cfg))
+                    continue
+
+                # ── it died: which kind of death decides whether it runs again ──
+                cause = _classify_exit(job.log_path(output_dir))
+                if cause == "oom":
+                    # A real property of these hyperparameters, not bad luck. Score it (rewards are
+                    # strictly positive, so 0.0 is below every real result and TPE is rank-based
+                    # anyway) so the sampler learns the region is unavailable, and never relaunch.
+                    _retire(job, 0.0, failed="oom")
+                    continue
+                if job.attempt + 1 >= max_att:
+                    _retire(job, _NEGINF, failed=cause)
+                    continue
+                ckpt = _newest_ckpt(job.nn_dir)
+                _release(job, f"exit {job.proc.returncode} ({cause}) -> "
+                              f"{'resume from ' + ckpt.name if ckpt else 'retry from scratch'}")
+                job.attempt += 1
+                state.retry(num, job.attempt, "resuming" if ckpt else "retrying")
+                if ckpt is None:
+                    job.next_epoch, job.ema = 0, None
+                _start(job, tune_cfg, output_dir, checkpoint=ckpt)
+
+            # Sleep only as long as nothing is owed: a free slot waiting out its stagger should
+            # not also wait out a full poll interval.
+            nap = poll_secs
+            if free and launched < budget:
+                nap = min(nap, max(1.0, stagger - (time.time() - last_launch)))
+            time.sleep(nap)
+    except (KeyboardInterrupt, SystemExit):
+        # Kill the whole cohort, then mark every in-flight trial FAIL and re-enqueue its exact
+        # params. Without the re-enqueue an interrupted trial is lost budget: it is neither a result
+        # nor a pending trial, and at 8-wide every Ctrl-C would silently drop eight of them.
+        for job in list(jobs.values()):
+            _kill(job.proc)
+            _release(job, "INTERRUPTED")
+            study.tell(job.trial, state=TS.FAIL)
+            state.end(job.num, _NEGINF)
+            if job.params:
+                study.enqueue_trial(job.params, skip_if_exists=False)
+        raise
 
 
 # ── entry point ───────────────────────────────────────────────────────
@@ -595,6 +1200,22 @@ def main():
     ap = argparse.ArgumentParser(description="Bayesian hyperparameter tuner")
     ap.add_argument("config", nargs="?", default="configs/tune_config.yaml")
     ap.add_argument("--reset", action="store_true", help="delete study DB before starting")
+    ap.add_argument("--slots", default=None,
+                    help="'auto' (every idle device), an int N (first N idle), or a comma-separated "
+                         "list of CUDA_VISIBLE_DEVICES strings used verbatim. Overrides study.slots.")
+    ap.add_argument("--allow-busy", action="store_true",
+                    help="schedule onto devices that already carry a foreign compute app "
+                         "(a workstation's desktop session); never wanted on the tuning server")
+    ap.add_argument("--headless", action="store_true",
+                    help="line logging instead of the live TUI (screen mode needs a TTY)")
+    ap.add_argument("--calibrate", type=int, metavar="N",
+                    help="calibration wave: run the anchor config at N seeds and stop, to measure "
+                         "the study's noise floor before committing budget to a sweep")
+    ap.add_argument("--confirm", type=int, metavar="N",
+                    help="confirmation wave: run the exported top-k centre at N seeds and stop, to "
+                         "test the winner rather than describe it")
+    ap.add_argument("--report", action="store_true",
+                    help="re-print results for an existing study without running anything")
     args = ap.parse_args()
 
     with open(args.config) as f:
@@ -624,8 +1245,17 @@ def main():
                 raise KeyError(f"derived_param path '{dp['path']}' not found in base config (failed at '{k}')")
             d = d[k]
 
+    # ── slot pool ──  (skipped for --report: reading a finished study needs no GPU at all)
+    slots: list[_Slot] = []
+    if not args.report:
+        spec = args.slots if args.slots is not None else sc.get("slots")
+        if isinstance(spec, str):
+            spec = None if spec == "auto" else (int(spec) if spec.isdigit() else spec.split(","))
+        slots = _make_slots(spec, allow_busy=args.allow_busy)
+        print(f"[slots] {len(slots)}: " + ", ".join(f"{s.name}={s.device}" for s in slots), flush=True)
+
     param_names = [p["path"] for p in tune_cfg["params"]]
-    state = _State(sc["n_trials"], param_names)
+    state = _State(sc["n_trials"], param_names, [s.name for s in slots])
 
     pc = tune_cfg.get("pruner", {})
     if pc.get("enabled", False) and pc.get("type", "median") == "median":
@@ -642,107 +1272,129 @@ def main():
         storage=f"sqlite:///{output_dir}/study.db",
         direction="maximize",
         load_if_exists=True,
-        sampler=optuna.samplers.TPESampler(seed=sc.get("sampler_seed", 42)),
+        # constant_liar is mandatory above one slot: in-flight trials are otherwise invisible to the
+        # sampler, which keeps proposing near-duplicates of whatever is already running.
+        sampler=optuna.samplers.TPESampler(seed=sc.get("sampler_seed", 42),
+                                           constant_liar=len(slots) > 1),
         pruner=pruner,
     )
 
-    if not args.reset and len(study.trials) >= sc["n_trials"]:
+    # Trials left RUNNING by a previous session are neither results nor pending work. Mark them FAIL
+    # and re-enqueue their params, or they would count against the budget forever.
+    TS = optuna.trial.TrialState
+    stale = [] if args.report else [t for t in study.trials if t.state == TS.RUNNING]
+    for t in stale:
+        study.tell(t.number, state=TS.FAIL)
+        if t.params:
+            study.enqueue_trial(t.params, skip_if_exists=False)
+    if stale:
+        print(f"[resume] {len(stale)} interrupted trial(s) marked FAIL and re-enqueued", flush=True)
+
+    # THE budget counts finished results only. Counting len(study.trials) (as this did) counts
+    # interrupted and re-enqueued trials too, so every Ctrl-C silently shrank the sweep — 8x worse
+    # at 8-wide, where one interrupt strands a whole cohort.
+    n_done_db = sum(1 for t in study.trials if t.state in (TS.COMPLETE, TS.PRUNED))
+    wave = args.calibrate or args.confirm
+    if args.report or (not args.reset and not wave and n_done_db >= sc["n_trials"]):
         _show_results(study, tune_cfg, base_cfg, output_dir)
         return
 
-    state.seed(study)  # show prior trials in the TUI on resume
-    n_remaining = max(0, sc["n_trials"] - len(study.trials))
+    if not wave:
+        state.seed(study)  # show prior trials in the TUI on resume; a wave shows only its own
 
-    if len(study.trials) == 0:
-        enqueue = sc.get("enqueue_trials")
-        if enqueue:
-            for t in enqueue:              # explicit anchors (fully-specified path->value dicts)
-                study.enqueue_trial(t)
+    def _defaults() -> dict:
+        d = {}
+        for p in tune_cfg["params"]:
+            v = base_cfg
+            for k in p["path"].split("."):
+                v = v[k]
+            d[p["path"]] = v
+        return d
+
+    if wave:
+        # A wave is N ordinary trials pinned to ONE point in the space, differing only by seed, run
+        # in the search study rather than a side DB so its runs stay comparable to every other trial
+        # and resume/reporting need no special case. The cost is real: N observations stacked on one
+        # coordinate skew the sampler's density model, which is why a wave is a deliberate act.
+        if args.calibrate:
+            point, tag = (sc.get("enqueue_trials") or [None])[0] or _defaults(), "calibration"
         else:
-            defaults = {}
-            for p in tune_cfg["params"]:
-                d = base_cfg
-                for k in p["path"].split("."):
-                    d = d[k]
-                defaults[p["path"]] = d
-            study.enqueue_trial(defaults)
+            done = [t for t in study.trials
+                    if t.state == TS.COMPLETE and t.value is not None and t.value > _NEGINF
+                    and not t.user_attrs.get("failed")]
+            if not done:
+                raise SystemExit("--confirm needs completed trials to take a winner from")
+            k = sc.get("top_k") or max(3, min(len(done), round(len(done) * 0.15)))
+            point, tag = _centre_and_spread(_topk(done, min(k, len(done))), tune_cfg)[0], "confirmation"
+        for _ in range(wave):
+            study.enqueue_trial(point, user_attrs={"wave": tag}, skip_if_exists=False)
+        n_remaining = wave
+        state.n_trials = wave
+        print(f"[{tag}] {wave} seeds of {point}", flush=True)
+    else:
+        n_remaining = max(0, sc["n_trials"] - n_done_db)
+        if len(study.trials) == 0:
+            enqueue = sc.get("enqueue_trials")
+            if enqueue:
+                for t in enqueue:          # explicit anchors (fully-specified path->value dicts)
+                    study.enqueue_trial(t)
+            else:
+                study.enqueue_trial(_defaults())
 
     log_file = open(output_dir / "trials.jsonl", "a")
-    tick = 0
+    # Per-trial seeds come from one study-level RNG, so the study as a whole stays reproducible
+    # while no two trials share a seed. Advanced past the results already in the DB so a resumed
+    # session does not re-issue seeds the finished trials already used.
+    rng = random.Random(sc.get("sampler_seed", 42))
+    for _ in range(n_done_db):
+        rng.randrange(1, 2 ** 31 - 1)
 
-    with Live(_build(state, tick), refresh_per_second=4, screen=True) as live:
-        stop = threading.Event()
+    stop = threading.Event()
 
-        def _updater():
-            nonlocal tick
-            while not stop.is_set():
-                live.update(_build(state, tick))
-                tick += 1
-                time.sleep(0.25)
+    # Take over BOTH stop signals so the cohort is always cleaned up, however the tuner is stopped.
+    # Two reasons the default handling is not enough: a remote sweep is stopped with `kill` (SIGTERM),
+    # which by default kills the tuner outright and leaves eight orphaned trials holding every slot;
+    # and a tuner launched in the background or under nohup inherits SIGINT as SIG_IGN, so Python
+    # never installs its KeyboardInterrupt handler and Ctrl-C/-INT is silently ignored. Installing
+    # handlers explicitly overrides the inherited disposition in both cases.
+    def _on_signal(signum, _frame):
+        raise KeyboardInterrupt(f"signal {signum}")
 
-        th = threading.Thread(target=_updater, daemon=True)
-        th.start()
+    for _sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(_sig, _on_signal)
 
-        def objective(trial):
-            params = {}
-            for p in tune_cfg["params"]:
-                path = p["path"]
-                match p["type"]:
-                    case "float":
-                        params[path] = trial.suggest_float(
-                            path, p["low"], p["high"], log=p.get("log", False)
-                        )
-                    case "int":
-                        params[path] = trial.suggest_int(
-                            path, p["low"], p["high"], step=p.get("step", 1)
-                        )
-                    case "categorical":
-                        params[path] = trial.suggest_categorical(path, p["choices"])
+    def _run_loop():
+        _schedule(study, state, slots, tune_cfg, base_cfg, output_dir, log_file, n_remaining, rng)
 
-            # Feasibility guard: reject configs whose derived eval window can't reach the RL phase
-            # BEFORE spending any GPU (the sampled params alone decide it). Expr sees each swept param
-            # by short name plus the injected budget constants; False -> prune (marked PRUNED, no retry).
-            fexpr = sc.get("feasibility_expr")
-            if fexpr:
-                cc = base_cfg["params"]["config"]
-                fns = {p["path"].split(".")[-1]: params[p["path"]] for p in tune_cfg["params"]}
-                fns.update(max_epochs=cc["max_epochs"], horizon_length=cc["horizon_length"],
-                           max_episode_length=sc.get("max_episode_length", 1000),
-                           eval_min=sc.get("eval_min", 1))
-                if not eval(fexpr, {"__builtins__": {}}, fns):
-                    state.begin(trial.number, params)
-                    state.prune(trial.number)
-                    log_file.write(json.dumps(
-                        {"trial": trial.number, "params": params, "score": "infeasible"}) + "\n")
-                    log_file.flush()
-                    raise optuna.TrialPruned()
-
-            state.begin(trial.number, params)
+    try:
+        if args.headless:
+            # Live(screen=True) needs a TTY; the tuning box is driven over ssh/nohup.
+            th = threading.Thread(target=_headless_view, args=(state, stop), daemon=True)
+            th.start()
             try:
-                score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, trial, attempt=0)
-                if score is not None and score <= _NEGINF:
-                    state.retry(trial.number)
-                    score = _run(trial.number, params, base_cfg, tune_cfg, output_dir, trial, attempt=1)
-            except optuna.TrialPruned:
-                state.prune(trial.number)
-                log_file.write(json.dumps({"trial": trial.number, "params": params, "score": "pruned"}) + "\n")
-                log_file.flush()
-                raise  # let Optuna mark the trial PRUNED (not a crash -> no retry)
-            if score is None:
-                score = _NEGINF
-            state.end(trial.number, score)
+                _run_loop()
+            finally:
+                stop.set()
+                th.join(timeout=2)
+        else:
+            tick = 0
+            with Live(_build(state, tick), refresh_per_second=4, screen=True) as live:
+                def _updater():
+                    nonlocal tick
+                    while not stop.is_set():
+                        live.update(_build(state, tick))
+                        tick += 1
+                        time.sleep(0.25)
 
-            log_file.write(json.dumps({"trial": trial.number, "params": params, "score": score}) + "\n")
-            log_file.flush()
-            return score
-
-        try:
-            study.optimize(objective, n_trials=n_remaining)
-        except KeyboardInterrupt:
-            pass
-        finally:
-            stop.set()
-            th.join()
+                th = threading.Thread(target=_updater, daemon=True)
+                th.start()
+                try:
+                    _run_loop()
+                finally:
+                    stop.set()
+                    th.join(timeout=2)
+    except KeyboardInterrupt:
+        print("\n[tune] interrupted; in-flight trials killed and re-enqueued", flush=True)
 
     log_file.close()
     _show_results(study, tune_cfg, base_cfg, output_dir)

@@ -3,8 +3,13 @@
 # coef, and the FD target variant. Objective = task reward (control), NOT quality/R_mean: FD/FK are
 # control-side auxiliaries, so the most direct "did the aux help" signal is the recovered reward.
 #
-#   run:    python scripts/tune.py            # this file is the default
-#   resume: same command (study.db);  --reset to start over
+#   calibrate: python scripts/tune.py --calibrate 8   # FIRST: anchor at 8 seeds -> noise floor
+#   run:       python scripts/tune.py                 # this file is the default
+#   resume:    same command (study.db);  --reset to start over
+#   confirm:   python scripts/tune.py --confirm 8     # LAST: the exported winner at 8 fresh seeds
+#   report:    python scripts/tune.py --report        # re-print results, no GPU needed
+# Add --headless on the tuning box (the live TUI needs a TTY). A calibration/confirmation wave runs
+# in THIS study and counts against n_trials, so raise n_trials by the wave size (ADR-0018).
 #
 # Flat 5-param space with EXPLICIT on/off booleans (fd.enabled, fk.enabled). Consequence: only ~25%
 # of sampled trials have both heads on, so the 5 enqueued anchors below pin the clean 2x2 on/off
@@ -28,7 +33,24 @@ study:
   experiment_name_path: params.config.full_experiment_name
   train_dir_path: params.config.train_dir
   summaries_subdir: summaries
-  sampler_seed: 42              # reproducible TPE (single-seed tuning)
+  sampler_seed: 42              # seeds BOTH the TPE sampler and the per-trial seed RNG (ADR-0018),
+                                # so the study is reproducible as a whole while no two trials share
+                                # a seed. Trial seeds go through params.seed, never the --seed flag.
+
+  # ── parallel scheduling (ADR-0017) ──  one trial = one process = one pinned device.
+  slots: auto                   # 'auto' (every idle device) | N (first N idle) | explicit device list.
+                                # slots=1 is exactly the old serial tuner. Override with --slots.
+  launch_stagger_seconds: 30    # keep initial scene builds from contending for pinned host memory
+  max_attempts: 3               # total launches per trial; a rebuild crash resumes from checkpoint,
+                                # an OOM never relaunches (it is a property of the hyperparameters)
+  keep_checkpoints: 2           # per trial while it runs (all deleted when it ends); 2 not 1 so a
+                                # crash mid-write cannot leave the only checkpoint truncated
+
+  # ── reporting (ADR-0018) ──
+  top_k: null                   # null -> max(3, 15% of completed); winner = centre of this cluster
+  noise_metrics:                # each needs its OWN tail window: rewards/iter is per-epoch (~2000
+    - {key: "rewards/iter",    window: 100}   # points) while R_mean is per resample window (~31),
+    - {key: "quality/R_mean",  window: 5}     # where a 100-point tail would average the whole run
   # Corner anchors (guaranteed sampled first): both-off baseline, FD-only, FK-only, both-on(latent),
   # both-on(raw). Each is fully specified so Optuna does not random-fill the irrelevant knobs.
   enqueue_trials:
