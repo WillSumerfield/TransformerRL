@@ -29,12 +29,16 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── morphology.py                 (seed body, generator designs → Morphology, body sampling)
 │   ├── runtime.py                    (the run's one ModuleLibrary + seed body + obs layout)
 │   ├── models.py                     (rl_games model/network builders)
+│   ├── algorithm.py                  (CodesignAlgorithm: the agent as a package Algorithm)
+│   ├── artifacts.py                  (the trunk's two heads as ControlPolicy/MorphologyGenerator)
 │   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
 │   └── train_utils.py
 ├── scripts/                          ← Training context
 │   ├── CONTEXT.md
 │   ├── train_ant_*.py
+│   ├── optimize_codesign.py          (the same run, driven by codesigner.optimize)
+│   ├── evaluate_codesign.py          (score a checkpoint on named bodies)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
 │   ├── ppo_ant*.yaml
@@ -67,6 +71,8 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 The **CoDesigner** package ([`../SoftwarePackage`](../SoftwarePackage/CONTEXT.md), installed editable as `codesigner`) owns the `Task` / `ModuleLibrary` / `Algorithm` interfaces this repo implements, and its [CONTEXT.md](../SoftwarePackage/CONTEXT.md) is the source of truth for their vocabulary. **The tasks and module libraries now live there**; this repo is a consumer. Our codesign algorithm — the shared-trunk transformer + PPG agent — **stays here** and plugs in as one `Algorithm`.
 
 A run names its library once, in the config's `env:` block. `run_training` constructs exactly one and hands it to the Task at `setup()` and to the network through `transformer_rl/runtime.py`, which exists because rl_games builds the network from a config dict and gives it no env to ask.
+
+**Two entry points, one agent.** `scripts/train_ant_codesign_single.py` runs the agent directly under rl_games' `Runner` — the day-to-day path, with play, video and the follow camera. `scripts/optimize_codesign.py` runs the same agent under `codesigner.optimize`, which calls `CodesignAlgorithm.run()` once per **resample window** and fires a progress tick and a checkpoint after each. Both drive `LoggingA2CAgent._train_iter`, a single copy of rl_games' `train()` reshaped as a generator, so the two paths cannot drift. `scripts/evaluate_codesign.py` scores a checkpoint on bodies you name, rebuilding the library from the checkpoint's own provenance.
 
 ## Upstream — vlearn / VSim
 
