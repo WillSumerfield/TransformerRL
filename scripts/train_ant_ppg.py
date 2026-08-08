@@ -11,14 +11,14 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+from codesigner.components.tasks import Ant
 from transformer_rl import MultiMorphLimbTransformerBuilder
 
 run_training(
     default_config="ppo_ant_ppg.yaml",
     train_dir="runs/ant_ppg",
     name="ant_ppg_transformer",
-    env_class=AntCodesignEnv,
+    env_class=Ant,
     env_name="ant-codesign-env",
     network=("multimorph_limb_transformer", MultiMorphLimbTransformerBuilder),
     model="transformer_masked_a2c_logstd",

@@ -651,19 +651,24 @@ def _attach_render_callback(env, recorder=None, switch=None) -> None:
 
 
 def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
+    """Config-free smoke path: the default library, the canonical seed body, one body per env."""
     import torch
+    import vlearn as v
+    from codesigner.components.modular_libraries import REGISTRY as ml_registry
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_envs = args.num_envs or 1
+    library = ml_registry["simple"]()
+    morphologies = [seed_body(library)] * num_envs
     env = env_class(
-        num_envs,
-        device,
+        device=device,
         rendering=True,
         raise_exception=True,
-        seed=args.seed,
+        enable_scene_query=False,
+        rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
     )
+    total = env.setup(library, num_envs, len(morphologies), morphologies, seed=args.seed)
     act_low = torch.tensor(env.action_space.low, device=device)
     act_high = torch.tensor(env.action_space.high, device=device)
-    total = getattr(env, "total_num_envs", num_envs)
     env.reset()
     recorder = None
     if video_path is not None:
@@ -672,7 +677,7 @@ def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
         # tripping env.render_finished (which would raise via raise_exception).
         recorder = _VideoRecorder(video_path, max_frames=num_episodes * max_ep, stop_env=False)
     _attach_render_callback(env, recorder)
-    from task_envs.multigroup_environment import RenderFinished
+    from codesigner.backend.simulation import RenderFinished
     try:
         while not env.render_finished:
             if recorder is not None and recorder.done:
@@ -695,6 +700,7 @@ def run_training(
     post_config_fn=None,
 ) -> None:
     import torch
+    import vlearn as v
     import gymnasium.spaces
     from argparse import ArgumentParser
     from rl_games.common import env_configurations, vecenv
@@ -713,7 +719,11 @@ def run_training(
     class VlearnEnv(IVecEnv):
         def __init__(self, config_dict, config_name, num_actors, **kwargs):
             self.envs = config_dict[config_name]["env_creator"](num_actors, **kwargs)
-            self.num_actors = num_actors
+            # The count the Task actually built, not the one asked for (D17). They agree because
+            # num_actors was snapped to a multiple of num_morphs before the Runner started; reading
+            # it back is what makes a future disagreement visible instead of misaligning rollouts.
+            self.num_actors = getattr(getattr(self.envs, "env", self.envs),
+                                      "total_num_envs", num_actors)
 
         def step(self, actions):
             return self.envs.step(actions)
@@ -860,8 +870,37 @@ def run_training(
     if post_config_fn is not None:
         post_config_fn(args, config)
 
-    # --- Minibatch adjustment ---
+    # --- The run's library, seed body, and body count ---
+    resolved_seed = args.seed if args.seed is not None else config["params"].get("seed")
+    env_cfg = dict(config.get("env", {}))
+
+    # ONE ModuleLibrary per run (D14): named once here, constructed once, handed to the Task at
+    # setup() and to the network through `runtime`. The network used to rebuild its own from a name
+    # in the network config -- two instances, free to disagree about slot count or vocabulary while
+    # every derived width still looked plausible.
+    from codesigner.components.modular_libraries import REGISTRY as ml_registry
+    library = ml_registry[env_cfg.pop("module_library", "simple")](
+        **env_cfg.pop("module_library_kwargs", {}))
+    base_morphology = seed_body(library, **env_cfg.pop("base_morphology", {}))
+    runtime.set_run(library=library, base_morphology=base_morphology)
+
+    # `num_morphs` bodies share `num_envs` envs and the division ROUNDS DOWN, so the Task can build
+    # fewer envs than asked for (D15-D17). rl_games sizes its rollout buffers from num_actors before
+    # any env exists, so the count it is handed must already be the count the Task will reach --
+    # snap it here rather than meeting the shortfall later as a shape mismatch or, worse, a rollout
+    # that silently misaligns. Default: one body per env, which is what the baseline ran.
     ppo_cfg = config["params"]["config"]
+    num_morphs = env_cfg.pop("num_morphs", None) or ppo_cfg["num_actors"]
+    snapped = (ppo_cfg["num_actors"] // num_morphs) * num_morphs
+    if snapped != ppo_cfg["num_actors"]:
+        print(f"[env] num_actors {ppo_cfg['num_actors']} -> {snapped}: "
+              f"{num_morphs} bodies x {ppo_cfg['num_actors'] // num_morphs} envs each", flush=True)
+        ppo_cfg["num_actors"] = snapped
+    if snapped < num_morphs:
+        raise ValueError(f"num_actors={ppo_cfg['num_actors']} over num_morphs={num_morphs} "
+                         "leaves no envs per body")
+
+    # --- Minibatch adjustment ---
     if "horizon_length" in ppo_cfg:
         _adjust_minibatch(ppo_cfg, ppo_cfg["num_actors"], ppo_cfg["horizon_length"])
         if "central_value_config" in ppo_cfg:
@@ -878,22 +917,12 @@ def run_training(
         args.headless = "False" if mode == "play" else "True"
     rendering = not _str_to_bool(args.headless)
 
-    resolved_seed = args.seed if args.seed is not None else config["params"].get("seed")
-    env_cfg = dict(config.get("env", {}))
-
-    # ONE ModuleLibrary per run (D14): named once here, constructed once, handed to the Task at
-    # setup() and to the network through `runtime`. The network used to rebuild its own from a name
-    # in the network config -- two instances, free to disagree about slot count or vocabulary while
-    # every derived width still looked plausible.
-    from codesigner.components.modular_libraries import REGISTRY as ml_registry
-    library = ml_registry[env_cfg.pop("module_library", "simple")](
-        **env_cfg.pop("module_library_kwargs", {}))
-    base_morphology = seed_body(library, **env_cfg.pop("base_morphology", {}))
-    runtime.set_run(library=library, base_morphology=base_morphology)
-
     env_kwargs = {
         "rendering": rendering,
         "raise_exception": rendering,
+        "enable_scene_query": False,
+        # No offset between the world frame and the scene root; every task places its own bodies.
+        "rootOffset": (v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
         **env_cfg,
     }
 
@@ -913,9 +942,16 @@ def run_training(
     def create_envs(n, **kw):
         assert torch.cuda.is_available()
         device = torch.device("cuda:0")
-        env_kwargs["num_envs"] = n
-        env_kwargs["device"] = device
-        envs = env_class(**env_kwargs)
+        envs = env_class(device=device, **env_kwargs)
+        # Two-phase (D7): __init__ takes simulation parameters, setup() takes the run -- the gym's
+        # contact buffers are sized by the env count, so no gym exists until here. Window 0 runs on
+        # the seed body in every group; the generator replaces the whole set at the first resample.
+        built = envs.setup(library, n, num_morphs, [base_morphology] * num_morphs,
+                           seed=resolved_seed)
+        # num_actors was snapped to a multiple of num_morphs above, so the round-down has nothing
+        # left to take. If that ever stops being true, rl_games' buffers are already the wrong size.
+        assert built == n, f"Task built {built} envs, rl_games is sized for {n}"
+        runtime.set_run(obs_layout=envs.obs_layout())
         if mode == "play":
             envs.inference_mode_post_init_callback()
         if switch is not None:                       # drop arch-incompatible runs (mixed-gen dirs)
@@ -1005,7 +1041,7 @@ def run_training(
             print(f"[play] Loading model from checkpoint: {checkpoint}")
         else:
             print("[play] No checkpoint provided; running with randomly initialized model")
-    from task_envs.multigroup_environment import RenderFinished
+    from codesigner.backend.simulation import RenderFinished
     try:
         runner.run(run_args)
     except RenderFinished:
