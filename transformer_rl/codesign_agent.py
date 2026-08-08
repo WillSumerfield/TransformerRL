@@ -26,14 +26,15 @@ from rl_games.algos_torch import torch_ext
 from rl_games.common.a2c_common import swap_and_flatten01
 from rl_games.common.schedulers import RLScheduler, AdaptiveScheduler
 
-from codesigner.components.interfaces import ModuleType
+from codesigner.interfaces import ModuleType
 
+from . import runtime
+from .morphology import designs_from_arrays
 from .vocab import GEN_EFF, GEN_CAP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
 from experiments.diversity_p5 import population_to_repr, redundancy, rao_blackwell_h_body
 
-_N_LIMBS = 8                                 # obs mask offset / n_dof derive from the net's tdims
 # embedding-like matrices excluded from weight decay despite being nn.Linear (3b, grill 2026-07-15):
 # pos_emb/depth_emb are nn.Embedding tables; embed_module/embed_root are content projections treated
 # the same way (their weight rows behave like per-token/per-slot embeddings, not a generic FFN map).
@@ -103,19 +104,20 @@ class CodesignAgent(LoggingA2CAgent):
         # of up to _max_len modules.
         self._n_dof = net.tdims['n_modules']
         self._mask_off = net.tdims['mask_off']
+        self._n_limbs = net.n_limbs            # attachment slots, the library's (D14)
         self._n_sub = net.n_sub                # subtype index width, the library's (D14)
         self._max_len = net.max_limb_length
         self._max_eff = net.max_effectors      # max_len-1: the deepest slot is grammar-forced to a cap
 
         env = self._env()
         assert env is not None, "CodesignAgent requires a live codesign env (module_library/base body)"
-        self._ml = env.module_library
+        self._ml = env.module_library          # the run's ONE library, carried by the Task (D14)
         # Per-type subtype name tuples, derived once from the ModuleLibrary's public modules API
         # (self._ml.names) rather than hardcoded per-type constants -- cached here since
         # _frontier_rollout (hot path) needs the plain ints, not a name lookup per call. "swing"/
-        # "knee"/"bare" are OUR choice of canonical/fallback body (matches env.base_morphology's own
-        # literal vocabulary, e.g. AntCodesignEnv._BASE_MORPHOLOGY), not something the library hands
-        # out -- ModuleLibrary has no concept of "canonical", only the type vocabulary itself.
+        # "knee"/"bare" are OUR choice of canonical/fallback body (matches the seed body's own
+        # literal vocabulary, transformer_rl.morphology.CANONICAL_*), not something the library
+        # hands out -- ModuleLibrary has no concept of "canonical", only the type vocabulary.
         self._eff_names = self._ml.names(ModuleType.EFFECTOR)
         self._cap_names = self._ml.names(ModuleType.CAP)
         self._eff_swing = self._eff_names.index("swing")
@@ -137,11 +139,14 @@ class CodesignAgent(LoggingA2CAgent):
         self._prob_invalid = float(cd.get('prob_invalid', 0.1))    # keep an UNSTABLE body w.p. this
         # sigma solved from q = P(round(N(0,sigma)) == 0) = erf(0.5/(sigma*sqrt2))
         self._len_sigma = 0.5 / (math.sqrt(2) * torch.erfinv(torch.tensor(self._len_keep)).item())
-        bset = set(env.base_morphology.limbs)
-        # base morph = base_legs @ count-2 (1 swing + 1 knee). Per-token flip noise around this target
-        # length gives P(limb differs by +-1 token)=flip, +-2=flip^2, ... (presence + length unified).
+        # The seed body is the algorithm's, not the Task's -- the Task takes bodies, it does not
+        # keep a canonical one -- so it comes from the run record. Slots are 0-based on both sides.
+        bset = set(runtime.base_morphology().occupied_slots)
+        # seed morph = those slots @ count-2 (1 swing + 1 knee). Per-token flip noise around this
+        # target length gives P(limb differs by +-1 token)=flip, +-2=flip^2, ... (presence + length
+        # unified).
         self._base_target = torch.tensor(
-            [2 if (i + 1) in bset else 0 for i in range(_N_LIMBS)], dtype=torch.long, device=dev)
+            [2 if i in bset else 0 for i in range(self._n_limbs)], dtype=torch.long, device=dev)
         self._base_counts = self._base_target.clone()      # window-0 realized body == base target
         assert int(self._base_target.max()) <= self._max_eff, \
             f"base target exceeds max effectors/limb ({self._max_eff})"
@@ -182,8 +187,8 @@ class CodesignAgent(LoggingA2CAgent):
 
         # window state: window 0 is the env's base build, so _cur_counts = base everywhere.
         # window 0 is the env's canonical base build: base counts, canonical types, bare caps.
-        self._cur_counts = self._base_counts.view(1, _N_LIMBS).expand(N, _N_LIMBS).clone()
-        self._cur_eff = torch.full((N, _N_LIMBS, self._max_len), -1, dtype=torch.long, device=dev)
+        self._cur_counts = self._base_counts.view(1, self._n_limbs).expand(N, self._n_limbs).clone()
+        self._cur_eff = torch.full((N, self._n_limbs, self._max_len), -1, dtype=torch.long, device=dev)
         for d in range(self._max_len):
             self._cur_eff[:, :, d] = torch.where(
                 self._cur_counts > d, self._eff_swing if d == 0 else self._eff_knee, -1)
@@ -452,7 +457,7 @@ class CodesignAgent(LoggingA2CAgent):
         pres = counts > 0
         ok = (pres.sum(1) >= 3) & ((counts >= 2).sum(1) >= 2)
         pad = torch.cat([pres, pres], 1)                              # wrap the ring
-        for r in range(_N_LIMBS):
+        for r in range(self._n_limbs):
             ok &= (pad[:, r] | pad[:, r + 1] | pad[:, r + 2])
         return ok
 
@@ -469,16 +474,16 @@ class CodesignAgent(LoggingA2CAgent):
         Unstable draws are rejected and resampled, except kept w.p. prob_invalid -- so GenCrit still
         sees some bad bodies (that is how it learns 'bad' without an oracle)."""
         dev = self._base_target.device
-        ar = torch.arange(_N_LIMBS, device=dev)
-        out = torch.zeros(N, _N_LIMBS, dtype=torch.long, device=dev)
+        ar = torch.arange(self._n_limbs, device=dev)
+        out = torch.zeros(N, self._n_limbs, dtype=torch.long, device=dev)
         filled = 0
         while filled < N:
             m = max(N, 2 * (N - filled))                              # over-draw; rejection is cheap
-            own = torch.rand(m, _N_LIMBS, device=dev) < self._copy_prob
-            other = torch.randint(0, _N_LIMBS - 1, (m, _N_LIMBS), device=dev)
+            own = torch.rand(m, self._n_limbs, device=dev) < self._copy_prob
+            other = torch.randint(0, self._n_limbs - 1, (m, self._n_limbs), device=dev)
             other = other + (other >= ar).long()                      # uniform over the OTHER slots
             tmpl = self._base_target[torch.where(own, ar.expand(m, -1), other)]
-            off = torch.round(torch.randn(m, _N_LIMBS, device=dev) * self._len_sigma).long()
+            off = torch.round(torch.randn(m, self._n_limbs, device=dev) * self._len_sigma).long()
             c = torch.where(tmpl > 0, (tmpl + off).clamp(0, self._max_eff), torch.zeros_like(tmpl))
             c[c.sum(1) == 0, 0] = 2                                   # >=1-limb guard
             keep = c[self._is_stable(c) | (torch.rand(m, device=dev) < self._prob_invalid)]
@@ -495,7 +500,7 @@ class CodesignAgent(LoggingA2CAgent):
         always come from the type-flip knob."""
         if self._teacher == 'parts':
             return self._frontier_rollout(self._draw_parts_counts(N), 0.0, self._type_flip)
-        return self._frontier_rollout(self._base_target.view(1, _N_LIMBS).expand(N, _N_LIMBS),
+        return self._frontier_rollout(self._base_target.view(1, self._n_limbs).expand(N, self._n_limbs),
                                       self._flip, self._type_flip)
 
     # ---- accumulate true episode returns (R_i, gamma=1) over the window ----------------
@@ -690,8 +695,8 @@ class CodesignAgent(LoggingA2CAgent):
     def _slot_marginal(self, raw_adv, slots, cat_a, valid):
         """Per-limb marginal value of adding an EFFECTOR, over valid steps only."""
         on = (cat_a == GEN_EFF) & valid
-        marg = torch.full((_N_LIMBS,), float('nan'), device=raw_adv.device)
-        for k in range(_N_LIMBS):
+        marg = torch.full((self._n_limbs,), float('nan'), device=raw_adv.device)
+        for k in range(self._n_limbs):
             m = on & (slots == k)
             if m.any():
                 marg[k] = raw_adv[m].mean()
@@ -794,12 +799,12 @@ class CodesignAgent(LoggingA2CAgent):
             trace['counts'].long(), trace['eff_sub'], trace['cap_sub'])
         self._cur_trace = trace
         self._cur_counts, self._cur_eff, self._cur_cap = counts, eff_sub, cap_sub
-        env.set_next(counts, eff_sub, cap_sub)
+        morphs = designs_from_arrays(self._ml, counts, eff_sub, cap_sub)
         print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
               f"limbcount={(counts > 0).sum(1).float().mean().item():.2f} "
               f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
-        env.resample()
+        env.resample(morphs)
         self.obs = self.env_reset()
         self.current_rewards.zero_(); self.current_lengths.zero_()
         # reset R_i accumulators for the new window
@@ -839,8 +844,8 @@ class CodesignAgent(LoggingA2CAgent):
 
         # --- build/: the body the generator produces (realized = built body, counts) ---
         rate = (self._cur_counts > 0).float().mean(0)      # per-limb realized presence rate
-        for i in range(_N_LIMBS):
-            w.add_scalar(f'build/p/{_LIMB_CODE[i + 1]}', rate[i].item(), frame)
+        for i in range(self._n_limbs):
+            w.add_scalar(f'build/p/{_LIMB_CODE[i]}', rate[i].item(), frame)
         w.add_scalar('build/limbcount_realized', (self._cur_counts > 0).sum(1).float().mean().item(), frame)
         w.add_scalar('build/modulecount_realized', self._cur_counts.sum(1).float().mean().item(), frame)
         if self._base_draw is not None:                    # pretrain only: the around-base draws
@@ -866,10 +871,10 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('gen/grad_norm', g['gn'], frame)
         w.add_scalar('gen/fraction', self._gen_fraction(), frame)
         if 'marg' in g:                                    # per-limb marginal value (RL phase only)
-            for i in range(_N_LIMBS):
+            for i in range(self._n_limbs):
                 m = g['marg'][i].item()
                 if m == m:                                 # skip NaN slots (no `on` this window)
-                    w.add_scalar(f'gen/marg/{_LIMB_CODE[i + 1]}', m, frame)
+                    w.add_scalar(f'gen/marg/{_LIMB_CODE[i]}', m, frame)
 
         # --- gencrit/: GenCrit/V1.0 value-head fit (scale-free: MSE / Var(R)) ---
         rvar = max(g['R_var'], 1e-8)
@@ -917,8 +922,8 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('build/body_diversity', red['N_body'], frame)
         sumH = red['H_within_sum']
         w.add_scalar('build/body_structure', red['C_nats'] / sumH if sumH > 1e-9 else 0.0, frame)
-        for i in range(_N_LIMBS):
-            w.add_scalar(f'build/limb_diversity/{_LIMB_CODE[i + 1]}', float(red['N_limb'][i]), frame)
+        for i in range(self._n_limbs):
+            w.add_scalar(f'build/limb_diversity/{_LIMB_CODE[i]}', float(red['N_limb'][i]), frame)
 
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):

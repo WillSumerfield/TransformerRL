@@ -15,6 +15,7 @@ Registered globally over 'a2c_continuous' in train_utils, so every continuous PP
 run (transformer or MLP) gets these. Metrics are generic; nothing transformer-specific.
 """
 import contextlib
+import random
 import time
 
 import torch
@@ -24,16 +25,18 @@ from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
 
+from .morphology import sample_bodies
 
-# Limb slot (1-8 at (n-1)*45 deg) -> compass code, relative to forward = +X (the reward axis),
-# right = -Z, slot number increasing clockwise toward the right. See architectures/build_vsim.
-_LIMB_CODE = {1: "F", 2: "FR", 3: "R", 4: "BR", 5: "B", 6: "BL", 7: "L", 8: "FL"}
+
+# Attachment slot (0-7 at i*45 deg) -> compass code, relative to forward = +X (the reward axis),
+# right = -Z, slot number increasing clockwise toward the right. 0-BASED, matching Morphology.
+_LIMB_CODE = {0: "F", 1: "FR", 2: "R", 3: "BR", 4: "B", 5: "BL", 6: "L", 7: "FL"}
 _LEADERBOARD_EVERY = 50  # epochs
 _LEADERBOARD_K = 5       # top-k and bottom-k
 
 
 def _morph_label(limbs) -> str:
-    """frozenset/list of limb slots -> compass-coded label, e.g. {2,4,6,8} -> 'FR.BR.BL.FL'."""
+    """frozenset/list of 0-based slots -> compass-coded label, e.g. {1,3,5,7} -> 'FR·BR·BL·FL'."""
     return "·".join(_LIMB_CODE[n] for n in sorted(limbs))
 
 
@@ -47,6 +50,9 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
         self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
+        # Own stream for the body draw, seeded off the global one the Task seeded at setup, so a
+        # run's resample sequence is reproducible without plumbing the seed down here.
+        self._morph_rng = random.Random(random.randrange(2 ** 32))
         # opt-in synced phase timing (config.timing); shared with PPGAgent. Off -> stock path.
         self._timing = self.config.get('timing', False)
         self._timings = {}
@@ -198,7 +204,10 @@ class LoggingA2CAgent(A2CAgent):
         if self._steps_since_resample < interval * env.max_episode_length:
             return
         print(f"[resample] new morphology set (every {interval} episodes)", flush=True)
-        env.resample()
+        # The Task no longer draws bodies -- it is handed them (D10c), so the draw is the agent's.
+        # This agent has no generator, so it draws random stable topologies; CodesignAgent overrides
+        # this whole method and supplies its generator's designs instead.
+        env.resample(sample_bodies(env.module_library, env.n_morphs, self._morph_rng))
         self.obs = self.env_reset()             # rebuilt env -> refresh stale rollout-start obs
         self.current_rewards.zero_()            # the hard reset ends all episodes; drop partials
         self.current_lengths.zero_()
@@ -303,7 +312,7 @@ class LoggingA2CAgent(A2CAgent):
         epoch_num = int(args[1]) if len(args) > 1 else kwargs.get('epoch_num', 0)
         self._log_morph_stats(w, frame, epoch_num)
 
-    # ---- per-morphology performance (multi-morph AntCodesignEnv only) -------------
+    # ---- per-morphology performance (multi-morph codesign Tasks only) ------------
 
     def _morph_metadata(self):
         """Detect a multi-morph env and cache per-morph layout/labels. Returns dict or False."""
@@ -313,7 +322,8 @@ class LoggingA2CAgent(A2CAgent):
         if env is None or not hasattr(env, 'envs_per_morph') or not hasattr(env, 'groups'):
             self._morph_meta = False
             return False
-        morphs = [sorted(g['morph'].limbs) for g in env.groups]
+        # occupied_slots, not the pre-migration `limbs`: 0-based now (see Morphology).
+        morphs = [list(g['morph'].occupied_slots) for g in env.groups]
         by_limbs: dict[int, list[int]] = {}
         for i, m in enumerate(morphs):
             by_limbs.setdefault(len(m), []).append(i)

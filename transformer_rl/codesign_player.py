@@ -6,6 +6,7 @@ checkpoint's net has no codesign generator. See codesign_agent.py."""
 import torch
 from rl_games.algos_torch.players import PpoPlayerContinuous
 
+from .morphology import designs_from_arrays
 from .policy_switch import SwitchMixin
 
 
@@ -23,7 +24,7 @@ class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
 
     def _env(self):
         base = getattr(self.env, 'envs', self.env)     # VlearnEnv -> NewToOldAPI
-        return getattr(base, 'env', base)              # -> AntCodesignEnv
+        return getattr(base, 'env', base)              # -> the codesigner Task
 
     @torch.no_grad()
     def env_reset(self, env):
@@ -31,8 +32,8 @@ class CodesignPlayer(SwitchMixin, PpoPlayerContinuous):
         if self._gen:
             tr = self.model.a2c_network.net.sample(e.total_num_envs)
             counts = tr['counts'].long()
-            e.set_next(counts, tr['eff_sub'], tr['cap_sub'])
-            e.resample()                               # full rebuild to the sampled bodies
+            morphs = designs_from_arrays(e.module_library, counts, tr['eff_sub'], tr['cap_sub'])
+            e.resample(morphs)                         # full rebuild to the sampled bodies
             print(f"[codesign-play] sampled bodies: mean #limbs="
                   f"{(counts > 0).sum(1).float().mean().item():.2f} "
                   f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
