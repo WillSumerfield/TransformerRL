@@ -93,13 +93,11 @@ def tokenize_8(obs):
 # where the bytes are, and this file owns only what they become. The block offsets are read
 # individually rather than walked from a base, so the root block widening for a world-mounted task
 # moves everything downstream correctly instead of silently shearing the module blocks.
-ROOT_DIM_P2 = 13   # free-floating root: y(1) + rot6d(6) + linvel(3) + angvel(3); layout["root_dim"]
-                   # is authoritative and is wider when the task mounts its root on actuated axes.
 # per-module dynamic obs blocks, in token-content order: (layout offset key, width). cfrc is NOT
 # here — it rides the shared per-limb sensor block, routed to each limb's contact module below.
+# Widths sum to 19; the token adds cfrc(6) on top, hence MODULE_DIM below.
 _MOD_BLOCKS = (("sin_off", 1), ("cos_off", 1), ("vel_off", 1), ("act_off", 1),
                ("relpos_off", 3), ("relrot_off", 6), ("relvel_off", 6))
-MODULE_DYN = 19   # sum of _MOD_BLOCKS widths — per-module obs dims (excludes terminal cfrc)
 MODULE_DIM = 25   # token content: sin, cos, vel, act, cfrc(6), relpos(3), relrot6d(6), relvel(6)
 
 
