@@ -15,15 +15,19 @@ Registered globally over 'a2c_continuous' in train_utils, so every continuous PP
 run (transformer or MLP) gets these. Metrics are generic; nothing transformer-specific.
 """
 import contextlib
+import os
 import random
 import time
 
+import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 
 from rl_games.common import a2c_common
 from rl_games.algos_torch import torch_ext
 from rl_games.algos_torch.a2c_continuous import A2CAgent
+
+from codesigner.progress import Progress
 
 from .morphology import sample_bodies
 
@@ -50,6 +54,10 @@ class LoggingA2CAgent(A2CAgent):
         self._adv_std: float | None = None
         self._morph_meta = None  # None=undetected, False=single-morph, dict=multi-morph metadata
         self._steps_since_resample = 0  # env-steps since last morphology resample (full ant only)
+        self._resample_count = 0        # rebuilds performed; bounds one Algorithm.run() (_run_unit)
+        self._train_finished = False    # set by _train_iter at exit, read by Algorithm.is_finished
+        self._on_iteration = None       # package iteration tick (D26); set by CodesignAlgorithm
+        self._defer_train = False       # True -> train() returns without looping (see train())
         # Own stream for the body draw, seeded off the global one the Task seeded at setup, so a
         # run's resample sequence is reproducible without plumbing the seed down here.
         self._morph_rng = random.Random(random.randrange(2 ** 32))
@@ -190,6 +198,169 @@ class LoggingA2CAgent(A2CAgent):
         return (batch_dict['step_time'], play_time, update_time, total_time,
                 a_losses, c_losses, b_losses, entropies, kls, last_lr, lr_mul)
 
+    # ---- the training loop, as a generator (package Phase 8) -------------------------
+    # rl_games' train() is one monolithic loop, so an outer driver that wants control back
+    # periodically -- codesigner.optimize, which fires a progress tick and checkpoints after every
+    # Algorithm.run() -- has nowhere to take it. This is that loop, copied once and reshaped to
+    # yield at each resample boundary. train() below just drains it, so the script entry point is
+    # behaviourally unchanged and neither path can drift from the other.
+
+    def _run_unit(self) -> int:
+        """The counter whose increments bound one `Algorithm.run()`. Resamples performed, i.e. the
+        rebuild boundary -- already a synchronization point, and where a crash costs the most (D24).
+        A run with resampling off never increments it, so `run()` is then the whole of training,
+        which is the right degenerate answer rather than a special case."""
+        return self._resample_count
+
+    def _train_iter(self):
+        """`ContinuousA2CBase.train()`, yielding `(mean_rewards, epoch_num)` at every resample boundary
+        and once more when training exits.
+
+        The yielded reward is the CURRENT mean episode return, not `last_mean_rewards` -- that one
+        is rl_games' best-ever, and it stays pinned at its -1e9 sentinel until `save_best_after`, so
+        a driver tracking progress from it would see nothing for the first hundreds of epochs.
+
+        A faithful copy but for the yields and one simplification: multi-GPU is dropped (asserted
+        against) rather than carried, since every path in this repo is single-GPU and the broadcast
+        bookkeeping is the bulk of what would be copied. Note in particular that `frame` is read
+        BEFORE `self.frame` is advanced -- the continuous loop differs from the discrete one there,
+        and every scalar logged against `frame` would shift by one epoch if this were "tidied".
+        Keep it aligned with rl_games on upgrade.
+        """
+        assert not self.multi_gpu, "single-GPU only; see rl_games train() for the broadcast path"
+        self.init_tensors()
+        self.last_mean_rewards = -1000000000
+        start_time = time.perf_counter()
+        total_time = 0
+        rep_count = 0                                        # noqa: F841 (parity with rl_games)
+        self.obs = self.env_reset()
+        self.curr_frames = self.batch_size_envs
+        last_unit = self._run_unit()
+
+        while True:
+            epoch_num = self.update_epoch()
+            (step_time, play_time, update_time, sum_time, a_losses, c_losses, b_losses, entropies,
+             kls, last_lr, lr_mul) = self.train_epoch()
+            total_time += sum_time
+            frame = self.frame // self.num_agents
+
+            self.dataset.update_values_dict(None)            # cleaning memory to optimize space
+            should_exit = False
+
+            self.diagnostics.epoch(self, current_epoch=epoch_num)
+            scaled_time = self.num_agents * sum_time
+            scaled_play_time = self.num_agents * play_time
+            curr_frames = self.curr_frames
+            self.frame += curr_frames
+
+            a2c_common.print_statistics(self.print_stats, curr_frames, step_time, scaled_play_time,
+                                        scaled_time, epoch_num, self.max_epochs, frame,
+                                        self.max_frames)
+            self.write_stats(total_time, epoch_num, step_time, play_time, update_time,
+                             a_losses, c_losses, entropies, kls, last_lr, lr_mul, frame,
+                             scaled_time, scaled_play_time, curr_frames)
+
+            if len(b_losses) > 0:
+                self.writer.add_scalar('losses/bounds_loss',
+                                       torch_ext.mean_list(b_losses).item(), frame)
+
+            # Iteration tick (D26): the epoch is this algorithm's inner cadence -- far finer than
+            # the window that bounds a run(). Best-effort by contract, so an unattached driver
+            # costs nothing. Reward is withheld until an episode has actually completed, rather
+            # than reported as rl_games' -1e9 sentinel.
+            if self._on_iteration is not None:
+                have_reward = self.game_rewards.current_size > 0
+                self._on_iteration(Progress(
+                    step=epoch_num,
+                    reward=float(self.game_rewards.get_mean()[0]) if have_reward else None,
+                    wall_time=time.perf_counter() - start_time))
+
+            if self.game_rewards.current_size > 0:
+                mean_rewards = self.game_rewards.get_mean()
+                mean_shaped_rewards = self.game_shaped_rewards.get_mean()
+                mean_lengths = self.game_lengths.get_mean()
+                self.mean_rewards = mean_rewards[0]
+
+                for i in range(self.value_size):
+                    rewards_name = 'rewards' if i == 0 else 'rewards{0}'.format(i)
+                    self.writer.add_scalar(rewards_name + '/step', mean_rewards[i], frame)
+                    self.writer.add_scalar(rewards_name + '/iter', mean_rewards[i], epoch_num)
+                    self.writer.add_scalar(rewards_name + '/time', mean_rewards[i], total_time)
+                    self.writer.add_scalar('shaped_' + rewards_name + '/step',
+                                           mean_shaped_rewards[i], frame)
+                    self.writer.add_scalar('shaped_' + rewards_name + '/iter',
+                                           mean_shaped_rewards[i], epoch_num)
+                    self.writer.add_scalar('shaped_' + rewards_name + '/time',
+                                           mean_shaped_rewards[i], total_time)
+
+                self.writer.add_scalar('episode_lengths/step', mean_lengths, frame)
+                self.writer.add_scalar('episode_lengths/iter', mean_lengths, epoch_num)
+                self.writer.add_scalar('episode_lengths/time', mean_lengths, total_time)
+
+                if self.has_self_play_config:
+                    self.self_play_manager.update(self)
+
+                checkpoint_name = (self.config['name'] + '_ep_' + str(epoch_num) + '_rew_'
+                                   + str(mean_rewards[0]))
+
+                if self.save_freq > 0 and epoch_num % self.save_freq == 0:
+                    self.save(os.path.join(self.nn_dir, 'last_' + checkpoint_name))
+
+                if mean_rewards[0] > self.last_mean_rewards and epoch_num >= self.save_best_after:
+                    print('saving next best rewards: ', mean_rewards)
+                    self.last_mean_rewards = mean_rewards[0]
+                    self.save(os.path.join(self.nn_dir, self.config['name']))
+
+                    if 'score_to_win' in self.config and \
+                            self.last_mean_rewards > self.config['score_to_win']:
+                        print('Maximum reward achieved. Network won!')
+                        self.save(os.path.join(self.nn_dir, checkpoint_name))
+                        should_exit = True
+
+            if epoch_num >= self.max_epochs and self.max_epochs != -1:
+                if self.game_rewards.current_size == 0:
+                    print('WARNING: Max epochs reached before any env terminated at least once')
+                    mean_rewards = -np.inf
+                self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_ep_'
+                                       + str(epoch_num) + '_rew_'
+                                       + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                print('MAX EPOCHS NUM!')
+                should_exit = True
+
+            if self.frame >= self.max_frames and self.max_frames != -1:
+                if self.game_rewards.current_size == 0:
+                    print('WARNING: Max frames reached before any env terminated at least once')
+                    mean_rewards = -np.inf
+                self.save(os.path.join(self.nn_dir, 'last_' + self.config['name'] + '_frame_'
+                                       + str(self.frame) + '_rew_'
+                                       + str(mean_rewards).replace('[', '_').replace(']', '_')))
+                print('MAX FRAMES NUM!')
+                should_exit = True
+
+            update_time = 0                                  # noqa: F841 (parity with rl_games)
+
+            if should_exit:
+                self._train_finished = True
+                yield self.mean_rewards, epoch_num
+                return
+            # A window closed during this epoch -- hand control back to whatever is driving.
+            if self._run_unit() != last_unit:
+                last_unit = self._run_unit()
+                yield self.mean_rewards, epoch_num
+    def train(self):
+        """rl_games' entry point: drain the generator. Same loop, same result.
+
+        `_defer_train` makes this a no-op, which is how `CodesignAlgorithm` gets a fully
+        constructed, restored and compiled agent out of `Runner.run_train` without training it --
+        it then drives `_train_iter` a window at a time.
+        """
+        if self._defer_train:
+            return None
+        result = None
+        for result in self._train_iter():
+            pass
+        return result
+
     def _maybe_resample(self):
         """Every resample_interval episodes, draw a fresh morphology set (full gym rebuild) and
         refresh the agent's cached obs. No-op unless the env samples morphologies and the knob is set.
@@ -213,6 +384,7 @@ class LoggingA2CAgent(A2CAgent):
         self.current_lengths.zero_()
         self._morph_meta = None                 # morphs changed -> re-detect per-morph logging labels
         self._steps_since_resample = 0
+        self._resample_count += 1
 
     # ---- raw advantage scale logging (health/adv_*) ---------------------------------
 

@@ -239,6 +239,12 @@ class CodesignAgent(LoggingA2CAgent):
     def _net(self):
         return self.model.a2c_network.net
 
+    def _run_unit(self) -> int:
+        """One `Algorithm.run()` == one generator window. `_gen_window` already counts exactly the
+        resamples the base class's `_resample_count` would, and it is the counter every generator
+        phase decision reads, so there is no second one to keep in step."""
+        return self._gen_window
+
     def prepare_dataset(self, batch_dict):
         # Build the shuffled minibatch dataset as usual, then (FD only) inject the per-sample
         # next_obs + valid so calc_gradients can supervise the (obs[t] -> obs[t+1]) transition.
