@@ -11,8 +11,9 @@ from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_dims, lim
                        ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM, ROOT_DIM_P2)
 from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
                     GEN_EFF, GEN_CAP, N_GEN_CAT, N_SUB)
-from task_envs.modular_libraries import REGISTRY as _ML_REGISTRY
-from codesigner.components.interfaces import ModuleType
+from codesigner.interfaces import ModuleType
+
+from . import runtime
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
@@ -136,7 +137,6 @@ class _CustomEncoder(nn.Module):
 class LimbTransformer(nn.Module):
     def __init__(
         self,
-        n_limbs: int = 4,
         d_model: int = 128,
         n_heads: int = 8,
         n_layers: int = 1,
@@ -147,25 +147,29 @@ class LimbTransformer(nn.Module):
         policy_head: bool = True,
         value_head: bool = True,
         codesign_tokens: bool = False,
-        max_limb_length: int = 1,
         fd_variant: str = 'raw',
         use_rope: bool = False,
         reg_mode: str = 'none',
         dropout: float = 0.1,
-        module_library: str = 'simple',
-        module_library_kwargs: dict = None,
     ):
         super().__init__()
         if use_rope and not codesign_tokens:
             raise ValueError("use_rope needs codesign_tokens (depth-only rotary needs limb-chain depth)")
         if reg_mode not in ('none', 'dropout', 'attention_drop'):
             raise ValueError(f"reg_mode must be 'none'|'dropout'|'attention_drop', got {reg_mode!r}")
-        ml = _ML_REGISTRY[module_library](**(module_library_kwargs or {}))
+        # The run's ONE library (D14) -- the same instance the Task was set up with, not a second
+        # one built from a name here. Slot count and chain depth are its facts, so they are read off
+        # it rather than configured: a config that could disagree with the library is a config that
+        # eventually does.
+        ml = runtime.library()
         # generator/tokenizer subtype vocabulary, derived from the public modules API (not hardcoded).
         # "bare" is OUR choice of the constrained decoder's default/no-cap type (matches the literal
-        # vocabulary used everywhere else, e.g. AntCodesignEnv._BASE_MORPHOLOGY), not library data.
+        # vocabulary used everywhere else, e.g. transformer_rl.morphology.CANONICAL_CAP), not
+        # library data.
         self.n_eff = len(ml.names(ModuleType.EFFECTOR))
         self.cap_bare = ml.names(ModuleType.CAP).index("bare")
+        n_limbs = ml.n_slots
+        max_limb_length = ml.max_depth
         self.n_limbs = n_limbs
         self.has_policy_head = policy_head
         self.has_value_head = value_head
@@ -182,12 +186,13 @@ class LimbTransformer(nn.Module):
             # Phase 1 uniform module-token codesign. A limb is a chain of up to max_limb_length
             # modules; each module is ONE 12-D token. Token layout (n_tokens = 1 + n + n*max_len):
             #   [CLS] [start x n] [module x (n*max_len)]  -- modules in depth-major slot order
-            #   slot(n,d) = (d-1)*n + (n-1)  (== ant_multimorph._slot, == env action order).
+            #   slot(n,d) = (d-1)*n + (n-1)  (== the Task's slot order, == env action order).
             # tdims is the single source of truth for the derived obs layout (must match the env's
             # _OBS_* constants, which derive from the SAME (n_limbs, max_limb_length)).
             if max_limb_length < 2:
-                raise ValueError("Phase-5 grammar forces the deepest slot to a cap -> max_limb_length "
-                                 f"must be >= 2 (got {max_limb_length}); max effectors/limb = it - 1")
+                raise ValueError("Phase-5 grammar forces the deepest slot to a cap -> the library's "
+                                 f"max_depth must be >= 2 (got {max_limb_length} from "
+                                 f"{ml.name!r}); max effectors/limb = it - 1")
             self.tdims = token_dims(n_limbs, max_limb_length)
             self.n_module_tokens = self.tdims["n_module_tokens"]        # n*max_len
             self.max_effectors = max_limb_length - 1   # deepest slot is grammar-forced to a cap (5a)
@@ -867,7 +872,7 @@ class LimbTransformer(nn.Module):
 
 
 def MultiMorphLimbTransformer(n_layers: int = 3, **kwargs) -> LimbTransformer:
-    kwargs.setdefault('n_limbs', 8)
+    # Slot count is the library's now (D14), so there is nothing to default here.
     kwargs.setdefault('eff0_dim', EFF0_DIM_8)      # 8-limb legacy tokens carry segment lengths
     kwargs.setdefault('eff1_dim', EFF1_DIM_8)
     return LimbTransformer(n_layers=n_layers, **kwargs)

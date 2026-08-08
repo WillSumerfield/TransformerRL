@@ -21,7 +21,6 @@ params:
       n_layers: 1
       ffn: 640
       codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
-      max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
       fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target
       use_rope: true            # 3a WINNER (rew 2366 vs 1998 base): depth-only RoPE on module Q/K
       reg_mode: none            # 3b: none|dropout|attention_drop (mutually exclusive)
@@ -83,3 +82,14 @@ params:
     fk:                      # Phase 2b Forward Kinematics aux, FUSED (0 extra passes); own torso-frame
       enabled: true          # pose (pos+rot6D+vel, 15). Stays RAW (latent FK is degenerate).
       coef: 1.0              # weight on the FK MSE (per-depth normalized target space)
+
+# The Task's own block (outside `params`, which is rl_games'). The module library is named ONCE
+# here and constructed once: the Task builds bodies with it and the network reads slot count, chain
+# depth and subtype vocabulary off the same instance (D14). Slots are 0-BASED -- the pre-migration
+# `base_legs: [1, 4, 6]` is the same three limbs as `slots: [0, 3, 5]` below.
+env:
+  module_library: simple
+  base_morphology:          # the seed body: window 0 runs on it, the warmup teacher is relative to it
+    slots: [0, 3, 5]
+    effectors: [swing, knee]
+    cap: bare

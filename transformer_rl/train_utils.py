@@ -11,6 +11,9 @@ from pathlib import Path
 
 import yaml
 
+from . import runtime
+from .morphology import seed_body
+
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _VIDEOS_DIR = _PROJECT_ROOT / "videos"
 
@@ -876,23 +879,23 @@ def run_training(
     rendering = not _str_to_bool(args.headless)
 
     resolved_seed = args.seed if args.seed is not None else config["params"].get("seed")
+    env_cfg = dict(config.get("env", {}))
+
+    # ONE ModuleLibrary per run (D14): named once here, constructed once, handed to the Task at
+    # setup() and to the network through `runtime`. The network used to rebuild its own from a name
+    # in the network config -- two instances, free to disagree about slot count or vocabulary while
+    # every derived width still looked plausible.
+    from codesigner.components.modular_libraries import REGISTRY as ml_registry
+    library = ml_registry[env_cfg.pop("module_library", "simple")](
+        **env_cfg.pop("module_library_kwargs", {}))
+    base_morphology = seed_body(library, **env_cfg.pop("base_morphology", {}))
+    runtime.set_run(library=library, base_morphology=base_morphology)
+
     env_kwargs = {
         "rendering": rendering,
         "raise_exception": rendering,
-        "seed": resolved_seed,
-        **config.get("env", {}),
+        **env_cfg,
     }
-    ml_name = env_kwargs.pop("module_library", None)
-    ml_kwargs = env_kwargs.pop("module_library_kwargs", {})
-    if ml_name is not None:      # unset -> env_class's own default module_library instance
-        from task_envs.modular_libraries import REGISTRY as ml_registry
-        env_kwargs["module_library"] = ml_registry[ml_name](**ml_kwargs)
-
-    bm_cfg = env_kwargs.pop("base_morphology", None)
-    if bm_cfg is not None:       # unset -> env_class's own default base morphology
-        assert ml_name is not None, "env.base_morphology requires an explicit env.module_library"
-        from task_envs.modular_libraries.simple import Morphology
-        env_kwargs["base_morphology"] = Morphology.from_design(env_kwargs["module_library"], **bm_cfg)
 
     # --- Video recorder setup ---
     recorder = None

@@ -16,7 +16,6 @@ params:
       n_layers: 1
       ffn: 640
       codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
-      max_limb_length: 4        # limbs are chains of up to 4 modules; token count = 1 + 8 + 8*4 = 41
       fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target; SWEPT
       use_rope: true            # 3a WINNER (rew 2366 vs 1998 base): depth-only RoPE on module Q/K
       reg_mode: none            # 3b: none|dropout|attention_drop (mutually exclusive)
@@ -68,3 +67,11 @@ params:
     fk:                      # Phase 2b Forward Kinematics aux, FUSED (0 extra passes); own torso-frame
       enabled: true          # pose (pos+rot6D+vel, 15). Stays RAW (latent FK is degenerate); SWEPT
       coef: 1.0              # weight on the FK MSE (per-depth normalized target space); SWEPT
+
+# See ppo_ant_codesign_single.yaml for the `env:` block's contract. Slots are 0-based.
+env:
+  module_library: simple
+  base_morphology:
+    slots: [0, 3, 5]
+    effectors: [swing, knee]
+    cap: bare
