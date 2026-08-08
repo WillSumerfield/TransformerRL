@@ -21,7 +21,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
-from codesigner import evaluate
+from codesigner import checkpoint as _checkpoint, evaluate
 from codesigner.components.tasks import Ant
 
 from transformer_rl.algorithm import CodesignAlgorithm
@@ -42,8 +42,13 @@ def main():
 
     config = args.config if Path(args.config).is_absolute() else _ROOT / "configs" / args.config
     algorithm = CodesignAlgorithm(config)
-    library = algorithm.make_library()
     task = algorithm.make_task(Ant)
+    # The library comes from the CHECKPOINT, not from the config -- the config names whichever
+    # library its next training run would use, which need not be the one this checkpoint was trained
+    # against. Building the config's library here instead just moves the failure to `evaluate`'s
+    # provenance check, which is right to refuse it.
+    library = _checkpoint.load(args.checkpoint, map_location="cpu")["library"]
+    print(f"module library from checkpoint: {library.name}")
 
     if args.bodies == "stable":
         bodies = [seed_body(library, slots=sorted(s)) for s in stable_slot_sets(library.n_slots)]
@@ -51,7 +56,7 @@ def main():
         bodies = [seed_body(library)]
     else:
         # The generator has to be loaded before it can be drawn from, and evaluate loads the
-        # checkpoint itself -- so this pre-load is the one place the checkpoint is read twice.
+        # checkpoint itself, so these body sources read the payload twice. Cheap next to the rollout.
         algorithm.assign_task_and_modlib(task, library)
         algorithm.load_checkpoint(args.checkpoint, map_location="cpu")
         generator = algorithm.morphology_generator()
