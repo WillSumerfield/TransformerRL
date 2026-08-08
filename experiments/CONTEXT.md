@@ -48,3 +48,22 @@ _Avoid_: comparing the network's raw normalized output to reward — wrong units
 
 **Aggregation granularity** (per-token vs grouped):
 Plots come in `_tokens` and `_groups` families. `_tokens` keeps individual tokens; `_groups` pools them — but *how* it pools is intentionally not fixed (could be per limb, per token type, or per morphology depending on the view). Treat "group" as the coarser aggregation, defined per plot.
+
+## Historical scripts
+
+Eight analysis scripts read constants the CoDesigner migration abolished — `_OBS_TOTAL`,
+`_N_DOFS_FULL`, `_N_LIMBS`, `_slot` — which were module-level facts of the deleted `task_envs/` and
+have **no aliasable successor**: slot count and chain depth belong to the live `ModuleLibrary`, and
+the observation offsets are published per-Task by `Task.obs_layout()`. Both need a run's library
+instance, which a bare import cannot supply.
+
+**Historical**, i.e. their env-touching entry points raise on import and are repaired on demand, not
+kept green: `ant_codesign.py`, `vocab_ablation.py`, `free_entropy.py`, `teacher_fidelity.py`
+(only its checkpoint path), `gen_ratio_staleness.py`, `commit_metrics.py`, `lengthonly_recheck.py`.
+Half of them were already broken before the migration — four import `_OBS_TOTAL` from a module that
+stopped defining it at the ModuleLibrary port. Their pure-analysis halves (`diversity*.py`,
+metric functions, notebook readers) are untouched and still work.
+
+`ppg_parity.py` and `phase_comparison.py` are **not** in this bucket: `eval.py` depends on the
+former's checkpoint loader, so both were ported. Repairing one of the others means the same three
+moves — construct the library, `setup()` the Task, read widths off `obs_layout()`.

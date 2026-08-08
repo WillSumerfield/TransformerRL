@@ -102,3 +102,19 @@ def sample_bodies(library, num: int, rng, effectors=CANONICAL_EFFECTORS,
     return [seed_body(library, slots=rng.choice(by_count[rng.choice(counts)]),
                       effectors=effectors, cap=cap)
             for _ in range(num)]
+
+
+def canonical_chain(n_effectors: int) -> tuple:
+    """The canonical limb of a given length: one hip, then knees. `CANONICAL_EFFECTORS` at n=2."""
+    hip, joint = CANONICAL_EFFECTORS
+    return (hip,) + (joint,) * (n_effectors - 1)
+
+
+def body_from_counts(library, counts, cap=CANONICAL_CAP) -> Morphology:
+    """{slot: n_effectors} -> the canonical chain of that length in each named slot.
+
+    The successor to the pre-migration `Morphology.from_counts`, for the analysis scripts that
+    describe a body by limb length alone. Slots are 0-based; a count of 0 leaves the slot empty.
+    """
+    return Morphology.from_names(
+        library, {int(s): (canonical_chain(int(k)), cap) for s, k in counts.items() if int(k) > 0})

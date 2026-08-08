@@ -41,6 +41,7 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import numpy as np
 import torch
+import vlearn as v
 import yaml
 from tqdm import tqdm
 
@@ -48,8 +49,9 @@ from experiments.ppg_parity import _load_policy
 from experiments.diversity_p5 import population_to_repr, rao_blackwell_h_body, redundancy
 from experiments.diversity import within_run_metrics
 from transformer_rl.models import _raw_tail
-from task_envs.ant_envs.ant_codesign import AntCodesignEnv
-from task_envs.codesign_environment import _OBS_TOTAL, _N_DOFS_FULL
+from transformer_rl.morphology import designs_from_arrays, seed_body
+from codesigner.components.modular_libraries import REGISTRY as ML_REGISTRY
+from codesigner.components.tasks import Ant
 
 RUN_ROOT = _ROOT / "runs/ant_codesign/codesign_single_transformer"
 EVAL_SEED = 123
@@ -167,8 +169,10 @@ def _sample(net, n, mode):
 
 
 def _install(env, out):
-    env.set_next(out["counts"].long(), out["eff_sub"], out["cap_sub"])
-    env.resample()
+    """Rebuild the scene onto the generator's designed bodies. The Task takes Morphologies now,
+    so the design grid is translated on this side of the boundary."""
+    env.resample(designs_from_arrays(env.module_library, out["counts"].long(),
+                                     out["eff_sub"], out["cap_sub"]))
 
 
 def _typed_reps(out):
@@ -307,8 +311,12 @@ def main():
     n_envs = args.num_envs or int(jobs[0][3]["params"]["config"]["num_actors"])
     print(f"[eval] {n_envs} bodies x {args.episodes} episodes/body x 3 sources; seed={EVAL_SEED}",
           flush=True)
-    env = AntCodesignEnv(n_envs, device, rendering=False,
-                         raise_exception=False, seed=EVAL_SEED, with_window=False)
+    library = ML_REGISTRY[jobs[0][3].get("env", {}).get("module_library", "simple")]()
+    env = Ant(device=device, rendering=False, raise_exception=False, with_window=False,
+              enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
+    # One body per env, seeded with the canonical body; every source below rebuilds onto its own.
+    n_envs = env.setup(library, n_envs, n_envs, [seed_body(library)] * n_envs, seed=EVAL_SEED)
+    layout = env.obs_layout()
 
     rows = []
     for run_name, rd, ckpts, cfg in jobs:
@@ -317,7 +325,7 @@ def main():
         for label, ckpt in ckpts:
             print(f"[eval] {run_name} @ {label}: {ckpt.name}", flush=True)
             net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size,
-                                         obs_base=_OBS_TOTAL, n_act=_N_DOFS_FULL)
+                                         obs_base=layout["obs_total"], n_act=layout["n_modules"])
             row = {"run": run_name, "epoch": label}
             row.update(evaluate(net, obs_norm, env, device, episodes=args.episodes, top_k=args.top_k))
             rows.append(row)

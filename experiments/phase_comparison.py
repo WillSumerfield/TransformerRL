@@ -119,15 +119,29 @@ def eval_all(seeds):
     import yaml
     import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
-    from task_envs.ant_envs.ant_multimorph import (AntCodesignEnv, _OBS_TOTAL as OBS_BASE,
-                                              _MASK_DIM as MASK_DIM, _N_DOFS_FULL as N_ACT)
-    from task_envs.build_vsim import Morphology
+    from codesigner.components.modular_libraries import REGISTRY as ML_REGISTRY
+    from codesigner.components.tasks import Ant
+    from transformer_rl import runtime
+    from transformer_rl.morphology import body_from_counts, seed_body
 
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
     cfg = yaml.safe_load((_ROOT / CONFIG).read_text())
-    value_size = int(cfg.get("env", {}).get("value_size", 1))
+    env_cfg = cfg.get("env", {})
+    value_size = int(env_cfg.get("value_size", 1))
     net_params = cfg["params"]["network"]
+
+    # ONE Task for every seed, resized onto each seed's bodies (D17b). vsim's gym is a licensed
+    # per-process singleton, so the old code tore it down and rebuilt it between seeds by hand;
+    # resize does that internally and correctly.
+    library = ML_REGISTRY[env_cfg.get("module_library", "simple")]()
+    env = Ant(device=device, rendering=False, raise_exception=False, with_window=False,
+              enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
+              value_size=value_size)
+    env.setup(library, EVAL_EPM, 1, [seed_body(library)], seed=EVAL_SEED)
+    layout = env.obs_layout()
+    runtime.set_run(library=library, obs_layout=layout)
+    OBS_BASE, MASK_DIM, N_ACT = layout["obs_total"], layout["n_modules"], layout["n_modules"]
 
     scal = {k: [] for k in ("perf_top", "perf_distavg", "perf_topk",
                             "div_comp", "div_comp_norm", "div_struct", "div_nmodes")}
@@ -145,11 +159,9 @@ def eval_all(seeds):
         keep = np.argsort(counts)[::-1][:MAX_BODIES]     # most-frequent distinct bodies (mode first)
         kept_pat, kept_cnt = patterns[keep], counts[keep].astype(float)
 
-        bodies = [Morphology.from_counts({i + 1: int(c) for i, c in enumerate(row) if c > 0})
-                  for row in kept_pat]                   # 1-based limb ids; count 0 = absent
-        env = AntCodesignEnv(len(bodies) * EVAL_EPM, device, morphologies=bodies,
-                               rendering=False, raise_exception=False,
-                               seed=EVAL_SEED, with_window=False, value_size=value_size)
+        bodies = [body_from_counts(library, {i: int(c) for i, c in enumerate(row)})
+                  for row in kept_pat]                   # 0-based slots; count 0 = absent
+        env.resize(len(bodies) * EVAL_EPM, len(bodies), bodies)
         epm = env.envs_per_morph
         ep = _rollout_return(net, obs_norm, env, device,
                              obs_base=OBS_BASE, mask_dim=MASK_DIM)    # (len*epm,) raw returns
@@ -168,16 +180,10 @@ def eval_all(seeds):
         print(f"[phase] eval {NAME(seed)}: top={scal['perf_top'][-1]:.1f} "
               f"distavg={scal['perf_distavg'][-1]:.1f} top{TOPK}={scal['perf_topk'][-1]:.1f} "
               f"| {len(patterns)} distinct, nmodes={wm['div_nmodes']:.2f}", flush=True)
-        # vsim gym is a licensed per-process singleton: must tear down before the next seed's
-        # create_gym (else "License validation failed"). Drain in-flight work first, mirroring
-        # AntCodesignEnv._rebuild, so delete_gym doesn't free vsim buffers under a live async op.
-        torch.cuda.synchronize()
-        for _fn in ("end_streaming", "_check_for_cuda_errors"):
-            try: getattr(env.gym, _fn)()
-            except Exception: pass
-        env.gym = None; del env; gc.collect()
-        v.delete_gym()
+        del net, obs_norm
+        gc.collect()
 
+    env.release()          # the gym is a process-wide singleton; give it back before returning
     out = {f"seed_{k}": np.array(v, dtype=np.float32) for k, v in scal.items()}
     if dominants:
         bm = between_seed_metrics(dominants)             # single set over seeds' dominant bodies

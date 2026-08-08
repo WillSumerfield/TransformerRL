@@ -26,13 +26,17 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import numpy as np
 import torch
+import vlearn as v
 import yaml
 from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from transformer_rl.models import MultiMorphLimbTransformerBuilder, _raw_tail
 from transformer_rl.tokenize import OBS_DIM_8, LEN_DIM_8, MASK_DIM_8
-from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+from transformer_rl import runtime
+from transformer_rl.morphology import seed_body, stable_slot_sets
+from codesigner.components.modular_libraries import SimpleModuleLibrary
+from codesigner.components.tasks import Ant
 
 _OBS_TOTAL = OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8   # 139
 _MASK_DIM  = MASK_DIM_8                            # 16
@@ -59,26 +63,6 @@ CURVE_TAGS = [
     "perf/peak_mem_mib",
 ]
 DATA_DIR = _ROOT / "data" / "ppg_parity"
-
-
-def stable_morphologies(
-    min_limbs: int = 3,
-    max_limbs: int = 8,
-    max_gap_deg: float = 135.0,
-) -> list[frozenset]:
-    """Enumerate limb-presence patterns (8-bit masks) viable as a walker: min_limbs..max_limbs
-    limbs present, no circular gap between adjacent limbs > max_gap_deg. Presence-only."""
-    result = []
-    for mask in range(1, 256):
-        active = frozenset(i + 1 for i in range(8) if (mask >> i) & 1)
-        if not (min_limbs <= len(active) <= max_limbs):
-            continue
-        angles = sorted((n - 1) * 45.0 for n in active)
-        gaps = [angles[i + 1] - angles[i] for i in range(len(angles) - 1)]
-        gaps.append(360.0 - angles[-1] + angles[0])
-        if max(gaps) <= max_gap_deg:
-            result.append(active)
-    return result
 
 
 # ---- 1. training -----------------------------------------------------------------
@@ -134,8 +118,18 @@ def aggregate_curves(seeds):
 
 # ---- 3. final-inference return (controlled clean bodies) -------------------------
 
+# Network config keys retired by the CoDesigner migration: slot count, chain depth and the module
+# vocabulary are the live library's now (D14), so a stamped config from an older run still names
+# them. Dropped rather than honoured -- the library is the authority, and a checkpoint that
+# disagrees with it would not load anyway.
+_RETIRED_NET_KEYS = ("n_limbs", "max_limb_length", "module_library", "module_library_kwargs")
+
+
 def _load_policy(ckpt: Path, net_params: dict, device, value_size: int = 1,
                  obs_base: int = _OBS_TOTAL, n_act: int = _N_ACT):
+    net_params = dict(net_params)
+    net_params["transformer"] = {k: val for k, val in net_params.get("transformer", {}).items()
+                                 if k not in _RETIRED_NET_KEYS}
     obs_total = obs_base + (1 if value_size == 2 else 0)     # +progress dim for the V1.0 head
     net = MultiMorphLimbTransformerBuilder.Network(
         params=net_params, actions_num=n_act, input_shape=(obs_total,), num_seqs=1,
@@ -173,13 +167,14 @@ def _rollout_return(net, obs_norm, env, device, obs_base: int = _OBS_TOTAL, mask
 def run_inference(seeds):
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
-    bodies = _stable_morphologies()
-    bcount = np.array([len(b) for b in bodies])
-    # TODO: broken -- CodesignEnvironmentGpu has no `morphologies=` kwarg (bodies now only change
-    # via resample()/set_next()); this needs redesigning against the generator-driven codesign env.
-    env = AntCodesignEnv(len(bodies) * ENVS_PER, device, morphologies=bodies,
-                           rendering=False, raise_exception=False,
-                           seed=EVAL_SEED, with_window=False)
+    library = SimpleModuleLibrary()
+    slot_sets = stable_slot_sets(library.n_slots)
+    bodies = [seed_body(library, slots=s) for s in slot_sets]
+    bcount = np.array([len(s) for s in slot_sets])
+    env = Ant(device=device, rendering=False, raise_exception=False, with_window=False,
+              enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
+    env.setup(library, len(bodies) * ENVS_PER, len(bodies), bodies, seed=EVAL_SEED)
+    runtime.set_run(library=library, obs_layout=env.obs_layout())
     EPM = env.envs_per_morph
 
     results = {}

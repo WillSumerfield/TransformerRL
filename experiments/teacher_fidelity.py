@@ -45,7 +45,7 @@ import numpy as np
 from experiments.diversity import counts_to_repr
 from experiments.diversity_p5 import (encode_population, limb_entropies, pairwise_d_struct,
                                       population_to_repr)
-from task_envs.ant_envs.ant_codesign import AntCodesignEnv
+from transformer_rl.morphology import CANONICAL_SLOTS
 
 RUN_DIR = _ROOT / "runs/ant_codesign/codesign_single_transformer"
 # phase 3 clamps parts-copy lengths to max_limb_length (4); phase 5 to max_effectors (3).
@@ -58,7 +58,7 @@ class _TeacherShim:
     def __init__(self, copy_prob, len_keep, prob_invalid, max_eff, device):
         import torch
         n = 8
-        self._base_target = torch.tensor([2 if (i + 1) in set(AntCodesignEnv._BASE_MORPHOLOGY.legs) else 0 for i in range(n)],
+        self._base_target = torch.tensor([2 if i in set(CANONICAL_SLOTS) else 0 for i in range(n)],
                                          dtype=torch.long, device=device)
         self._copy_prob, self._prob_invalid = copy_prob, prob_invalid
         # phase 5's method clamps to _max_eff, phase 3's (root) to _max_len -- set both so the shim
