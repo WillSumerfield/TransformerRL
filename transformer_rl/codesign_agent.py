@@ -945,9 +945,21 @@ class CodesignAgent(LoggingA2CAgent):
             return
         self._gen_window = int(weights['gen_window'])
         self._cur_counts = weights['cur_counts'].to(self.ppo_device)
-        if 'cur_eff' in weights:
+        has_sub = 'cur_eff' in weights
+        if has_sub:
             self._cur_eff = weights['cur_eff'].to(self.ppo_device)
             self._cur_cap = weights['cur_cap'].to(self.ppo_device)
         tr = weights.get('cur_trace')
         self._cur_trace = {k: v.to(self.ppo_device) for k, v in tr.items()} if tr else None
         self._steps_since_resample = int(weights.get('steps_since_resample', 0))
+
+        # The sim we are restoring INTO was built on the seed body at setup(); the state above
+        # describes a generated one. env.resample() is only ever reached from _maybe_resample, so
+        # without this the run earns reward on the seed body while GenCrit is trained against a body
+        # that never ran -- silently, until the next window boundary (up to ~62 epochs later). Skip
+        # for window 0 (the seed build IS current) and for pre-subtype checkpoints, whose restored
+        # counts would pair with base-derived subtypes and build a body matching neither.
+        env = self._env()
+        if env is not None and self._gen_window > 0 and has_sub:
+            env.resample(designs_from_arrays(
+                self._ml, self._cur_counts, self._cur_eff, self._cur_cap))
