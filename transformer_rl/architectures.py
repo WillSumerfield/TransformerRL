@@ -167,8 +167,12 @@ class LimbTransformer(nn.Module):
         # vocabulary used everywhere else, e.g. transformer_rl.morphology.CANONICAL_CAP), not
         # library data.
         self.n_eff = len(ml.names(ModuleType.EFFECTOR))
+        self.n_cap = len(ml.names(ModuleType.CAP))
         self.cap_bare = ml.names(ModuleType.CAP).index("bare")
-        self.n_sub = ml.subtype_width           # subtype one-hot width, == obs_layout()["n_sub"]
+        # Subtype one-hot width, == obs_layout()["n_sub"]. The SHARED width is the larger of the two
+        # per-type vocabularies, so n_eff and n_cap are each <= n_sub and neither may be assumed to
+        # fill it -- the generator's masks are built from the per-type counts, never from n_sub.
+        self.n_sub = ml.subtype_width
         n_limbs = ml.n_slots
         max_limb_length = ml.max_depth
         self.n_limbs = n_limbs
@@ -643,7 +647,7 @@ class LimbTransformer(nn.Module):
           depth 0             -> effectors + the BARE cap only. A morphology cap needs a limb to sit
                                  on, and `bare cap at depth 0` IS how the generator says "no limb".
                                  force_grow additionally removes the whole cap category.
-          1 .. max_len-2      -> all effectors + all caps
+          1 .. max_len-2      -> every effector + every cap the library actually defines
           max_len-1 (deepest) -> caps only  =>  at most max_len-1 effectors per limb
         Applied IDENTICALLY here and in gen_replay, so the PPO ratio is over the same distribution
         that produced the trace."""
@@ -653,10 +657,15 @@ class LimbTransformer(nn.Module):
         # (unreachable with max_limb_length >= 2, but keeps the row from being fully masked).
         cap_ok = (~force_grow) | (~eff_ok)
         cat_mask = torch.stack([eff_ok, cap_ok], dim=-1)                 # (N, N_GEN_CAT)
-        sub_eff = (torch.arange(self.n_sub, device=dev) < self.n_eff).expand(N, self.n_sub)
+        sub_idx = torch.arange(self.n_sub, device=dev)
+        sub_eff = (sub_idx < self.n_eff).expand(N, self.n_sub)
+        # Each row is masked to its OWN type's vocabulary. n_cap == n_sub in `simple`, so a row of
+        # ones was right there by coincidence; a library with fewer caps than effectors (`basic`: 1
+        # cap, n_sub 2) would otherwise let the decoder sample a cap subtype that does not exist,
+        # and indexing names(CAP) with it raises only once the body reaches the Task.
         cap_bare = F.one_hot(torch.full((N,), self.cap_bare, device=dev), self.n_sub).bool()
         sub_cap = torch.where((depth == 0).unsqueeze(-1), cap_bare,
-                              torch.ones(N, self.n_sub, dtype=torch.bool, device=dev))
+                              (sub_idx < self.n_cap).expand(N, self.n_sub))
         return cat_mask, torch.stack([sub_eff, sub_cap], dim=-2)         # (N, N_GEN_CAT, n_sub)
 
     @staticmethod
