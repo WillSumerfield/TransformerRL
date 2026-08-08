@@ -6,11 +6,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_dims, limb_enc,
+from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_counts, limb_enc,
                        contact_mask,
-                       ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM, ROOT_DIM_P2)
+                       ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM)
 from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
-                    GEN_EFF, GEN_CAP, N_GEN_CAT, N_SUB)
+                    GEN_EFF, GEN_CAP, N_GEN_CAT)
 from codesigner.interfaces import ModuleType
 
 from . import runtime
@@ -168,6 +168,7 @@ class LimbTransformer(nn.Module):
         # library data.
         self.n_eff = len(ml.names(ModuleType.EFFECTOR))
         self.cap_bare = ml.names(ModuleType.CAP).index("bare")
+        self.n_sub = ml.subtype_width           # subtype one-hot width, == obs_layout()["n_sub"]
         n_limbs = ml.n_slots
         max_limb_length = ml.max_depth
         self.n_limbs = n_limbs
@@ -187,21 +188,23 @@ class LimbTransformer(nn.Module):
             # modules; each module is ONE 12-D token. Token layout (n_tokens = 1 + n + n*max_len):
             #   [CLS] [start x n] [module x (n*max_len)]  -- modules in depth-major slot order
             #   slot(n,d) = (d-1)*n + (n-1)  (== the Task's slot order, == env action order).
-            # tdims is the single source of truth for the derived obs layout (must match the env's
-            # _OBS_* constants, which derive from the SAME (n_limbs, max_limb_length)).
+            # tdims is the Task's OWN obs_layout() (D23) -- where each block starts is the package's
+            # fact, published once and read here, not re-derived from (n_limbs, max_limb_length) on
+            # this side of the boundary and hand-kept in step.
             if max_limb_length < 2:
                 raise ValueError("Phase-5 grammar forces the deepest slot to a cap -> the library's "
                                  f"max_depth must be >= 2 (got {max_limb_length} from "
                                  f"{ml.name!r}); max effectors/limb = it - 1")
-            self.tdims = token_dims(n_limbs, max_limb_length)
-            self.n_module_tokens = self.tdims["n_module_tokens"]        # n*max_len
+            self.tdims = runtime.obs_layout()
+            self.n_module_tokens = token_counts(self.tdims)["n_module_tokens"]   # n*max_len
             self.max_effectors = max_limb_length - 1   # deepest slot is grammar-forced to a cap (5a)
             # 2a: category + subtype + mode one-hots are CONCATENATED into each token's content (not
             # additive), so each content projection is widened by the one-hot dims. category
-            # disambiguates token kind {root, start, effector, cap}; subtype (shared index, width 4)
+            # disambiguates token kind {root, start, effector, cap}; subtype (library-sized index)
             # picks the concrete kind within it; mode (LIVE/COMMITTED/STOP) rides embed_module only.
-            self.embed_root   = nn.Linear(ROOT_DIM_P2 + N_CAT, d_model)             # override root dim
-            self.embed_module = nn.Linear(MODULE_DIM + N_CAT + N_SUB + _N_MODE, d_model)
+            # The root block widens for a world-mounted task, so its width is read off the layout.
+            self.embed_root   = nn.Linear(self.tdims["root_dim"] + N_CAT, d_model)  # override root dim
+            self.embed_module = nn.Linear(MODULE_DIM + N_CAT + self.n_sub + _N_MODE, d_model)
             self.angle_proj   = nn.Linear(2 + N_CAT, d_model)
 
             # additive learned embeddings (still summed on top): pos = limb slot (SHARED across start +
@@ -277,7 +280,7 @@ class LimbTransformer(nn.Module):
             #               both live full-state tokens and partial designed prefixes (same weights).
             #   cls_design = learned CLS content used in design mode (generation has no root state).
             self.gen_cat_head = nn.Linear(d_model, N_GEN_CAT)
-            self.gen_sub_head = nn.Linear(d_model, N_SUB)
+            self.gen_sub_head = nn.Linear(d_model, self.n_sub)
             for h in (self.gen_cat_head, self.gen_sub_head):
                 nn.init.zeros_(h.weight)
                 nn.init.zeros_(h.bias)   # uniform over the VALID set at init; p(effector)=0.5 == p1
@@ -343,7 +346,7 @@ class LimbTransformer(nn.Module):
         return torch.cat([pad, dep], dim=0).unsqueeze(0)
 
     def _tokenize_modules(self, obs):
-        return tokenize_modules(obs, self.n_limbs, self.max_limb_length, self.cap_bare, self.angle_enc)
+        return tokenize_modules(obs, self.tdims, self.cap_bare, self.angle_enc)
 
     # ---- classic (non-codesign) legacy path -----------------------------------------------------
     def _encode_legacy(self, root, eff0_tok, eff1_tok, active_mask, B):
@@ -472,9 +475,9 @@ class LimbTransformer(nn.Module):
         modules; cfrc (6) on TERMINAL modules only. Masks + terminal computed from obs[t] active_mask
         (morphology constant within episode; next_obs's normalized mask tail is unusable). valid (B,)
         masks last-horizon-step + `done`. torch.compiled -> fuses the target-derivation + masked MSE."""
-        B, n, D = next_obs.shape[0], self.n_limbs, self.max_limb_length
+        B = next_obs.shape[0]
         # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
-        _, mod_t, *_ = tokenize_modules(next_obs, n, D, self.cap_bare)
+        _, mod_t, *_ = tokenize_modules(next_obs, self.tdims, self.cap_bare)
         if self.fd_variant == 'latent':
             # JEPA target = content-only embed of next physical state: next_phys @ W_phys.T (drop the
             # constant type/mode one-hot cols + bias -> the fixed offset c the head could trivially fit).
@@ -489,7 +492,7 @@ class LimbTransformer(nn.Module):
         # predict contact is the one that observes it (Phase 5; == terminal effector when all caps
         # are bare, i.e. phase-1-identical).
         cfrc_tgt = mod_t[..., 4:10]                                     # (B, n_dof, 6)
-        cont = contact_mask(next_obs, n, D, self.cap_bare)               # (B, n_dof)
+        cont = contact_mask(next_obs, self.tdims, self.cap_bare)         # (B, n_dof)
         v = valid.float().unsqueeze(-1)
         geom_mm, cfrc_mm = active_mask * v, cont * v                    # (B, n_dof) each
         geom_mse = (((mod_pred[..., :15] - geom_tgt) ** 2).mean(-1) * geom_mm).sum() / geom_mm.sum().clamp(min=1)
@@ -617,7 +620,7 @@ class LimbTransformer(nn.Module):
         toh = self.type_oh
         dt = toh.dtype
         cat_oh  = _oh(cat_slot.reshape(M, nd), N_CAT, dt)
-        sub_oh  = _oh(sub_slot.reshape(M, nd), N_SUB, dt)
+        sub_oh  = _oh(sub_slot.reshape(M, nd), self.n_sub, dt)
         mode_oh = F.one_hot(mode_slot.reshape(M, nd), _N_MODE).to(dt)
         phys = mode_oh.new_zeros(M, nd, MODULE_DIM)                      # no physical state in design
         m = self.embed_module(torch.cat([phys, cat_oh, sub_oh, mode_oh], dim=-1))
@@ -634,7 +637,7 @@ class LimbTransformer(nn.Module):
     # ---- constrained decoder (5a): purely positional valid-next masks ----------------------------
     def _gen_masks(self, depth, force_grow):
         """depth (N,) long = 0-based depth of the slot about to be filled; force_grow (N,) bool =
-        the >=1-limb guard. Returns cat_mask (N, N_GEN_CAT) and sub_mask (N, N_GEN_CAT, N_SUB),
+        the >=1-limb guard. Returns cat_mask (N, N_GEN_CAT) and sub_mask (N, N_GEN_CAT, n_sub),
         both bool, True = allowed. The rules are positional only (the prev-type mechanism the
         general decoder supports is unused until Stage-3 connectors):
           depth 0             -> effectors + the BARE cap only. A morphology cap needs a limb to sit
@@ -650,18 +653,18 @@ class LimbTransformer(nn.Module):
         # (unreachable with max_limb_length >= 2, but keeps the row from being fully masked).
         cap_ok = (~force_grow) | (~eff_ok)
         cat_mask = torch.stack([eff_ok, cap_ok], dim=-1)                 # (N, N_GEN_CAT)
-        sub_eff = (torch.arange(N_SUB, device=dev) < self.n_eff).expand(N, N_SUB)
-        cap_bare = F.one_hot(torch.full((N,), self.cap_bare, device=dev), N_SUB).bool()
+        sub_eff = (torch.arange(self.n_sub, device=dev) < self.n_eff).expand(N, self.n_sub)
+        cap_bare = F.one_hot(torch.full((N,), self.cap_bare, device=dev), self.n_sub).bool()
         sub_cap = torch.where((depth == 0).unsqueeze(-1), cap_bare,
-                              torch.ones(N, N_SUB, dtype=torch.bool, device=dev))
-        return cat_mask, torch.stack([sub_eff, sub_cap], dim=-2)         # (N, N_GEN_CAT, N_SUB)
+                              torch.ones(N, self.n_sub, dtype=torch.bool, device=dev))
+        return cat_mask, torch.stack([sub_eff, sub_cap], dim=-2)         # (N, N_GEN_CAT, n_sub)
 
     @staticmethod
     def gen_dist(cat_logits, sub_logits, cat_mask, sub_mask):
         """Masked log-probs for the FACTORED GenAct action. Returns
           cat_logp (..., N_GEN_CAT)
-          sub_logp (..., N_GEN_CAT, N_SUB)  -- row c = the subtype distribution CONDITIONED on
-                                               category c (the same N_SUB logits under c's mask).
+          sub_logp (..., N_GEN_CAT, n_sub)  -- row c = the subtype distribution CONDITIONED on
+                                               category c (the same n_sub logits under c's mask).
         Masking uses finfo.min rather than -inf so a masked entry contributes p*logp == 0 to the
         entropy instead of 0 * -inf == NaN."""
         neg = torch.finfo(cat_logits.dtype).min
@@ -676,7 +679,7 @@ class LimbTransformer(nn.Module):
         H(cat) + sum_c p(c) H(sub | c). Shapes broadcast over any leading dims."""
         lp = cat_logp.gather(-1, cat_a.unsqueeze(-1)).squeeze(-1)
         row = cat_a.unsqueeze(-1).unsqueeze(-1).expand(*cat_a.shape, 1, sub_logp.shape[-1])
-        sub_c = sub_logp.gather(-2, row).squeeze(-2)                     # (..., N_SUB) under cat_a
+        sub_c = sub_logp.gather(-2, row).squeeze(-2)                     # (..., n_sub) under cat_a
         lp = lp + sub_c.gather(-1, sub_a.unsqueeze(-1)).squeeze(-1)
         p_cat = cat_logp.exp()
         h_cat = -(p_cat * cat_logp).sum(-1)
@@ -813,7 +816,7 @@ class LimbTransformer(nn.Module):
 
     def gen_replay(self, slots: torch.Tensor, cat_a: torch.Tensor, sub_a: torch.Tensor):
         """Teacher-forced replay WITH grad, batched over all L+1 prefixes in one trunk forward.
-        Returns (cat_logp (B,L,N_GEN_CAT), sub_logp (B,L,N_GEN_CAT,N_SUB), v (B,L+1), valid (B,L)).
+        Returns (cat_logp (B,L,N_GEN_CAT), sub_logp (B,L,N_GEN_CAT,n_sub), v (B,L+1), valid (B,L)).
         The grammar mask is rebuilt from the replayed state EXACTLY as in sample() — same positional
         rule, same >=1-limb guard — so the PPO ratio is over the same constrained distribution."""
         B, L = slots.shape
@@ -831,7 +834,7 @@ class LimbTransformer(nn.Module):
         cat_mask, sub_mask = self._gen_masks(depth_h.reshape(-1), force_h.reshape(-1))
         cat_logp, sub_logp = self.gen_dist(
             self.gen_cat_head(chosen), self.gen_sub_head(chosen),
-            cat_mask.view(B, L, N_GEN_CAT), sub_mask.view(B, L, N_GEN_CAT, N_SUB))
+            cat_mask.view(B, L, N_GEN_CAT), sub_mask.view(B, L, N_GEN_CAT, self.n_sub))
         return cat_logp, sub_logp, v, active_h
 
 

@@ -1,11 +1,11 @@
 """Token CATEGORY vocabulary -- shared/global across every ModuleLibrary (CONTEXT.md "Type
-embedding"). Which SUBTYPES fill the width below, and what each one physically is, is owned by the
-active ModuleLibrary (task_envs/modular_libraries/) instead -- see
-docs/adr/0016-modulelibrary-abstraction.md.
+embedding"). Which SUBTYPES fill the subtype width, what each one physically is, and how wide the
+index is are all owned by the active ModuleLibrary (`codesigner.components.modular_libraries`) --
+see docs/adr/0016-modulelibrary-abstraction.md.
 
 Two SEPARATE one-hots ride each token:
   category  {root, start, effector, cap}   -- splits phase-1's single `module` type
-  subtype   shared index, width N_SUB      -- meaning is per-ModuleLibrary
+  subtype   shared index, width n_sub      -- meaning AND width are per-ModuleLibrary
 
 GenAct is FACTORED, not flat: a category choice {effector, cap} (positionally grammar-masked), then
 a subtype choice masked to that category's kinds. logp = logp(cat) + logp(sub | cat).
@@ -21,5 +21,7 @@ N_CAT = 4
 GEN_EFF, GEN_CAP = 0, 1
 N_GEN_CAT = 2
 
-# --- SUBTYPE one-hot width: SHARED index space, sized to the largest ModuleLibrary in use ------
-N_SUB = 4
+# The SUBTYPE one-hot width is NOT here. It is `ModuleLibrary.subtype_width`, published by the Task
+# as `obs_layout()["n_sub"]` and carried on the net as `n_sub`. A constant here would be a second
+# opinion on how wide the library's own subtype block is; the obs block is sized by the library, so
+# a disagreement misreads the tail rather than failing (D14, D23).

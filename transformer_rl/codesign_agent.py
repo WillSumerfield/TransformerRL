@@ -28,7 +28,7 @@ from rl_games.common.schedulers import RLScheduler, AdaptiveScheduler
 
 from codesigner.components.interfaces import ModuleType
 
-from .vocab import GEN_EFF, GEN_CAP, N_SUB
+from .vocab import GEN_EFF, GEN_CAP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
 from experiments.diversity_p5 import population_to_repr, redundancy, rao_blackwell_h_body
@@ -98,10 +98,12 @@ class CodesignAgent(LoggingA2CAgent):
         dev = self.ppo_device
         N = self.num_actors * self.num_agents
 
-        # obs layout + action dim from the net's tdims (single source of truth). Phase-1: 32 DOF,
-        # mask at obs[187:219]; a limb is a chain of up to _max_len modules.
-        self._n_dof = net.tdims['n_dof']
+        # obs layout + action dim from the net's tdims -- which IS the Task's obs_layout() (D23),
+        # not a second derivation of it. Phase-1: 32 DOF, mask at obs[187:219]; a limb is a chain
+        # of up to _max_len modules.
+        self._n_dof = net.tdims['n_modules']
         self._mask_off = net.tdims['mask_off']
+        self._n_sub = net.n_sub                # subtype index width, the library's (D14)
         self._max_len = net.max_limb_length
         self._max_eff = net.max_effectors      # max_len-1: the deepest slot is grammar-forced to a cap
 
@@ -428,9 +430,9 @@ class CodesignAgent(LoggingA2CAgent):
                                     depth.new_full((), self._eff_knee))
                 s_cap = depth.new_full((N,), self._cap_bare)
             s = torch.where(c == GEN_EFF, s_eff, s_cap)
-            sm = sub_mask[arange, c]                                          # (N, N_SUB) valid set
+            sm = sub_mask[arange, c]                                          # (N, n_sub) valid set
             if type_flip > 0 and eff_types is None:
-                u = torch.rand(N, N_SUB, device=dev) * sm.float()             # invalid -> exactly 0
+                u = torch.rand(N, self._n_sub, device=dev) * sm.float()       # invalid -> exactly 0
                 s = torch.where(torch.rand(N, device=dev) < type_flip, u.argmax(1), s)
             ok = sm.gather(1, s.clamp(min=0).unsqueeze(1)).squeeze(1)
             s = torch.where(ok, s, sm.float().argmax(1))     # fall back to the first legal subtype

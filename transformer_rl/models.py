@@ -10,13 +10,15 @@ from .tokenize import (OBS_DIM_4 as OBS_DIM, MASK_DIM_4 as MASK_DIM,
 
 
 def _dyn_dims(net):
-    """(mask_off, mask_dim, obs_total) for a MultiMorph net, from its tdims (single source of truth,
-    parameterized by (n_limbs, max_limb_length)). Non-codesign (legacy 8-limb PPG/classic, out of
-    scope since Phase 1) falls back to the old 107/16/16 layout."""
+    """(mask_off, mask_dim, obs_total) for a MultiMorph net, from the Task's published layout.
+    mask_dim is the padded MODULE count -- one mask channel per module slot, which is also the
+    action width for a free-floating task. A task that mounts its root on actuated axes acts on
+    `n_root_axes` more DOFs than it masks. Non-codesign (legacy 8-limb PPG/classic, out of scope
+    since Phase 1) falls back to the old 107/16/16 layout."""
     d = getattr(net, "tdims", None)
     if d is None:
         return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8, OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8
-    return d["mask_off"], d["mask_dim"], d["obs_total"]
+    return d["mask_off"], d["n_modules"], d["obs_total"]
 
 
 def _raw_tail(net):
