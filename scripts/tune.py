@@ -26,6 +26,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from transformer_rl.train_utils import _load_config   # ONE `extends:` resolver, shared with training
+
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 _SPARK  = "▁▂▃▄▅▆▇█"
@@ -1220,8 +1223,12 @@ def main():
 
     with open(args.config) as f:
         tune_cfg = yaml.safe_load(f)
-    with open(tune_cfg["study"]["base_config"]) as f:
-        base_cfg = yaml.safe_load(f)
+    # RESOLVED, not raw: the base config is an `extends:` leaf (task + seed body over an algorithm
+    # parent), so a raw read would see only those two keys -- every param path below would miss, and
+    # each trial_N.yaml would be written with no algorithm in it. Resolving also flattens the chain,
+    # which the trial configs need: they are written under the study dir, where a relative `extends:`
+    # no longer points anywhere.
+    base_cfg = _load_config(Path(tune_cfg["study"]["base_config"]))
 
     sc = tune_cfg["study"]
     output_dir = Path(sc["output_dir"])

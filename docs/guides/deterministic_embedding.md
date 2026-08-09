@@ -4,7 +4,7 @@ This explains `MatmulEmbedding` in `transformer_rl/architectures.py` and why `mo
 
 ## The symptom
 
-Single-network codesign training (`train_ant_codesign_single.py`) ran **~2.4x slower than every
+Single-network codesign training (`train_codesign_single.py`) ran **~2.4x slower than every
 other run** — ~3 h per seed for 3000 epochs, vs ~55 min for the same budget on the older codesign,
 PPG, or plain-control nets. Throughput was ~24k env-steps/s where the others hit ~95–100k.
 

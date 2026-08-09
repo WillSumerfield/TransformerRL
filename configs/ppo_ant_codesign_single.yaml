@@ -1,94 +1,10 @@
-# Single-network codesign: control (ContAct + ContCrit/V0.98) and the morphology generator
-# (GenAct + GenCrit/V1.0) share ONE LegTransformer trunk (codesign_tokens=true) under one
-# optimizer. value_size=1 (V1.0 is the gencrit_head, not a value column). Per step: plain combined
-# PPO on control. At each resample: fit GenCrit (rollout states + designed prefixes -> R), GenAct
-# PPO, and clone control (beta*KL + lam*MSE). See temp/codesign_single_network_plan.md, CONTEXT.md.
-#
-# THE PHASE-2 CONFIG: Forward Dynamics (latent) + Forward Kinematics aux heads ON (fused into the PPO
-# loss, 0 extra passes; config.fd/fk). Aux is still gated -- `--set params.config.fd.enabled=false`
-# (and fk) reproduces the phase-1 baseline. Generator warmup = parts teacher, entropy RL-only, BC on
-# the teacher draw (see the generator block). Override any knob with --set (e.g. fd_variant=raw).
-params:
-  seed: 42
-
-  algo:
-    name: codesign_continuous   # selects CodesignAgent
-
-  network:
-    transformer:
-      d_model: 160
-      n_heads: 8
-      n_layers: 1
-      ffn: 640
-      codesign_tokens: true     # uniform module-token scheme + gen/critic heads on the shared trunk
-      fd_variant: latent        # FD head predicts content-only next-obs embed (cosine); 'raw' = 21-D obs target
-      use_rope: true            # 3a WINNER (rew 2366 vs 1998 base): depth-only RoPE on module Q/K
-      reg_mode: none            # 3b: none|dropout|attention_drop (mutually exclusive)
-      dropout: 0.1              # 3b: prob used by whichever reg_mode is active (ignored if none)
-
-  config:
-    num_actors: 4096
-    reward_shaper:
-      scale_value: 0.01
-    gamma: 0.98
-    tau: 0.95
-    weight_decay: 0.01        # 3b WINNER: AdamW (CodesignAgent), 2 param groups; 0 == plain Adam
-    lr_warmup: true           # 3c WINNER (short ramp): linear 0->peak over warmup_epochs, then AKL.
-    warmup_epochs: 64         # 3c: ramp DURATION in epochs. 64 (~1 window) beat control; the old
-                              # derived span (n_pretrain*63=504) ran pretrain cold -> 465 collapse.
-    learning_rate: 1.0e-3
-    kl_threshold: 0.0083
-    max_epochs: 3000
-    save_best_after: 200
-    save_frequency: 50
-    grad_norm: 1.45
-    entropy_coef: 0.0055
-    e_clip: 0.15
-    resample_interval: 1     # one generator window per ~62-epoch rebuild window
-    horizon_length: 16
-    minibatch_size: 16384
-    mini_epochs: 4
-    critic_coef: 3.25
-    bounds_loss_coef: 0.0005
-
-    generator:               # generator heads share the trunk/optimizer (no separate net/lr)
-      # Warmup teacher = the generator's post-warmup PRIOR (it is behaviour-cloned onto it).
-      # parts-copy: each slot copies a limb template from the seed, then takes a length offset;
-      # unstable draws are rejection-resampled but kept w.p. prob_invalid (GenCrit needs negatives).
-      # vs the old 'flip' teacher (seed +- per-token noise): 49% of flip draws were LITERALLY the
-      # base ant and 0% had >=6 limbs -- an edit-distance ball whose cheap edits are degenerate.
-      teacher: parts
-      copy_prob: 0.6         # p: slot keeps its OWN seed limb template (else copies another slot's)
-      len_keep_prob: 0.6     # q: P(per-limb length offset == 0); sets the Gaussian sigma
-      prob_invalid: 0.1      # keep an UNSTABLE body w.p. this
-      # Phase-5 second teacher knob: per-token TYPE flip. On a flip the emitted subtype is redrawn
-      # uniformly over the grammar-valid kinds for the category actually emitted, so the BC prior
-      # is seeded with real type diversity instead of the canonical (swing, knee, bare) corner.
-      # desirable_flip_prob = type_flip_prob = 0 reproduces the phase-1 canonical body exactly.
-      type_flip_prob: 0.10
-      n_pretrain: 8          # warmup windows (BC toward the teacher draw + value fit; ramp gen-frac 0->1)
-      epochs: 16             # BC epochs/window; each REDRAWS the teacher, so 16 = 4x fresh data, not 4x passes
-      minibatches: 4
-      clip: 0.2              # GenAct PPO-clip
-      entropy_coef: 0.05      # RL-only (0 in warmup: BC is max-likelihood, the teacher is the diversity source)
-      gencrit_coef: 0.5      # weight on the V1.0 fit (designed prefixes + rollout states -> R)
-      beta: 1.0             # control-actor KL clone coefficient
-      lam: 1.0             # control-critic MSE clone coefficient
-
-    fd:                      # Phase 2b Forward Dynamics aux, FUSED into the PPO loss (0 extra passes)
-      enabled: true          # false == phase-1 baseline (get_aux_loss -> None)
-      coef: 1.0              # cosine loss in [0,4] (latent variant); may retune vs raw-FD MSE scale
-
-    fk:                      # Phase 2b Forward Kinematics aux, FUSED (0 extra passes); own torso-frame
-      enabled: true          # pose (pos+rot6D+vel, 15). Stays RAW (latent FK is degenerate).
-      coef: 1.0              # weight on the FK MSE (per-depth normalized target space)
-
-# The Task's own block (outside `params`, which is rl_games'). The module library is named ONCE
-# here and constructed once: the Task builds bodies with it and the network reads slot count, chain
-# depth and subtype vocabulary off the same instance (D14). Slots are 0-BASED -- the pre-migration
+# Single-network codesign ON THE ANT. Everything about the algorithm lives in the parent; this leaf
+# holds only what is a fact about the task. Slots are 0-BASED -- the pre-migration
 # `base_legs: [1, 4, 6]` is the same three limbs as `slots: [0, 3, 5]` below.
+extends: ppo_codesign_single.yaml
+
 env:
-  module_library: simple
+  task: ant
   base_morphology:          # the seed body: window 0 runs on it, the warmup teacher is relative to it
     slots: [0, 3, 5]
     effectors: [swing, knee]

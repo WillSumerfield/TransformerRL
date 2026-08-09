@@ -7,7 +7,7 @@ flag); this one is a *correctness* casualty.
 
 ## The symptom
 
-Passing `--seed` to `train_ant_codesign_single.py` produced:
+Passing `--seed` to `train_codesign_single.py` produced:
 
 - A steady stream of `NaN or Inf found in input tensor.` warnings (from `tensorboardX`, i.e. a
   *logged metric* is NaN) — starting from epoch 1, ~5/epoch, not a one-off.
@@ -96,13 +96,13 @@ bit-exact requirement.
 
 ```bash
 # NaN (before fix): --seed + compile + bf16
-python scripts/train_ant_codesign_single.py --seed 42 --max_epochs 5 --name x --headless True
+python scripts/train_codesign_single.py --config configs/ppo_ant_codesign_single.yaml --seed 42 --max_epochs 5 --name x --headless True
 #   -> 'NaN or Inf' warnings; a_loss/c_loss/kl NaN
 
 # Locate the kernel:
-TORCHINDUCTOR_NAN_ASSERTS=1 python scripts/train_ant_codesign_single.py --seed 42 --max_epochs 3 ...
+TORCHINDUCTOR_NAN_ASSERTS=1 python scripts/train_codesign_single.py --config configs/ppo_ant_codesign_single.yaml --seed 42 --max_epochs 3 ...
 #   -> AssertionError on buf = _scaled_dot_product_flash_attention_backward(...)[2]
 
 # Clean (the fix): use_deterministic_algorithms off -> 0 NaN, full speed
-python scripts/train_ant_codesign_single.py --seed 42 --max_epochs 15 --name x --headless True
+python scripts/train_codesign_single.py --config configs/ppo_ant_codesign_single.yaml --seed 42 --max_epochs 15 --name x --headless True
 ```

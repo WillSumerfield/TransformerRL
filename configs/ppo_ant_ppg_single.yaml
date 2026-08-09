@@ -46,3 +46,8 @@ params:
       aux_minibatch_size: 32768   # aux chunk size (= minibatch_size -> known-good activation footprint)
       aux_buffer_device: cuda     # 'cpu' streams the buffer to spare GPU memory
     # timing: false         # opt-in cuda.synchronize phase timers (perf/*)
+
+# The Task, named by config and resolved through the package task registry. No entry point
+# names a task; this key is what makes the run an ant run.
+env:
+  task: ant

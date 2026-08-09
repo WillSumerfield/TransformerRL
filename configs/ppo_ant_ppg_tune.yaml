@@ -49,3 +49,8 @@ params:
       value_lr: 8.058754876711778e-4
       aux_minibatch_size: 32768
       aux_buffer_device: cuda
+
+# The Task, named by config and resolved through the package task registry. No entry point
+# names a task; this key is what makes the run an ant run.
+env:
+  task: ant

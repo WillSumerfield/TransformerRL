@@ -22,7 +22,6 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from codesigner import checkpoint as _checkpoint, evaluate
-from codesigner.components.tasks import Ant
 
 from transformer_rl.algorithm import CodesignAlgorithm
 from transformer_rl.morphology import seed_body, stable_slot_sets
@@ -31,7 +30,8 @@ from transformer_rl.morphology import seed_body, stable_slot_sets
 def main():
     ap = ArgumentParser()
     ap.add_argument("checkpoint", type=Path)
-    ap.add_argument("--config", default="ppo_ant_codesign_single.yaml")
+    ap.add_argument("--config", required=True,
+                    help="run config (names the task); path or a name under configs/")
     ap.add_argument("--bodies", default="generator",
                     choices=["generator", "sampled", "stable", "seed"])
     ap.add_argument("--num-bodies", type=int, default=8, dest="num_bodies",
@@ -42,7 +42,7 @@ def main():
 
     config = args.config if Path(args.config).is_absolute() else _ROOT / "configs" / args.config
     algorithm = CodesignAlgorithm(config)
-    task = algorithm.make_task(Ant)
+    task = algorithm.make_task()
     # The library comes from the CHECKPOINT, not from the config -- the config names whichever
     # library its next training run would use, which need not be the one this checkpoint was trained
     # against. Building the config's library here instead just moves the failure to `evaluate`'s

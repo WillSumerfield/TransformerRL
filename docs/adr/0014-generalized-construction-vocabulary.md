@@ -14,7 +14,7 @@ We generalize the construction vocabulary now, before those phases bake the old 
 Resolved vocabulary (primary term ← what it replaces):
 
 - **Robot** ← the generic body being built/controlled. **"ant" is reserved for env identity only**:
-  the `Ant*` class names, env keys, `.vsim` assets, `ppo_ant*.yaml` configs, `train_ant_*.py`
+  the `Ant*` class names, `.vsim` assets, and the `ppo_ant*.yaml` task-leaf configs
   scripts. Inside code, a generic reference to "the ant" becomes "the robot".
 - **Limb** ← **leg**. The repeating chain unit. "leg" is retired from vocabulary and code. The
   generic glosses **"structural unit"** and **"part-token"** are retired too (→ limb / token).

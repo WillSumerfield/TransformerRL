@@ -32,6 +32,7 @@ from rl_games.algos_torch.running_mean_std import RunningMeanStd
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from transformer_rl.models import MultiMorphLimbTransformerBuilder, _raw_tail
+from transformer_rl.train_utils import _load_config
 from transformer_rl.tokenize import OBS_DIM_8, LEN_DIM_8, MASK_DIM_8
 from transformer_rl import runtime
 from transformer_rl.morphology import seed_body, stable_slot_sets
@@ -46,12 +47,12 @@ EVAL_SEED  = 123
 
 # train=False -> reuse the existing run dirs (not retrained this pass), still aggregated + inferred.
 ALGOS = {
-    #"ppo": dict(script="scripts/train_ant_full.py", config="configs/ppo_ant_full.yaml",
+    #"ppo": dict(script="scripts/train_transformer.py", config="configs/ppo_ant_full.yaml",
     #            run="runs/ant_full/full_transformer/{name}", ckpt="ant_full_transformer.pth", train=True),
-    "ppg": dict(script="scripts/train_ant_ppg.py",  config="configs/ppo_ant_ppg.yaml",
+    "ppg": dict(script="scripts/train_ppg.py",  config="configs/ppo_ant_ppg.yaml",
                 run="runs/ant_ppg/ppg_transformer/{name}",  ckpt="ant_ppg_transformer.pth",
                 train=False),
-    "ppg_single": dict(script="scripts/train_ant_ppg_single.py", config="configs/ppo_ant_ppg_single.yaml",
+    "ppg_single": dict(script="scripts/train_ppg_single.py", config="configs/ppo_ant_ppg_single.yaml",
                        run="runs/ant_ppg_single/ppg_single_transformer/{name}",
                        ckpt="ant_ppg_single_transformer.pth", train=True),
 }
@@ -78,6 +79,7 @@ def train_all(seeds, max_epochs, num_envs):
             if run_dir.exists():
                 shutil.rmtree(run_dir)        # always retrain (only this exact named dir)
             cmd = [sys.executable, str(_ROOT / spec["script"]), "train",
+                   "--config", str(_ROOT / spec["config"]),
                    "--headless", "True", "--seed", str(seed), "--name", name, "--timing"]
             if max_epochs is not None:
                 cmd += ["--max_epochs", str(max_epochs)]
@@ -179,7 +181,7 @@ def run_inference(seeds):
 
     results = {}
     for algo, spec in ALGOS.items():
-        net_params = yaml.safe_load((_ROOT / spec["config"]).read_text())["params"]["network"]
+        net_params = _load_config(_ROOT / spec["config"])["params"]["network"]
         per_seed = []
         for seed in seeds:
             ckpt = _ROOT / spec["run"].format(name=f"s{seed}") / "nn" / spec["ckpt"]

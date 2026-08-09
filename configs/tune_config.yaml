@@ -23,7 +23,7 @@ study:
   name: codesign_fdfk_tune
   n_trials: 20                  # incl. the 5 enqueued anchors (-> ~15 TPE trials); ~30h at ~1.5h/trial
   output_dir: logs/tune/codesign_fdfk_tune
-  script: scripts/train_ant_codesign_single.py
+  script: scripts/train_codesign_single.py
   base_config: configs/ppo_ant_codesign_tune.yaml
   trial_timeout_seconds: 9000   # wall-clock safety net (~2.5h); max_epochs (2000) is the real limiter.
                                 # Must exceed full-run time: the objective scores the LAST epochs.

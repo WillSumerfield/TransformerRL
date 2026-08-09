@@ -51,7 +51,7 @@ from experiments.diversity import within_run_metrics
 from transformer_rl.models import _raw_tail
 from transformer_rl.morphology import designs_from_arrays, seed_body
 from codesigner.components.modular_libraries import REGISTRY as ML_REGISTRY
-from codesigner.components.tasks import Ant
+from transformer_rl.train_utils import _resolve_task
 
 RUN_ROOT = _ROOT / "runs/ant_codesign/codesign_single_transformer"
 EVAL_SEED = 123
@@ -312,8 +312,12 @@ def main():
     print(f"[eval] {n_envs} bodies x {args.episodes} episodes/body x 3 sources; seed={EVAL_SEED}",
           flush=True)
     library = ML_REGISTRY[jobs[0][3].get("env", {}).get("module_library", "simple")]()
-    env = Ant(device=device, rendering=False, raise_exception=False, with_window=False,
-              enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
+    # The task comes from the run's OWN stamp, beside the library, for the same reason: a checkpoint
+    # whose task differs from the one it trained on reads the wrong obs offsets. Runs stamped before
+    # `env.task` existed are ant runs by construction, hence the default.
+    task_key, task_class = _resolve_task(jobs[0][3], default="ant")
+    env = task_class(device=device, rendering=False, raise_exception=False, with_window=False,
+                     enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
     # One body per env, seeded with the canonical body; every source below rebuilds onto its own.
     n_envs = env.setup(library, n_envs, n_envs, [seed_body(library)] * n_envs, seed=EVAL_SEED)
     layout = env.obs_layout()

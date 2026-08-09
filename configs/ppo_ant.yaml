@@ -28,3 +28,8 @@ params:
     mini_epochs: 4
     critic_coef: 2
     bounds_loss_coef: 0.0
+
+# The Task, named by config and resolved through the package task registry. No entry point
+# names a task; this key is what makes the run an ant run.
+env:
+  task: ant

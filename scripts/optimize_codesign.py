@@ -1,6 +1,6 @@
 """Single-network codesign, driven through the package (`codesigner.optimize`).
 
-The same agent, network and config as `train_ant_codesign_single.py` -- what differs is who owns the
+The same agent, network and config as `train_codesign_single.py` -- what differs is who owns the
 loop. Here the package's driver does: it hands the algorithm a Task and a ModuleLibrary, calls
 `run()` until the algorithm reports finished, and fires a progress tick and a checkpoint after each
 one. One `run()` is one resample window.
@@ -22,14 +22,14 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from codesigner import optimize
-from codesigner.components.tasks import Ant
 
 from transformer_rl.algorithm import CodesignAlgorithm
 
 
 def main():
     ap = ArgumentParser()
-    ap.add_argument("--config", default="ppo_ant_codesign_single.yaml")
+    ap.add_argument("--config", required=True,
+                    help="run config (names the task); path or a name under configs/")
     ap.add_argument("--name", default=None, help="run name; the leaf output dir")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--num-envs", type=int, default=None, dest="num_envs")
@@ -64,7 +64,7 @@ def main():
     # The library and the Task are the caller's to build and the driver's to hand over -- the Task
     # arrives unsized, because how many envs and which bodies are the algorithm's choice (D7).
     library = algorithm.make_library()
-    task = algorithm.make_task(Ant)
+    task = algorithm.make_task()
 
     def on_iteration(record):
         if record.step % 20 == 0 and record.reward is not None:

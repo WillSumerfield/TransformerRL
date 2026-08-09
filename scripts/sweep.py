@@ -4,12 +4,12 @@ crossed with seeds, launching a given train script per point (subprocess, sequen
 generalized form of the warmup-length test. NOT a search: for Bayesian/Optuna range search use
 scripts/tune.py -- sweep runs exactly the values you name and prints a value->reward table.
 
-The `--script` is the alg+env (each train_ant_*.py pins its own env/network/model + default config);
-`--config` is the base config; every run = that base + `--set <param>=<value>` (+ any --extra-set).
+The `--script` is the ALGORITHM (each train_*.py pins its own network/model); `--config` names the
+TASK and is the base config; every run = that base + `--set <param>=<value>` (+ any --extra-set).
 
 Example (the warmup-length sweep it was generalized from):
   python scripts/sweep.py \
-    --script scripts/train_ant_codesign_single.py \
+    --script scripts/train_codesign_single.py \
     --config configs/ppo_ant_codesign_single.yaml \
     --param params.config.warmup_epochs --values 64,128,256 \
     --extra-set params.config.lr_warmup=true \
@@ -18,7 +18,7 @@ Example (the warmup-length sweep it was generalized from):
 
 Seeds-only mode: omit --param/--values to just replicate ONE base config over --seeds (no sweep axis):
   python scripts/sweep.py \
-    --script scripts/train_ant_codesign_single.py \
+    --script scripts/train_codesign_single.py \
     --config configs/ppo_ant_codesign_single.yaml \
     --seeds 42,43,44 --max-epochs 1500 --name-prefix base
   # -> base_s42, base_s43, base_s44, then a per-seed reward table.
@@ -54,7 +54,7 @@ def _best_reward(name, runs_root):
 
 def main():
     ap = argparse.ArgumentParser(description="Enumerate-and-run config sweep (Optuna search = tune.py)")
-    ap.add_argument("--script", required=True, help="train script = the alg+env, e.g. scripts/train_ant_codesign_single.py")
+    ap.add_argument("--script", required=True, help="train script = the algorithm, e.g. scripts/train_codesign_single.py")
     ap.add_argument("--config", required=True, help="base config yaml")
     ap.add_argument("--param", default=None, help="dotted config key to sweep, e.g. params.config.warmup_epochs (omit for seeds-only replication)")
     ap.add_argument("--values", default=None, help="comma-separated values for --param (omit for seeds-only replication)")

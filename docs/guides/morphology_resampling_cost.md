@@ -94,5 +94,5 @@ re-deciding:
 - **Rebuild:** `scripts/bench_gym_rebuild.py` — initial construct, then R=3 steady-state rebuilds
   (`delete_gym` + reconstruct) at 4096 groups in one process (one gym at a time; `delete_gym`
   between). `torch.cuda.synchronize()` brackets each construct.
-- **Episode time:** run `scripts/train_ant_full.py train --max_epochs 40 --seed 42` and read steady
+- **Episode time:** run `scripts/train_transformer.py train --config configs/ppo_ant.yaml --max_epochs 40 --seed 42` and read steady
   `fps_total`; `episode_time = 1000 × 4096 / fps_total`.

@@ -32,11 +32,12 @@ import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
 
 from experiments.diversity import within_run_metrics, between_seed_metrics, counts_to_repr
+from transformer_rl.train_utils import _load_config, _resolve_task
 
 # ---- phase identity (the ONE block a future phase edits) -------------------------
 PHASE = "phase3_substrate"
 BRANCH = "phase-3"             # harness aborts unless current git branch == this (stale-PHASE tripwire)
-SCRIPT = "scripts/train_ant_codesign_single.py"
+SCRIPT = "scripts/train_codesign_single.py"
 CONFIG = "configs/ppo_ant_codesign_single.yaml"   # +RoPE +AdamW-WD +short LR-warmup baked; FD+FK aux ON
 RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = phase3_s{seed}
 NAME = lambda seed: f"phase3_s{seed}"
@@ -80,8 +81,8 @@ def train_all(seeds, max_epochs, num_envs):
             shutil.rmtree(run_dir)                      # always retrain (only this exact phase2_ dir)
         # NB: no --timing -- it inserts cuda.synchronize()/epoch that kills GPU pipelining (~2x
         # slower). Throughput comes from rl_games' native performance/* tag; peak-mem logs passively.
-        cmd = [sys.executable, str(_ROOT / SCRIPT), "train", "--headless", "True",
-               "--seed", str(seed), "--name", name,
+        cmd = [sys.executable, str(_ROOT / SCRIPT), "train", "--config", str(_ROOT / CONFIG),
+               "--headless", "True", "--seed", str(seed), "--name", name,
                "--max_epochs", str(max_epochs if max_epochs is not None else MAX_EPOCHS)]
         if num_envs is not None:
             cmd += ["--num_envs", str(num_envs)]
@@ -120,13 +121,12 @@ def eval_all(seeds):
     import vlearn as v
     from experiments.ppg_parity import _load_policy, _rollout_return
     from codesigner.components.modular_libraries import REGISTRY as ML_REGISTRY
-    from codesigner.components.tasks import Ant
     from transformer_rl import runtime
     from transformer_rl.morphology import body_from_counts, seed_body
 
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
-    cfg = yaml.safe_load((_ROOT / CONFIG).read_text())
+    cfg = _load_config(_ROOT / CONFIG)          # RESOLVED: CONFIG is an `extends:` leaf
     env_cfg = cfg.get("env", {})
     value_size = int(env_cfg.get("value_size", 1))
     net_params = cfg["params"]["network"]
@@ -135,9 +135,10 @@ def eval_all(seeds):
     # per-process singleton, so the old code tore it down and rebuilt it between seeds by hand;
     # resize does that internally and correctly.
     library = ML_REGISTRY[env_cfg.get("module_library", "simple")]()
-    env = Ant(device=device, rendering=False, raise_exception=False, with_window=False,
-              enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
-              value_size=value_size)
+    _, task_class = _resolve_task(cfg)
+    env = task_class(device=device, rendering=False, raise_exception=False, with_window=False,
+                     enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
+                     value_size=value_size)
     env.setup(library, EVAL_EPM, 1, [seed_body(library)], seed=EVAL_SEED)
     layout = env.obs_layout()
     runtime.set_run(library=library, obs_layout=layout)

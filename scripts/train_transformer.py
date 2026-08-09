@@ -6,7 +6,6 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from transformer_rl.train_utils import run_training
-from codesigner.components.tasks import Ant
 from transformer_rl import LimbTransformerBuilder
 
 
@@ -33,11 +32,7 @@ def post_config(args, config):
 
 
 run_training(
-    default_config="ppo_ant.yaml",
-    train_dir="runs/ant",
-    name="ant_transformer",
-    env_class=Ant,
-    env_name="ant-codesign-env",
+    experiment="transformer",           # no family: writes straight to runs/<task>/transformer
     network=("limb_transformer", LimbTransformerBuilder),
     extra_args_fn=add_args,
     post_config_fn=post_config,

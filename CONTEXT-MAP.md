@@ -36,12 +36,12 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   └── train_utils.py
 ├── scripts/                          ← Training context
 │   ├── CONTEXT.md
-│   ├── train_ant_*.py
+│   ├── train_*.py
 │   ├── optimize_codesign.py          (the same run, driven by codesigner.optimize)
 │   ├── evaluate_codesign.py          (score a checkpoint on named bodies)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
-│   ├── ppo_ant*.yaml
+│   ├── ppo_*.yaml
 │   └── tune_config.yaml
 ├── experiments/                      ← Analysis context
 │   ├── CONTEXT.md
@@ -72,7 +72,7 @@ The **CoDesigner** package ([`../SoftwarePackage`](../SoftwarePackage/CONTEXT.md
 
 A run names its library once, in the config's `env:` block — `module_library: simple` (3 effectors, 4 caps) or `basic` (the original ant's `swing`/`knee`/`bare` and nothing else, for runs that want no subtype choice to make). `run_training` constructs exactly one and hands it to the Task at `setup()` and to the network through `transformer_rl/runtime.py`, which exists because rl_games builds the network from a config dict and gives it no env to ask. The network reads both per-type vocabulary sizes off the library and never assumes either fills `subtype_width`.
 
-**Two entry points, one agent.** `scripts/train_ant_codesign_single.py` runs the agent directly under rl_games' `Runner` — the day-to-day path, with play, video and the follow camera. `scripts/optimize_codesign.py` runs the same agent under `codesigner.optimize`, which calls `CodesignAlgorithm.run()` once per **resample window** and fires a progress tick and a checkpoint after each. Both drive `LoggingA2CAgent._train_iter`, a single copy of rl_games' `train()` reshaped as a generator, so the two paths cannot drift. `scripts/evaluate_codesign.py` scores a checkpoint on bodies you name, rebuilding the library from the checkpoint's own provenance.
+**Two entry points, one agent.** `scripts/train_codesign_single.py` runs the agent directly under rl_games' `Runner` — the day-to-day path, with play, video and the follow camera. `scripts/optimize_codesign.py` runs the same agent under `codesigner.optimize`, which calls `CodesignAlgorithm.run()` once per **resample window** and fires a progress tick and a checkpoint after each. Both drive `LoggingA2CAgent._train_iter`, a single copy of rl_games' `train()` reshaped as a generator, so the two paths cannot drift. `scripts/evaluate_codesign.py` scores a checkpoint on bodies you name, rebuilding the library from the checkpoint's own provenance.
 
 ## Upstream — vlearn / VSim
 
@@ -92,7 +92,7 @@ Our local [`docs/reference/vsim_geometry_api.md`](./docs/reference/vsim_geometry
 ## Shared Language
 
 **Robot**:
-The generic body being built and controlled — a **root** plus repeating **limbs**. "Robot" is the primary word in code and docs; **"ant" is reserved for env identity only** (the `Ant*` classes, env keys, `.vsim` assets, `ppo_ant*.yaml` configs, `train_ant_*.py` scripts). The ant is the current (only) robot instance. See [ADR-0014](docs/adr/0014-generalized-construction-vocabulary.md).
+The generic body being built and controlled — a **root** plus repeating **limbs**. "Robot" is the primary word in code and docs; **"ant" is reserved for env identity only** (the `Ant*` classes, `.vsim` assets, and the `ppo_ant*.yaml` task-leaf configs). The ant is the current (only) robot instance. See [ADR-0014](docs/adr/0014-generalized-construction-vocabulary.md).
 
 **Codesign**:
 Jointly optimizing the robot's morphology and its transformer controller in one loop. **Implemented** as a single shared-trunk network — a **GenAct/GenCrit** morphology generator + **ContAct/ContCrit** controller — in `AntCodesignEnv`: the generator emits a body per resample window, the controller earns the reward that trains both. See the Control glossary's *Codesign heads / tokens*.
@@ -135,5 +135,12 @@ _Avoid_: limb_mask (old code identifier; per-DOF not per-limb), bare "mask"
 vlearn's unit of one vsim build shared by a batch of envs. The repo uses one group per morphology, since real limb removal needs a distinct vsim per body.
 
 **Task**:
-A VSim scene plus the objective that scores it — defined by the [CoDesigner](../SoftwarePackage/CONTEXT.md) package, whose `Task` interface our envs are migrating onto. Task **absorbs** what this repo calls an env: it owns reward/termination, root pose, scene construction, and optionally the observation, over a package-owned backend (gym, groups, buffers, module layout). It owns neither the module library nor the initial body — both come from the Algorithm. Current tasks: **Locomotion** (`Ant`, forward velocity) and **Grasp**, which mounts and observes a target but scores nothing yet; **knob-rotation** reserved. Class/key renames onto task names are a Phase 9 loose end.
-_Avoid_: env, environment (retiring — Task absorbs them)
+A VSim scene plus the objective that scores it — defined by the [CoDesigner](../SoftwarePackage/CONTEXT.md) package, whose `Task` interface our envs are migrating onto. Task **absorbs** what this repo calls an env: it owns reward/termination, root pose, scene construction, and optionally the observation, over a package-owned backend (gym, groups, buffers, module layout). It owns neither the module library nor the initial body — both come from the Algorithm. Six ship: **Ant** (locomotion on a plane, forward velocity) and five world-mounted manipulation tasks — **Grasp** (mounts and observes a target but scores nothing, the deliberate witness for the mounted path) plus the Adroit ports **Door**, **Hammer**, **Pen**, **Relocate**, whose hand is *also* a codesigned morphology, not a fixed Shadow Hand. A run names its task **once**, in the config's `env:` block (`task: ant`), resolved through the package's `tasks.REGISTRY` exactly as `module_library` is — a training script names an *algorithm*, never a task. Class/key renames onto task names are a Phase 9 loose end.
+_Avoid_: env, environment (retiring — Task absorbs them); treating "ant" as a synonym for "task"
+
+**Root axis**:
+An actuated joint by which a Task **mounts its robot to the world** — Grasp's two prismatic approach axes, Door's four wrist DOFs, Relocate's six. A Task property, not a designed one: the generator never emits root axes, they are fixed per Task and constant per env (never padded, always active). Ranges 0–6 across the shipped tasks; `Ant` is free-floating and has **none**. They widen both the action space and the root observation block (`root_dim = 13 + 3·n_root_axes`, carrying pos/vel/last-action per axis), which is why the root token has always read them even though nothing acted on them. How they become actions: [Control](./transformer_rl/CONTEXT.md).
+_Avoid_: calling them DOFs without qualification — a **DOF** in this repo is a module's actuated joint and the unit of the DOF mask; a root axis is neither masked nor designed.
+
+**Task extra observation** (extra block):
+The observation fields an objective needs that a **body alone does not carry** — Grasp's target pose, Door's hinge angle, Hammer's nail position. Declared by the Task as a scalar `extra_obs_width` (0 for Ant, up to 24 for Hammer) and **appended after** the constant `{0,1}` raw tail, so every standard block keeps its standard offset and a policy trained on one task still reads them all. Normalized, unlike the raw tail. The Task publishes only the *width* — no structure — so the policy cannot decompose it and treats it as one opaque scene vector.

@@ -27,8 +27,9 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import numpy as np
 from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+from transformer_rl.train_utils import _load_config
 
-SCRIPT = "scripts/train_ant_codesign_single.py"
+SCRIPT = "scripts/train_codesign_single.py"
 RUN = "runs/ant_codesign/codesign_single_transformer/{name}"   # name = report_s{seed}
 _LIMBS = ["F", "FR", "R", "BR", "B", "BL", "L", "FL"]   # limb slots 1..8 (compass codes)
 CURVE_TAGS = (
@@ -59,7 +60,7 @@ def train_all(seeds, max_epochs, num_envs):
         assert name.startswith("report_"), "safety: only ever delete report_* run dirs"
         if run_dir.exists():
             shutil.rmtree(run_dir)              # always retrain (only this exact report_ dir)
-        cmd = [sys.executable, str(_ROOT / SCRIPT), "train",
+        cmd = [sys.executable, str(_ROOT / SCRIPT), "train", "--config", str(_ROOT / CONFIG),
                "--headless", "True", "--seed", str(seed), "--name", name]
         if max_epochs is not None:
             cmd += ["--max_epochs", str(max_epochs)]
@@ -138,7 +139,7 @@ def base_eval(seeds):
 
     assert torch.cuda.is_available()
     device = torch.device("cuda:0")
-    cfg = yaml.safe_load((_ROOT / CONFIG).read_text())
+    cfg = _load_config(_ROOT / CONFIG)          # RESOLVED: CONFIG is an `extends:` leaf
     value_size = int(cfg.get("env", {}).get("value_size", 1))   # 2 => V1.0 head (+progress obs dim)
     net_params = cfg["params"]["network"]
 

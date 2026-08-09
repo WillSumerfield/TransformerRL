@@ -77,6 +77,41 @@ def _load_config(path: Path) -> dict:
     return cfg if parent is None else _deep_merge(_load_config(path.parent / parent), cfg)
 
 
+def _resolve_task(config: dict, default: str | None = None) -> tuple[str, type]:
+    """(registry key, Task class) from the config's `env.task`.
+
+    The task is a CONFIG fact: an entry point names an algorithm and never a task, so this is the
+    only place either entry point learns which Task it is running. Resolved through the package's
+    registry exactly as `module_library` is -- no class argument, no import path, because the key
+    also has to mean the same thing in a stamped config.yaml and in a checkpoint.
+
+    `default` is for reading configs stamped into run dirs BEFORE `env.task` existed. Every such run
+    is an ant run -- ant was the only task -- so "ant" is a fact about those stamps, not a guess.
+    Never pass a default when reading a config a human wrote: there, a missing task is an error.
+    """
+    from codesigner.components.tasks import REGISTRY
+    key = config.get("env", {}).get("task", default)
+    if key not in REGISTRY:
+        raise SystemExit(f"env.task must be one of {sorted(REGISTRY)}; got {key!r}")
+    return key, REGISTRY[key]
+
+
+def _compose_identity(task: str, family: str | None, experiment: str) -> dict:
+    """The identity fields base.yaml leaves out, composed from the config's task and the algorithm
+    the entry point names.
+
+    `family` groups an algorithm's runs one level above the experiment dir; None puts the experiment
+    straight under `runs/<task>`. Composition -- rather than a per-script constant -- is what lets
+    the same script write `runs/ant_codesign/...` and `runs/grasp_codesign/...`.
+    """
+    root = f"runs/{task}_{family}" if family else f"runs/{task}"
+    return {
+        "env_name": f"{task}-env",
+        "name": f"{task}_{experiment}",
+        "train_dir": f"{root}/{experiment}",
+    }
+
+
 def _adjust_minibatch(cfg: dict, n_envs: int, h_len: int) -> None:
     requested = cfg["minibatch_size"]
     batch = h_len * n_envs
@@ -650,21 +685,32 @@ def _attach_render_callback(env, recorder=None, switch=None) -> None:
     env.render_callback = composite
 
 
-def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
-    """Config-free smoke path: the default library, the canonical seed body, one body per env."""
+def _run_random(config, args, video_path=None, num_episodes=1) -> None:
+    """Smoke path: the config's task, library and seed body, one body per env.
+
+    Used to be config-free (hardcoded Ant + the default library). It cannot be any more -- the task
+    itself now only exists in the config -- and reading the `env:` block here means `random` honours
+    the same Task constructor knobs training does.
+    """
     import torch
     import vlearn as v
     from codesigner.components.modular_libraries import REGISTRY as ml_registry
+    _, task_class = _resolve_task(config)
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     num_envs = args.num_envs or 1
-    library = ml_registry["simple"]()
-    morphologies = [seed_body(library)] * num_envs
-    env = env_class(
+    env_cfg = dict(config.get("env", {}))
+    for key in ("task", "num_morphs"):
+        env_cfg.pop(key, None)
+    library = ml_registry[env_cfg.pop("module_library", "simple")](
+        **env_cfg.pop("module_library_kwargs", {}))
+    morphologies = [seed_body(library, **env_cfg.pop("base_morphology", {}))] * num_envs
+    env = task_class(
         device=device,
         rendering=True,
         raise_exception=True,
         enable_scene_query=False,
         rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)),
+        **env_cfg,
     )
     total = env.setup(library, num_envs, len(morphologies), morphologies, seed=args.seed)
     act_low = torch.tensor(env.action_space.low, device=device)
@@ -689,16 +735,20 @@ def _run_random(env_class, args, video_path=None, num_episodes=1) -> None:
 
 
 def run_training(
-    default_config: str,
-    train_dir: str,
-    env_class,
-    env_name: str,
-    name: str,
+    experiment: str,
+    family: str | None = None,
     network: tuple | None = None,
     model: str = "continuous_a2c_logstd",
     extra_args_fn=None,
     post_config_fn=None,
 ) -> None:
+    """Run one training/play/random session for the algorithm this entry point names.
+
+    An entry point names an ALGORITHM (`family` + `experiment` + network + model) and never a task;
+    `--config` supplies the task, and everything task-shaped -- env registration key, run name,
+    output directory -- is composed from it by `_compose_identity`. There is deliberately no default
+    config: the task is not something a script gets to assume.
+    """
     import torch
     import vlearn as v
     import gymnasium.spaces
@@ -751,7 +801,9 @@ def run_training(
     parser.add_argument("--num_envs", type=int)
     parser.add_argument("--max_epochs", type=int)
     parser.add_argument("--horizon_length", type=int)
-    parser.add_argument("--config", type=Path, default=None)
+    parser.add_argument("--config", type=Path, required=True,
+                        help="Run config (e.g. configs/ppo_ant_codesign_single.yaml). Required: it "
+                             "is what names the task.")
     parser.add_argument("--name", type=str, default=None,
                         help="Run name: leaf output dir (runs/env/model/<name>) instead of timestamp.")
     parser.add_argument("--video", action="store_true")
@@ -771,6 +823,33 @@ def run_training(
     mode = args.mode
     checkpoint = args.checkpoint
 
+    # --- Config loading ---
+    # Must precede the play/random dispatch below: both need the task, and the task is only in the
+    # config. Merge shared rl_games boilerplate (configs/defaults/base.yaml) UNDER the config
+    # (resolved through its `extends:` chain) so per-config values win; then pin the identity fields
+    # the entry point owns -- composed from the config's task, not hardcoded. See ADR-0006.
+    with open(_PROJECT_ROOT / "configs" / "defaults" / "base.yaml") as f:
+        base = yaml.safe_load(f)
+    config = _deep_merge(base, _load_config(args.config))
+    for kv in args.set_keys:                          # --set params.config.x.y=VAL
+        key, _, val = kv.partition("=")
+        *path, leaf = key.split(".")
+        d = config
+        for p in path:
+            d = d.setdefault(p, {})
+        d[leaf] = yaml.safe_load(val)                 # YAML-parse: 0.3 -> float, true -> bool
+    task_key, env_class = _resolve_task(config)       # --set env.task=... is honoured, hence here
+    identity = _compose_identity(task_key, family, experiment)
+    env_name = identity["env_name"]
+    name = identity["name"]
+
+    params = config["params"]
+    params["config"]["env_name"] = env_name
+    params["config"]["name"] = name        # experiment-family label (drives checkpoint stems)
+    params.setdefault("model", {})["name"] = model
+    if network is not None:
+        params.setdefault("network", {})["name"] = network[0]
+
     # --- play: a run/model dir enables live policy switching (see policy_switch.py);
     # a plain .pth stays single-checkpoint. base name = `name` (the checkpoint stem). ---
     switch = None
@@ -789,33 +868,8 @@ def run_training(
         video_path = _VIDEOS_DIR / f"{timestamp}_{mode}.mp4"
 
     if mode == "random":
-        _run_random(env_class, args, video_path=video_path, num_episodes=args.num_episodes or 1)
+        _run_random(config, args, video_path=video_path, num_episodes=args.num_episodes or 1)
         return
-
-    # --- Config loading ---
-    config_path = args.config if args.config is not None \
-        else _PROJECT_ROOT / "configs" / default_config
-
-    # Merge shared rl_games boilerplate (configs/defaults/base.yaml) UNDER the config
-    # (resolved through its `extends:` chain) so per-config values win; then pin the
-    # identity fields the training script already owns (env_name, network/model name) so
-    # they can't drift from what's registered. See ADR-0006.
-    with open(_PROJECT_ROOT / "configs" / "defaults" / "base.yaml") as f:
-        base = yaml.safe_load(f)
-    config = _deep_merge(base, _load_config(config_path))
-    for kv in args.set_keys:                          # --set params.config.x.y=VAL
-        key, _, val = kv.partition("=")
-        *path, leaf = key.split(".")
-        d = config
-        for p in path:
-            d = d.setdefault(p, {})
-        d[leaf] = yaml.safe_load(val)                 # YAML-parse: 0.3 -> float, true -> bool
-    params = config["params"]
-    params["config"]["env_name"] = env_name
-    params["config"]["name"] = name        # experiment-family label (drives train_dir)
-    params.setdefault("model", {})["name"] = model
-    if network is not None:
-        params.setdefault("network", {})["name"] = network[0]
 
     if "player" not in config["params"]["config"]:
         config["params"]["config"]["player"] = {}
@@ -823,8 +877,7 @@ def run_training(
     config["params"]["config"]["player"]["print_stats"] = False
     cfg = config["params"]["config"]
     cfg.setdefault("use_diagnostics", True)  # enables diagnostics/exp_var, clip_frac, rms_value
-    exp_name = cfg.get("name", "run").removeprefix("ant_")
-    cfg.setdefault("train_dir", f"{train_dir}/{exp_name}")
+    cfg.setdefault("train_dir", identity["train_dir"])
     run_name = args.name or datetime.now().strftime("%d-%H-%M-%S")
     if mode == "train" and Path(cfg["train_dir"], run_name).exists():
         print(f"Error: run '{run_name}' already exists at {cfg['train_dir']}/{run_name}")
@@ -879,6 +932,7 @@ def run_training(
     # in the network config -- two instances, free to disagree about slot count or vocabulary while
     # every derived width still looked plausible.
     from codesigner.components.modular_libraries import REGISTRY as ml_registry
+    env_cfg.pop("task")                               # resolved above; not a Task ctor kwarg
     library = ml_registry[env_cfg.pop("module_library", "simple")](
         **env_cfg.pop("module_library_kwargs", {}))
     base_morphology = seed_body(library, **env_cfg.pop("base_morphology", {}))

@@ -1,7 +1,7 @@
 """`CodesignAlgorithm`: the shared-trunk PPG codesign agent, as a package `Algorithm`.
 
 This is the conformance layer, not a second trainer. `CodesignAgent` still owns its network, its
-optimizer and its rollout loop exactly as it does under `scripts/train_ant_codesign_single.py`; what
+optimizer and its rollout loop exactly as it does under `scripts/train_codesign_single.py`; what
 this adds is the shape `codesigner.optimize` drives -- a `run()` that returns periodically, the two
 artifacts, and checkpoints carrying enough provenance to be read somewhere else (D18, D19).
 
@@ -26,19 +26,20 @@ from codesigner.interfaces import Algorithm, ControlPolicy, MorphologyGenerator,
 from . import runtime
 from .artifacts import TransformerControlPolicy, TransformerMorphologyGenerator
 from .morphology import seed_body
-from .train_utils import _adjust_minibatch, _deep_merge, _load_config
+from .train_utils import (_adjust_minibatch, _compose_identity, _deep_merge, _load_config,
+                          _resolve_task)
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # The identity fields base.yaml deliberately leaves out, because the entry point owns them -- which
-# env is registered, which network builder and model are looked up, where the run writes. Under the
-# script path `run_training` injects them from its arguments; here they are these constants, and
-# they must keep naming the same things or a config resolves against a different network.
-_ENV_NAME = "ant-codesign-env"
+# network builder and model are looked up, and which algorithm the run is. The task-shaped fields
+# (env_name, run name, train_dir) are NOT here: they are composed from the config's `env.task` by
+# `_compose_identity`, the same call `run_training` makes, so the two entry points cannot disagree
+# about where an ant codesign run writes.
 _NETWORK_NAME = "multimorph_limb_transformer"
 _MODEL_NAME = "transformer_masked_a2c_logstd"
-_EXPERIMENT = "ant_codesign_single_transformer"
-_TRAIN_DIR = "runs/ant_codesign"
+_FAMILY = "codesign"
+_EXPERIMENT = "codesign_single_transformer"
 
 
 class CodesignAlgorithm(Algorithm):
@@ -75,14 +76,17 @@ class CodesignAlgorithm(Algorithm):
         if self.seed is not None:
             cfg["params"]["seed"] = self.seed
 
+        self._task_key, self._task_class = _resolve_task(cfg)
+        identity = _compose_identity(self._task_key, _FAMILY, _EXPERIMENT)
+
         params = cfg["params"]
-        params["config"]["env_name"] = _ENV_NAME
-        params["config"]["name"] = _EXPERIMENT
+        params["config"]["env_name"] = identity["env_name"]
+        params["config"]["name"] = identity["name"]
         params.setdefault("network", {})["name"] = _NETWORK_NAME
         params.setdefault("model", {})["name"] = _MODEL_NAME
         ppo = params["config"]
         ppo.setdefault("use_diagnostics", True)
-        ppo.setdefault("train_dir", f"{_TRAIN_DIR}/{_EXPERIMENT.removeprefix('ant_')}")
+        ppo.setdefault("train_dir", identity["train_dir"])
         ppo["full_experiment_name"] = (self._run_name
                                        or datetime.now().strftime("%d-%H-%M-%S"))
         return cfg
@@ -120,18 +124,24 @@ class CodesignAlgorithm(Algorithm):
         env_cfg = self._cfg.get("env", {})
         return REGISTRY[env_cfg.get("module_library", "simple")](**self.library_kwargs)
 
-    def make_task(self, task_class, **overrides):
-        """Construct (but do not size) the Task from the config's `env:` block.
+    @property
+    def task_key(self) -> str:
+        """The config's registry key for this run's Task -- the same string a checkpoint records."""
+        return self._task_key
+
+    def make_task(self, **overrides):
+        """Construct (but do not size) the Task the config names, from its `env:` block.
 
         Two-phase construction (D7): everything here is a simulation parameter. The keys this
-        module owns -- which library, which seed body, how many bodies -- are stripped, because they
-        describe the *run*, not the simulator, and the Task would reject them.
+        module owns -- which task, which library, which seed body, how many bodies -- are stripped,
+        because they describe the *run*, not the simulator, and the Task would reject them.
         """
         import torch
         import vlearn as v
 
         env_cfg = dict(self._cfg.get("env", {}))
-        for key in ("module_library", "module_library_kwargs", "base_morphology", "num_morphs"):
+        for key in ("task", "module_library", "module_library_kwargs", "base_morphology",
+                    "num_morphs"):
             env_cfg.pop(key, None)
         kwargs = {
             "device": torch.device("cuda:0"),
@@ -143,7 +153,7 @@ class CodesignAlgorithm(Algorithm):
             **env_cfg,
             **overrides,
         }
-        return task_class(**kwargs)
+        return self._task_class(**kwargs)
 
     # ---- startup ---------------------------------------------------------------------
 
