@@ -47,7 +47,10 @@ def main():
     # library its next training run would use, which need not be the one this checkpoint was trained
     # against. Building the config's library here instead just moves the failure to `evaluate`'s
     # provenance check, which is right to refuse it.
-    library = _checkpoint.load(args.checkpoint, map_location="cpu")["library"]
+    # The task IS the config's, though, and is checked here so a checkpoint from another task is
+    # refused before any scene is built rather than after the rollout has been set up.
+    library = _checkpoint.load(args.checkpoint, map_location="cpu",
+                               task=algorithm.task_key)["library"]
     print(f"module library from checkpoint: {library.name}")
 
     if args.bodies == "stable":
