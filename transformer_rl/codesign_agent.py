@@ -104,6 +104,11 @@ class CodesignAgent(LoggingA2CAgent):
         # of up to _max_len modules.
         self._n_dof = net.tdims['n_modules']
         self._mask_off = net.tdims['mask_off']
+        # The ACTION is wider than the DOF mask on a world-mounted task: one scalar per module slot
+        # plus one per root axis (ADR-0019). Equal on Ant, which has no root axes. Anything shaped
+        # like an action (mu, log_std) uses _n_act; anything indexing the design MDP over module
+        # slots stays on _n_dof, since a root axis is never designed.
+        self._n_act = self._n_dof + net.tdims['n_root_axes']
         self._n_limbs = net.n_limbs            # attachment slots, the library's (D14)
         self._n_sub = net.n_sub                # subtype index width, the library's (D14)
         self._max_len = net.max_limb_length
@@ -384,7 +389,13 @@ class CodesignAgent(LoggingA2CAgent):
         self._jepa_losses.append(acc / B)
 
     def _log_std(self, obs):
+        """Must match `models.py`'s forward exactly -- this is the same quantity, recomputed for the
+        generator's KL clone. Root axes are fixed per env and always active, so the env leaves them
+        out of the obs mask; append ones so their sigma is learned rather than gated to 0."""
         mask = (obs[..., self._mask_off:self._mask_off + self._n_dof] > 0).float()
+        if self._n_act > self._n_dof:
+            mask = torch.cat([mask, mask.new_ones(*mask.shape[:-1], self._n_act - self._n_dof)],
+                             dim=-1)
         return mask * self.model.a2c_network.log_std_param
 
     # ---- scripted frontier rollout: target-length teacher + per-token length/type flip noise -----
@@ -563,7 +574,7 @@ class CodesignAgent(LoggingA2CAgent):
         # H*N can be ~65k states -> a single trunk pass OOMs at scale (storing the result is cheap).
         with torch.no_grad():
             ls_old = self._log_std(obs_flat)
-            mu_old = obs_flat.new_empty(HN, self._n_dof)
+            mu_old = obs_flat.new_empty(HN, self._n_act)   # codesign_forward returns full action width
             v098_old = obs_flat.new_empty(HN, 1)
             for s in range(0, HN, self.minibatch_size):
                 m, v, _ = net.codesign_forward(self.model.norm_obs(obs_flat[s:s + self.minibatch_size]))

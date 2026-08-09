@@ -13,12 +13,19 @@ def _dyn_dims(net):
     """(mask_off, mask_dim, obs_total) for a MultiMorph net, from the Task's published layout.
     mask_dim is the padded MODULE count -- one mask channel per module slot, which is also the
     action width for a free-floating task. A task that mounts its root on actuated axes acts on
-    `n_root_axes` more DOFs than it masks. Non-codesign (legacy 8-limb PPG/classic, out of scope
-    since Phase 1) falls back to the old 107/16/16 layout."""
+    `n_root_axes` more DOFs than it masks (see `_action_width`). Non-codesign (legacy 8-limb
+    PPG/classic, out of scope since Phase 1) falls back to the old 107/16/16 layout."""
     d = getattr(net, "tdims", None)
     if d is None:
         return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8, OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8
     return d["mask_off"], d["n_modules"], d["obs_total"]
+
+
+def _action_width(net):
+    """Full action width = padded module slots + the task's root axes, matching the env's extended
+    DOF buffer. Equals the module count exactly when the root is free-floating (Ant)."""
+    d = getattr(net, "tdims", None)
+    return MASK_DIM_8 if d is None else d["n_modules"] + d["n_root_axes"]
 
 
 def _raw_tail(net):
@@ -94,7 +101,11 @@ class MultiMorphLimbTransformerBuilder(NetworkBuilder):
             tc = params.get('transformer', {})
             self.net = MultiMorphLimbTransformer(**tc)
             self._mask_off, self._mask_dim, _ = _dyn_dims(self.net)   # 187/32 (Phase-1 codesign)
-            self.log_std_param = nn.Parameter(torch.zeros(self._mask_dim))
+            # One entry per ACTION, not per masked module: a world-mounted task acts on root axes the
+            # obs mask deliberately omits. Identical to _mask_dim on Ant, which is what keeps the
+            # parameter shape -- and existing checkpoints -- unchanged.
+            self._act_dim = _action_width(self.net)
+            self.log_std_param = nn.Parameter(torch.zeros(self._act_dim))
 
         def forward(self, obs_dict):
             obs = obs_dict['obs']
@@ -104,6 +115,13 @@ class MultiMorphLimbTransformerBuilder(NetworkBuilder):
             mu, value = out['mu'], out.get('value')  # value None when aux head skipped
             if obs.shape[-1] >= self._mask_off + self._mask_dim:
                 mask_dof = (obs[..., self._mask_off : self._mask_off + self._mask_dim] > 0).float()
+                if self._act_dim > self._mask_dim:
+                    # Root axes are fixed per env and ALWAYS active, so the env leaves them out of
+                    # the obs mask entirely (modular.py slices it to the module count). Append ones:
+                    # their sigma must be learned like any other acting DOF, never gated to 0.
+                    mask_dof = torch.cat(
+                        [mask_dof, mask_dof.new_ones(*mask_dof.shape[:-1],
+                                                     self._act_dim - self._mask_dim)], dim=-1)
                 # Inactive dims -> log_std 0 (sigma=1). The env masks inactive actions anyway,
                 # so their sigma is irrelevant to dynamics; a moderate sigma keeps rl_games'
                 # policy_kl well-conditioned (tiny sigma collapses its eps term, poisoning KL ->

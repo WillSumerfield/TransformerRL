@@ -206,8 +206,14 @@ class LimbTransformer(nn.Module):
             # additive), so each content projection is widened by the one-hot dims. category
             # disambiguates token kind {root, start, effector, cap}; subtype (library-sized index)
             # picks the concrete kind within it; mode (LIVE/COMMITTED/STOP) rides embed_module only.
-            # The root block widens for a world-mounted task, so its width is read off the layout.
-            self.embed_root   = nn.Linear(self.tdims["root_dim"] + N_CAT, d_model)  # override root dim
+            # The root block widens for a world-mounted task, so its width is read off the layout,
+            # and the task's extra block is concatenated onto it (ADR-0019). Both tails are width 0
+            # on a free-floating task with no objective fields, which is what keeps Ant's parameter
+            # count -- and therefore its checkpoints -- unchanged.
+            self.n_root_axes = self.tdims["n_root_axes"]
+            self.extra_dim   = self.tdims["extra_dim"]
+            self.embed_root   = nn.Linear(
+                self.tdims["root_dim"] + self.extra_dim + N_CAT, d_model)  # override root dim
             self.embed_module = nn.Linear(MODULE_DIM + N_CAT + self.n_sub + _N_MODE, d_model)
             self.angle_proj   = nn.Linear(2 + N_CAT, d_model)
 
@@ -235,6 +241,8 @@ class LimbTransformer(nn.Module):
             self.register_buffer("module_depth_ids", module_depth_ids, persistent=False)
             self._content_start = 1 + n_limbs                          # module tokens begin after starts
         else:
+            self.n_root_axes = 0      # legacy fixed-4-limb ant: free-floating, no extra block
+            self.extra_dim = 0
             self.embed_eff0 = nn.Linear(eff0_dim, d_model)
             self.embed_eff1 = nn.Linear(eff1_dim, d_model)
             self.type_emb = nn.Embedding(3, d_model)
@@ -271,6 +279,15 @@ class LimbTransformer(nn.Module):
             self.joint_head = nn.Linear(d_model, 1)
             nn.init.zeros_(self.joint_head.weight)
             nn.init.zeros_(self.joint_head.bias)
+            # A task that mounts its root on actuated axes acts on those too. They come off the CLS
+            # token as ONE multi-output head rather than one token per axis, because a root axis is
+            # fixed by the Task and never designed -- a token for it would need special-casing out of
+            # the frontier, the prefix stack, design mode and the category grammar (ADR-0019).
+            # NOT CONSTRUCTED at zero width: Ant must stay parameter-identical.
+            if codesign_tokens and self.n_root_axes:
+                self.root_axis_head = nn.Linear(d_model, self.n_root_axes)
+                nn.init.zeros_(self.root_axis_head.weight)
+                nn.init.zeros_(self.root_axis_head.bias)
         if value_head:
             self.value_head = nn.Linear(d_model, 1)        # V0.98 (sole control critic)
 
@@ -420,10 +437,25 @@ class LimbTransformer(nn.Module):
         target / repr-anchor use."""
         root, module_tok, active_mask, cap_mask, sub_oh = self._tokenize_modules(obs)
         H = self._encode_codesign(root, module_tok, active_mask, cap_mask, sub_oh, obs.shape[0])
-        modules = H[:, self._content_start:, :]
-        mu = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask
+        mu = self._action_mu(H, active_mask)
         out = (mu, self.value_head(H[:, 0]), self.gencrit_head(H[:, 0]))
         return out + (H,) if return_hidden else out
+
+    def _action_mu(self, H, active_mask):
+        """The full action vector: masked module actions, then the task's root-axis actions.
+
+        Order is POSITIONAL and matches the env's DOF buffer, `[padded module DOFs] ++ [root axes]`
+        (`modular.py`'s `_n_dofs_ext`). Reorder either side and the policy drives the wrong joints,
+        silently -- there is no name on either end to catch it.
+
+        Root-axis outputs are deliberately UNMASKED: root axes are fixed per env and always active,
+        unlike limb slots, and the env's own DOF mask excludes them for the same reason. `tanh` suits
+        them because the action space is Box(-1, 1) over the full extended width.
+        """
+        mu = torch.tanh(self.joint_head(H[:, self._content_start:, :]).squeeze(-1)) * active_mask
+        if self.n_root_axes:
+            mu = torch.cat([mu, torch.tanh(self.root_axis_head(H[:, 0]))], dim=-1)
+        return mu
 
     def _sample_jepa_mask(self, present_mask: torch.Tensor, mask_prob: float) -> torch.Tensor:
         """(B, n_tokens) bool JEPA mask. Maskable = CLS + PRESENT modules (effectors AND caps; never
@@ -466,10 +498,15 @@ class LimbTransformer(nn.Module):
 
     # ---- Forward Dynamics (2b): per-active-module next-step prediction (raw variant) -------------
     def fd_predict(self, H, actions):
-        """module_pred (B, n_dof, 21) from post-trunk H[t] + OWN sampled action. `actions` (B, n_dof)
-        align 1:1 with the module tokens H[:, content_start:] (both depth-major slot order; mu is one
-        tanh action per module token, architectures.py:222). Own action only — no aggregation."""
-        mod_in = torch.cat([H[:, self._content_start:, :], actions.unsqueeze(-1)], dim=-1)
+        """module_pred (B, n_dof, 21) from post-trunk H[t] + OWN sampled action. `actions` aligns 1:1
+        with the module tokens H[:, content_start:] (both depth-major slot order; mu is one tanh
+        action per module token). Own action only — no aggregation.
+
+        `actions` arrives at the FULL action width, so its root-axis tail is sliced off here: those
+        entries belong to the CLS token, not to any module, and are not part of any module's own
+        next-step dynamics. The slice is a no-op on a free-floating task."""
+        n_mod = H.shape[1] - self._content_start
+        mod_in = torch.cat([H[:, self._content_start:, :], actions[:, :n_mod].unsqueeze(-1)], dim=-1)
         return self.fd_module_head(mod_in)
 
     def _fd_loss_impl(self, mod_pred, next_obs, active_mask, valid):
@@ -862,8 +899,7 @@ class LimbTransformer(nn.Module):
             if self._fd_enabled and actions is not None:
                 self._fd_pred, self._fd_active = self.fd_predict(x, actions), active_mask
             if self.has_policy_head:
-                modules = x[:, self._content_start:, :]
-                out['mu'] = torch.tanh(self.joint_head(modules).squeeze(-1)) * active_mask
+                out['mu'] = self._action_mu(x, active_mask)
         else:
             root, eff0_tok, eff1_tok, active_mask = self.tokenize_fn(obs)
             x = self._encode_legacy(root, eff0_tok, eff1_tok, active_mask, B)

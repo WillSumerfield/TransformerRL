@@ -329,7 +329,8 @@ def main():
         for label, ckpt in ckpts:
             print(f"[eval] {run_name} @ {label}: {ckpt.name}", flush=True)
             net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size,
-                                         obs_base=layout["obs_total"], n_act=layout["n_modules"])
+                                         obs_base=layout["obs_total"],
+                                         n_act=layout["n_modules"] + layout["n_root_axes"])
             row = {"run": run_name, "epoch": label}
             row.update(evaluate(net, obs_norm, env, device, episodes=args.episodes, top_k=args.top_k))
             rows.append(row)

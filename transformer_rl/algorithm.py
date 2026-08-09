@@ -289,9 +289,10 @@ class CodesignAlgorithm(Algorithm):
         builder = MultiMorphLimbTransformerBuilder()
         builder.load(self._cfg["params"]["network"])
         model = TransformerMaskedNorm(builder).build({
-            # Action width is the padded module count: one action per module slot. Read off the
-            # layout, not the Task's action space, which does not exist until the Task is sized.
-            "actions_num": layout["n_modules"],
+            # Action width = padded module slots + the task's root axes (one action per module
+            # slot, plus one per actuated world-mount axis). Read off the layout, not the Task's
+            # action space, which does not exist until the Task is sized.
+            "actions_num": layout["n_modules"] + layout["n_root_axes"],
             "input_shape": (layout["obs_total"],),
             "num_seqs": 1,
             "value_size": 1,

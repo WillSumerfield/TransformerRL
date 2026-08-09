@@ -148,8 +148,9 @@ def contact_mask(obs, layout: dict, cap_bare: int):
 def tokenize_modules(obs, layout: dict, cap_bare: int, enc: torch.Tensor = None):
     """Tokenize a depth-major relative-geometry obs into
     (root, module_tokens, active_mask, cap_mask, sub_oh).
-      root:          (B, layout["root_dim"]) = y + rot6d(6) + linvel(3) + angvel(3), then pos/vel/act
-                     per actuated root axis if the task mounts its root on any.
+      root:          (B, layout["root_dim"] + layout["extra_dim"]) = y + rot6d(6) + linvel(3) +
+                     angvel(3), then pos/vel/act per actuated root axis if the task mounts its root
+                     on any, then the task's extra block. Both tails are width 0 on Ant.
       module_tokens: (B, n_slots*max_depth, MODULE_DIM=25) canonical depth-major slot order:
                      [sin, cos, vel, act, cfrc(6), relpos(3), relrot6d(6), relvel(6)].
       active_mask:   (B, n_dof) 1 for real EFFECTORS (== DOFs; caps are actionless, so 0).
@@ -165,6 +166,12 @@ def tokenize_modules(obs, layout: dict, cap_bare: int, enc: torch.Tensor = None)
     sens_off = layout["sensor_off"]
     dev = obs.device
     root = obs[:, layout["root_off"]:layout["root_off"] + layout["root_dim"]]
+    # The task's EXTRA block (its objective's own fields -- target pose, object state, ...) rides the
+    # root token's content (ADR-0019). Width 0 on a free-floating task like Ant, where this is a
+    # no-op and `root` is unchanged. Normalized like the rest of the obs; only the {0,1} raw tail
+    # between here and it is restored unnormalized.
+    if layout["extra_dim"] and obs.shape[1] >= layout["obs_total"]:
+        root = torch.cat([root, obs[:, layout["extra_off"]:layout["obs_total"]]], dim=-1)
 
     dm = lambda x, w: x.reshape(B, max_len, n, w)                 # depth-major [B, d, n, w]; slot-major flat
     parts = [dm(obs[:, layout[k]:layout[k] + w * n_dof], w) for k, w in _MOD_BLOCKS]
