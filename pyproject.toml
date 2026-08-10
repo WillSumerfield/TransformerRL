@@ -17,6 +17,7 @@ dependencies = [
     "tensorboard>=2.20.0",
     "tqdm>=4.67.3",
     "vlearn",
+    "codesigner",
 ]
 
 [project.optional-dependencies]
@@ -28,3 +29,7 @@ notebook = [
 
 [tool.uv.sources]
 vlearn = { path = "../vlearn-main/vlearn-0.3.9-cp311-cp311-linux_x86_64.whl" }
+# Editable against the source tree while both sides of the observation contract are in flight, so an
+# edit there is visible here without a wheel rebuild. `../SoftwarePackage/package_and_install`
+# refreshes Packages/ for a handover; switch back to that wheel to ship one.
+codesigner = { path = "../SoftwarePackage", editable = true }
