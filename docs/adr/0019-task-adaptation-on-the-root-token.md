@@ -3,8 +3,8 @@
 The architecture's organising rule is **one token = one module = one DOF = one action scalar**, so
 the obvious way to make the policy task-general was to give each of a Task's [root axes](../../CONTEXT-MAP.md)
 its own token and let the shared `joint_head` decode it. We did the opposite: root-axis actions come
-from a **multi-output head on the root/CLS token**, and a Task's extra observation block is
-**concatenated into that same token's content**. The token stream is therefore identical on every
+from a **multi-output head on the root/CLS token**, and a Task's own observation fields are
+**part of that same token's content**. The token stream is therefore identical on every
 task — `[CLS] [start ×8] [module ×32]` — and nothing about masking, token roles, modes or the
 generator's grammar changes when the task does.
 
@@ -31,14 +31,18 @@ category grammar — four exceptions to buy a uniformity the generator does not 
   actions are gated by the DOF mask, and `log_std` must be widened to `n_modules + n_root_axes` with
   ones appended to the mask.
 - **The root token is now carrying a lot**: root state, the root-axis block, the scene description,
-  the value aggregation, and up to six actions. Hammer's 24-D extra block is the stress case. If
+  the value aggregation, and up to six actions. Hammer's 24 declared fields are the stress case. If
   task performance ever looks capacity-bound at the root, splitting the scene out into its own token
   is the first thing to try — it was the rejected alternative here, and only on bandwidth grounds.
 - **Checkpoints are task-locked**, which they already were: `embed_root`'s input width varies with
-  `n_root_axes` before `extra_dim` enters. `policy_switch.filter_compatible` drops shape-incompatible
+  `n_root_axes` before a task's own fields widen it further. `policy_switch.filter_compatible` drops shape-incompatible
   runs in play mode.
-- **Ant is parameter-identical.** With `n_root_axes == 0` and `extra_dim == 0` the head is not
-  constructed and `embed_root` keeps its old width, so existing checkpoints load and every
-  [ADR-0015](0015-phase-comparison-methodology.md) phase-comparison number stays comparable. This is
-  a required invariant, not a happy accident — it is why both quantities are built conditionally
-  rather than padded to a maximum width.
+- **Ant is parameter-identical.** With `n_root_axes == 0` and no task fields declared, the head is not
+  constructed and `embed_root` keeps its old width. This is a required invariant, not a happy
+  accident — it is why both quantities are built conditionally rather than padded to a maximum width.
+- **Parameter-identical stopped meaning checkpoint-compatible** (2026-08-10). The observation
+  regrouping made contact a per-module field (`n_modules × 6`, from `n_slots × 6`) and added
+  `has_sensor`, so `obs_total` moved and the stored `RunningMeanStd` buffers no longer fit — network
+  weights still would. Pre-2026-08-10 checkpoints therefore do not load, and
+  [ADR-0015](0015-phase-comparison-methodology.md) phase-comparison numbers are comparable only
+  within one side of that line. Deliberate: the package is WIP and no compatibility path was built.

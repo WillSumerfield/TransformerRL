@@ -14,7 +14,7 @@ _Avoid_: part-token (retired); proximal/distal-**effector token** (superseded by
 The codesign content token — one per actuated module, a uniform **12-D** vector `[pos, vel, last_action, sin, cos, module_len, cfrc(6)]` (`MODULE_DIM`, `tokenize_modules`). Contact (`cfrc`) rides **only** on a limb's **terminal** module. Same schema at every within-limb depth (no proximal/distal split) — depth is carried by the separate **depth embedding**, not by the token dims. Distinct from the generator's **grow/stop decision** (below).
 
 **Root token** (ant: the central torso body):
-The single non-repeating body token. Always active, never masked, attends to all parts; its encoder output feeds the value head (CLS-style whole-body aggregator). Reused as the **CLS token** in codesign. It is also where **both** task-varying quantities live — the [task extra observation](../CONTEXT-MAP.md) enters its content, and the [root-axis actions](#) leave from its output — so the root token, not the module tokens, is what makes the policy task-general.
+The single non-repeating body token. Always active, never masked, attends to all parts; its encoder output feeds the value head (CLS-style whole-body aggregator). Reused as the **CLS token** in codesign. It is also where **both** task-varying quantities live — the whole **global region** of the obs enters its content, [task observation fields](../CONTEXT-MAP.md) and all, and the [root-axis actions](#) leave from its output — so the root token, not the module tokens, is what makes the policy task-general.
 _Avoid_: torso (survives only as the ant's physical-build link name)
 
 **Root-axis head**:
@@ -52,11 +52,12 @@ Marks a token's **category** — pre-Phase-5 the 3 rows **root / start / module*
 **Token mask**:
 The attention-level masking of inactive limbs: their token embeddings are zeroed and they're set as padding keys (`src_key_padding_mask`) so active tokens never attend to them. Distinct from the DOF mask (the raw input vector it derives from).
 
-**Raw tail** (obs `[mask_off : obs_total]`):
-The block of obs that is deliberately **not normalized**: the `{0,1}` **DOF mask** plus (Phase 5) the per-slot **`is_cap` flag** and **subtype one-hot**. Every channel is exactly 0 or 1 and is read back with a `> 0` threshold, which normalization would break — a channel that happens to be constant over a window collapses to ~0 and would be misread as absent. Constant per body, written once at env `allocate_buffers` alongside the lengths block. The token **category** is *derived* from it, not stored: effector ⟺ mask, cap ⟺ `is_cap`, pad ⟺ neither. `token_dims()['raw_tail_off'/'raw_tail_dim']` is the single source of truth.
+**Structural block** (the obs fields the layout flags `structural`):
+The part of obs that is deliberately **not normalized**: the `{0,1}` **DOF mask**, the per-slot **`is_cap` flag**, the **subtype one-hot**, and **`has_sensor`**. Every channel is exactly 0 or 1 and is read back with a `> 0` threshold, which normalization would break — a channel that happens to be constant over a window collapses to ~0 and would be misread as absent. Constant per body, written once at env `allocate_buffers`. The token **category** is *derived* from it, not stored: effector ⟺ mask, cap ⟺ `is_cap`, pad ⟺ neither. The package flags each field individually (see its [CONTEXT.md](../../SoftwarePackage/CONTEXT.md)); `models._raw_tail` rebuilds the span from the flags and **refuses** if they are not contiguous, since restoring one slice is what keeps it cheap. Module **length** is *not* here — constant per body, but a measurement, so it normalizes.
+_Avoid_: "raw tail" (it was a tail only while these fields happened to sit at the end of the buffer).
 
 **Masked-norm model**:
-The rl_games model wrapper that runs the stock input normalizer but restores the **raw tail** (above) afterward, so normalization can't collapse the constant mask/type channels. Registered as `transformer_masked_a2c_logstd`. (See `docs/troubleshooting/adaptive_ant_fixes.md` for why.)
+The rl_games model wrapper that runs the stock input normalizer but restores the **structural block** (above) afterward, so normalization can't collapse the constant mask/type channels. Registered as `transformer_masked_a2c_logstd`. (See `docs/troubleshooting/adaptive_ant_fixes.md` for why.)
 
 **Dual-network PPG**:
 The default PPG control agent: a **policy net** and a separate **value net** with disjoint weights (≈2× params). The value net does all RL value math; the policy net carries an **aux value head** trained only in the aux phase to distill value representations into its trunk. The `ppg_continuous` baseline.
@@ -142,7 +143,7 @@ The generation MDP's state = the set of still-growable limb tips. Each step pick
 The single token/DOF ordering `slot(n,d) = (d−1)·n_limbs + (n−1)` — depth-major over limb `n`, depth `d`. Module tokens are emitted in this order, which **is** the env action/DOF order, so the old `nat_to_dof` remap is gone. (vsim assigns DOF order per-limb depth-ascending regardless of XML order, so the scatter **queries** joint names `joint_{n}_{d}`.)
 
 **`tdims`**:
-The obs-layout descriptor `token_dims(n_limbs, max_limb_length)` carried on the net — single source of truth for obs offsets/sizes. `models.py`, `rollout.py`, and the codesign agent all read it; no hardcoded `219` offsets.
+The Task's own `obs_layout()`, carried on the net — the single source of truth for obs offsets/sizes, published by the package rather than re-derived here. Counts (`n_modules`, `n_slots`, `n_sub`, `n_root_axes`, `obs_total`) sit at the top level; fields live in one of two groups, `global` (one per env) and `module` (one per padded slot, `dim` being a *single* slot's width), each entry `{off, dim, structural}`. `models.py`, the tokenizer and the codesign agent all read it **by field name**, never by a remembered offset.
 
 ## Reserved (upcoming phases)
 
