@@ -1,0 +1,11 @@
+# Single-network codesign ON THE ANT. Everything about the algorithm lives in the parent; this leaf
+# holds only what is a fact about the task. Slots are 0-BASED -- the pre-migration
+# `base_legs: [1, 4, 6]` is the same three limbs as `slots: [0, 3, 5]` below.
+extends: ppo_codesign_single.yaml
+
+env:
+  task: door
+  base_morphology:          # the seed body: window 0 runs on it, the warmup teacher is relative to it
+    slots: [0, 3, 5]
+    effectors: [swing, knee]
+    cap: bare
