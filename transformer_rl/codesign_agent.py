@@ -100,10 +100,10 @@ class CodesignAgent(LoggingA2CAgent):
         N = self.num_actors * self.num_agents
 
         # obs layout + action dim from the net's tdims -- which IS the Task's obs_layout() (D23),
-        # not a second derivation of it. Phase-1: 32 DOF, mask at obs[187:219]; a limb is a chain
-        # of up to _max_len modules.
+        # not a second derivation of it. A limb is a chain of up to _max_len modules; `mask` is a
+        # per-module field, looked up by name in its group rather than by a remembered offset.
         self._n_dof = net.tdims['n_modules']
-        self._mask_off = net.tdims['mask_off']
+        self._mask_off = net.tdims['module']['mask']['off']
         # The ACTION is wider than the DOF mask on a world-mounted task: one scalar per module slot
         # plus one per root axis (ADR-0019). Equal on Ant, which has no root axes. Anything shaped
         # like an action (mu, log_std) uses _n_act; anything indexing the design MDP over module

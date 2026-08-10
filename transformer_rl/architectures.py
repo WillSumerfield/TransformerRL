@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .tokenize import (tokenize_4, tokenize_8, tokenize_modules, token_counts, limb_enc,
-                       contact_mask,
+                       contact_mask, global_span,
                        ROOT_DIM, EFF0_DIM, EFF1_DIM, EFF0_DIM_8, EFF1_DIM_8, MODULE_DIM)
 from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
                     GEN_EFF, GEN_CAP, N_GEN_CAT)
@@ -206,14 +206,14 @@ class LimbTransformer(nn.Module):
             # additive), so each content projection is widened by the one-hot dims. category
             # disambiguates token kind {root, start, effector, cap}; subtype (library-sized index)
             # picks the concrete kind within it; mode (LIVE/COMMITTED/STOP) rides embed_module only.
-            # The root block widens for a world-mounted task, so its width is read off the layout,
-            # and the task's extra block is concatenated onto it (ADR-0019). Both tails are width 0
-            # on a free-floating task with no objective fields, which is what keeps Ant's parameter
-            # count -- and therefore its checkpoints -- unchanged.
+            # The root token's content is the WHOLE global region (ADR-0019): the robot's root state,
+            # wider for a world-mounted task, plus whatever the Task declared about its objective.
+            # One width, read off the layout -- there is no separate "extra" tail to add on, because
+            # the region is contiguous and the policy has no reason to tell the two apart.
             self.n_root_axes = self.tdims["n_root_axes"]
-            self.extra_dim   = self.tdims["extra_dim"]
-            self.embed_root   = nn.Linear(
-                self.tdims["root_dim"] + self.extra_dim + N_CAT, d_model)  # override root dim
+            g_start, g_stop = global_span(self.tdims)
+            self.root_dim = g_stop - g_start
+            self.embed_root = nn.Linear(self.root_dim + N_CAT, d_model)    # override root dim
             self.embed_module = nn.Linear(MODULE_DIM + N_CAT + self.n_sub + _N_MODE, d_model)
             self.angle_proj   = nn.Linear(2 + N_CAT, d_model)
 
@@ -241,8 +241,7 @@ class LimbTransformer(nn.Module):
             self.register_buffer("module_depth_ids", module_depth_ids, persistent=False)
             self._content_start = 1 + n_limbs                          # module tokens begin after starts
         else:
-            self.n_root_axes = 0      # legacy fixed-4-limb ant: free-floating, no extra block
-            self.extra_dim = 0
+            self.n_root_axes = 0      # legacy fixed-4-limb ant: free-floating, no task fields
             self.embed_eff0 = nn.Linear(eff0_dim, d_model)
             self.embed_eff1 = nn.Linear(eff1_dim, d_model)
             self.type_emb = nn.Embedding(3, d_model)
@@ -367,7 +366,7 @@ class LimbTransformer(nn.Module):
         return torch.cat([pad, dep], dim=0).unsqueeze(0)
 
     def _tokenize_modules(self, obs):
-        return tokenize_modules(obs, self.tdims, self.cap_bare, self.angle_enc)
+        return tokenize_modules(obs, self.tdims, self.angle_enc)
 
     # ---- classic (non-codesign) legacy path -----------------------------------------------------
     def _encode_legacy(self, root, eff0_tok, eff1_tok, active_mask, B):
@@ -518,7 +517,7 @@ class LimbTransformer(nn.Module):
         masks last-horizon-step + `done`. torch.compiled -> fuses the target-derivation + masked MSE."""
         B = next_obs.shape[0]
         # geometry target: straight slices (mask-independent) from tokenized normalized next_obs
-        _, mod_t, *_ = tokenize_modules(next_obs, self.tdims, self.cap_bare)
+        _, mod_t, *_ = tokenize_modules(next_obs, self.tdims)
         if self.fd_variant == 'latent':
             # JEPA target = content-only embed of next physical state: next_phys @ W_phys.T (drop the
             # constant type/mode one-hot cols + bias -> the fixed offset c the head could trivially fit).
@@ -528,12 +527,12 @@ class LimbTransformer(nn.Module):
             cos = F.cosine_similarity(mod_pred, tgt, dim=-1, eps=1e-6).unsqueeze(-1)  # (B, n_dof, 1)
             return ((2.0 - 2.0 * cos) * mm).sum() / mm.sum().clamp(min=1)
         geom_tgt = mod_t[..., 10:25]                                    # relpos3+relrot6+relvel6 (15)
-        # cfrc target + mask both come from the CONTACT slot -- the morphology cap when the limb has
-        # one, else the terminal effector. Same routing tokenize_modules uses, so the module asked to
-        # predict contact is the one that observes it (Phase 5; == terminal effector when all caps
-        # are bare, i.e. phase-1-identical).
+        # cfrc target + mask both come from the slots that actually carry a sensor, per the layout's
+        # `has_sensor` field -- so the module asked to predict contact is the one that observes it.
+        # This used to re-derive the placement rule (cap if a real body, else terminal effector);
+        # the library states it now, and a modlib placing sensors elsewhere stays correct here.
         cfrc_tgt = mod_t[..., 4:10]                                     # (B, n_dof, 6)
-        cont = contact_mask(next_obs, self.tdims, self.cap_bare)         # (B, n_dof)
+        cont = contact_mask(next_obs, self.tdims)                        # (B, n_dof)
         v = valid.float().unsqueeze(-1)
         geom_mm, cfrc_mm = active_mask * v, cont * v                    # (B, n_dof) each
         geom_mse = (((mod_pred[..., :15] - geom_tgt) ** 2).mean(-1) * geom_mm).sum() / geom_mm.sum().clamp(min=1)

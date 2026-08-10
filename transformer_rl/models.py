@@ -18,7 +18,7 @@ def _dyn_dims(net):
     d = getattr(net, "tdims", None)
     if d is None:
         return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8, OBS_DIM_8 + LEN_DIM_8 + MASK_DIM_8
-    return d["mask_off"], d["n_modules"], d["obs_total"]
+    return d["module"]["mask"]["off"], d["n_modules"], d["obs_total"]
 
 
 def _action_width(net):
@@ -29,13 +29,34 @@ def _action_width(net):
 
 
 def _raw_tail(net):
-    """(offset, dim) of the block kept UNNORMALIZED: DOF mask + (Phase 5) is_cap + subtype one-hot.
-    Every channel there is exactly {0,1} and is read back with a `> 0` threshold, which a normalized
-    channel would break (a constant channel collapses to ~0 -> misread as absent)."""
+    """(offset, dim) of the block kept UNNORMALIZED: every field the layout flags STRUCTURAL.
+
+    Structural fields are read back with a `> 0` threshold, which normalization breaks -- a channel
+    that is constant over a window collapses to ~0 and a real module reads as padding, silently. The
+    layout flags them per field now rather than publishing one span, so the span is rebuilt here and
+    checked for contiguity: one slice is what makes the restore cheap, and a task that interleaves a
+    structural field among normalized ones would quietly widen it over channels that must be
+    normalized. Better to refuse than to un-normalize someone's joint angles.
+    """
     d = getattr(net, "tdims", None)
     if d is None:
         return OBS_DIM_8 + LEN_DIM_8, MASK_DIM_8
-    return d["raw_tail_off"], d["raw_tail_dim"]
+    n_modules = d["n_modules"]
+    spans = []
+    for group, stride in (("global", 1), ("module", n_modules)):
+        for name, e in d[group].items():
+            if e["structural"] and e["dim"]:
+                spans.append((e["off"], e["off"] + e["dim"] * stride, name))
+    if not spans:
+        return 0, 0
+    spans.sort()
+    for (_, prev_stop, prev_name), (start, _, name) in zip(spans, spans[1:]):
+        if start != prev_stop:
+            raise ValueError(
+                f"structural fields are not contiguous: {prev_name} ends at {prev_stop} but {name} "
+                f"starts at {start}. The unnormalized block must be one slice -- declare structural "
+                f"fields adjacently.")
+    return spans[0][0], spans[-1][1] - spans[0][0]
 
 
 def _restore_mask_tail(normed, observation, off, dim, normalize_input):
