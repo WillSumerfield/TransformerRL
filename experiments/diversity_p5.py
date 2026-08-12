@@ -7,6 +7,7 @@ N_modes) and stays as specified. This module adds what the Phase-5 commitment in
   encode_population     pack reprs to int codes; d_struct == Hamming at W_OVERHANG=1
   pairwise_d_struct     vectorised (M,M) d_struct
   N_modes_curve         N_k modes for many tau at once (one dendrogram, not one pass per tau)
+  modes_and_spread      (N_modes at one tau, mean pairwise d_struct) -- per-window training logging
   limb_entropies        within-limb randomness: N_limb(n) = exp H(L_n)
   pairwise_mi           8x8 I(L_m;L_n) -- where body-plan structure lives
   redundancy            cross-limb randomness: rho = exp(C), C = sum_n H(L_n) - H(B)
@@ -23,7 +24,7 @@ from collections import Counter
 
 import numpy as np
 
-from experiments.diversity import _dedup, _hill, d_struct  # noqa: F401  (d_struct: self-test)
+from experiments.diversity import TAU_MODE, _dedup, _hill, d_struct  # noqa: F401  (d_struct: self-test)
 
 EFF_NAMES = ("swing", "knee", "twist")             # vocab.py effector subtype order
 CAP_NAMES = ("bare", "foot", "pad", "ball")        # vocab.py cap subtype order; 0 == bare
@@ -97,16 +98,12 @@ def pairwise_d_struct(codes, chunk=512):
     return D
 
 
-def N_modes_curve(bodies, taus, chunk=512):
-    """N_k modes for every tau in `taus`: single-linkage Hill number at cluster radius k modules.
+def _single_linkage_hill(D, counts, taus):
+    """{tau: Hill number} over single-linkage clusters of the DEDUPED set at each cluster radius.
 
-    Single-linkage at ALL thresholds is one dendrogram, so sort the deduped edges once and union in
-    increasing weight, snapshotting as each tau is passed -- O(M^2) distances total, not per tau.
-    taus=[0] reproduces plain n_distinct (as an effective count) -- the saturating statistic this
-    curve exists to replace."""
-    reps, counts = _dedup(bodies)
-    n = len(reps)
-    D = pairwise_d_struct(encode_population(reps), chunk)
+    Single-linkage at ALL thresholds is one dendrogram, so sort the edges once and union in
+    increasing weight, snapshotting as each tau is passed -- O(n^2) distances total, not per tau."""
+    n = len(counts)
     iu = np.triu_indices(n, 1)
     w = D[iu]
     order = np.argsort(w, kind="stable")
@@ -133,6 +130,36 @@ def N_modes_curve(bodies, taus, chunk=512):
             e += 1
         out[tau] = hill_now()
     return out
+
+
+def N_modes_curve(bodies, taus, chunk=512):
+    """N_k modes for every tau in `taus`: single-linkage Hill number at cluster radius k modules.
+
+    taus=[0] reproduces plain n_distinct (as an effective count) -- the saturating statistic this
+    curve exists to replace."""
+    reps, counts = _dedup(bodies)
+    return _single_linkage_hill(pairwise_d_struct(encode_population(reps), chunk), counts, taus)
+
+
+def modes_and_spread(bodies, tau=TAU_MODE, chunk=512):
+    """(N_modes at `tau`, mean pairwise d_struct) -- the two diversity headlines, from ONE pairwise
+    matrix, because computing them separately would pay the O(n^2) distance twice.
+
+    Intended for per-window logging during training, where the caller passes SUBTYPE-COLLAPSED
+    skeletons: the free_entropy finding is that the skeleton commits while the subtype axis stays
+    free, so a typed statistic stays near the sample size even under total skeleton collapse.
+
+    N_modes is 1.0 exactly when every draw falls in one cluster (full collapse); the spread is the
+    threshold-free companion, mean d_struct over all M(M-1)/2 sample pairs INCLUDING duplicate pairs
+    (which contribute 0), matching diversity._mean_pairwise."""
+    reps, counts = _dedup(bodies)
+    D = pairwise_d_struct(encode_population(reps), chunk)
+    n_modes = _single_linkage_hill(D, counts, [tau])[tau]
+    M = counts.sum()
+    # sum_{i<j} c_i c_j D_ij == 0.5 * (c @ D @ c), since D has a zero diagonal and is symmetric;
+    # over M(M-1)/2 pairs the halves cancel, leaving c @ D @ c / (M(M-1)).
+    spread = float(counts @ D @ counts / (M * (M - 1))) if M > 1 else 0.0
+    return n_modes, spread
 
 
 # ---- entropy decomposition: within-limb vs cross-limb ----------------------------
