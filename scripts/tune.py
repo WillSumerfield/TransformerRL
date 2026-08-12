@@ -115,6 +115,35 @@ def _final_score(series: list[float], mode: str, window: int) -> float:
     return sum(tail) / len(tail)
 
 
+def _gate_factor(job_tb, sc: dict) -> float:
+    """The collapse gate: a SATURATING floor on generator diversity, `min(1, D / floor)` (ADR-0020).
+
+    Above `floor` it is exactly 1, so ranking stays pure reward; below, it discounts linearly. It
+    exists because `quality/R_mean` averages over the sampled body population and so structurally
+    rewards collapse -- a diverse population holds more bad bodies and scores lower -- which makes
+    "maximise reward" partly an instruction to stop exploring. Saturation (rather than a product) is
+    what keeps it a guard: it needs no reward-per-body trade rate, and above the floor extra
+    generator entropy buys exactly zero score while still costing reward.
+
+    `window: 0`/absent averages the WHOLE series. For `build/n_modes` that is the intended reading --
+    it is logged RL-only, so the whole series is exactly the RL phase, and the pathology being caught
+    is "never searched", not "stopped searching" (late commitment is success, not collapse).
+
+    Returns 1.0 when no gate is configured or `floor` is null (the pre-calibration state, where the
+    floor has not been measured yet). Returns None when the gate metric is configured but ABSENT --
+    a run that logged no diversity at all never reached the RL phase, which is a failure rather than
+    a free pass."""
+    gate = sc.get("gate")
+    if not gate or not gate.get("floor"):
+        return 1.0
+    series = job_tb.series(gate["key"])
+    if not series:
+        return None
+    win = int(gate.get("window", 0)) or len(series)
+    tail = series[-win:]
+    return min(1.0, (sum(tail) / len(tail)) / float(gate["floor"]))
+
+
 def _param_or_base(params: dict, base_cfg: dict, path: str):
     """Value of a config path: the swept value if this trial tuned it, else the base-config default."""
     if path in params:
@@ -823,9 +852,16 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     # The across-config spread, to be read directly against the noise floor below it.
     vals = [t.value for t in completed]
     mean, sd, cv = _cv(vals)
+    n_gated = sum(1 for t in study.trials if t.user_attrs.get("gated"))
     c.print(f"[dim]Across-config spread: mean {mean:.1f}  SD {sd:.1f}  "
             f"CV {cv * 100:.0f}%  over {len(completed)} trials"
             + (f"   ({n_oom} OOM excluded)" if n_oom else "") + "[/dim]")
+    if n_gated:
+        gate = tune_cfg["study"].get("gate", {})
+        c.print(f"[yellow]Collapse gate fired on {n_gated}/{len(study.trials)} trials "
+                f"({gate.get('key')} < {gate.get('floor')}).[/yellow] [dim]The gate is insurance and "
+                f"is expected to be INERT; if it is firing routinely the floor is wrong, not the "
+                f"configs — it is then acting as a second objective (ADR-0020).[/dim]")
     _noise_report(study, tune_cfg, output_dir, c)
     c.print(f"[dim]Output: {output_dir}/[/dim]")
 
@@ -1020,8 +1056,17 @@ def _score_job(job: _Job, tune_cfg: dict, base_cfg: dict) -> float:
     window = sc.get("score_window", tune_cfg.get("pruner", {}).get("score_window", 50))
     series = job.tb.series(sc.get("metric_key", "Reward / Total reward (mean)"))
     if mode == "final_frac":
-        return _final_frac_score(series, job.params, sc, base_cfg)
-    return _final_score(series, mode, window)
+        score = _final_frac_score(series, job.params, sc, base_cfg)
+    else:
+        score = _final_score(series, mode, window)
+    if score <= _NEGINF:
+        return score
+    gate = _gate_factor(job.tb, sc)
+    if gate is None:
+        return _NEGINF
+    if gate < 1.0:      # recorded so _show_results can report how often the guard actually fired;
+        job.trial.set_user_attr("gated", round(gate, 4))   # if that is often, the floor is wrong
+    return score * gate
 
 
 def _suggest(trial, tune_cfg: dict) -> dict:
