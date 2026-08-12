@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bayesian hyperparameter tuner — Optuna + Rich TUI.
 
-Usage: python tune.py [tune_config.yaml]
+Usage: python tune.py <tune_config.yaml> [--calibrate N | --confirm N | --report]
 """
 
 import json
@@ -1292,7 +1292,9 @@ def _schedule(study, state: _State, slots: list[_Slot], tune_cfg: dict, base_cfg
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="Bayesian hyperparameter tuner")
-    ap.add_argument("config", nargs="?", default="configs/tune_config.yaml")
+    # Mandatory, no default: a tune config names a base_config, which names a TASK. Defaulting would
+    # pick a task by omission -- the same reason --config is mandatory for the train scripts.
+    ap.add_argument("config", help="tune study yaml, e.g. configs/tune_codesign_ant_screen.yaml")
     ap.add_argument("--reset", action="store_true", help="delete study DB before starting")
     ap.add_argument("--slots", default=None,
                     help="'auto' (every idle device), an int N (first N idle), or a comma-separated "
