@@ -11,6 +11,7 @@ dependencies = [
     "python-xlib>=0.33",
     "pyyaml>=6.0.3",
     "rich>=13.0.0",
+    "scikit-learn>=1.4",    # optuna's fANOVA importance evaluator (scripts/tune.py --report)
     "seaborn>=0.13.0",
     "setuptools<81",
     "rl_games>=1.6.0",

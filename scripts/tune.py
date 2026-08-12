@@ -677,6 +677,24 @@ def _centre_and_spread(top: list, tune_cfg: dict) -> tuple[dict, dict]:
     return centre, spread
 
 
+def _importances(completed: list):
+    """fANOVA importance over the SUCCESSFUL trials only, or None if it cannot be computed.
+
+    Built on a throwaway in-memory study rather than run against the real one: `get_param_importances`
+    reads every COMPLETE trial, and OOM trials are COMPLETE-with-0.0 by design (so the sampler learns
+    the region is unavailable). Leaving them in would let a memory limit masquerade as a
+    hyperparameter effect -- and a 0.0 against rewards in the thousands would dominate the variance
+    decomposition, so the most "important" parameter would be whichever one drives memory."""
+    try:
+        import optuna.importance as oimp
+        tmp = optuna.create_study(direction="maximize")
+        tmp.add_trials(completed)
+        return oimp.get_param_importances(tmp, evaluator=oimp.FanovaImportanceEvaluator(seed=0))
+    except Exception as e:
+        print(f"[importance] unavailable: {e}")
+        return None
+
+
 def _write_params(cfg_path: Path, base_cfg: dict, params: dict):
     out = deepcopy(base_cfg)
     for path, value in params.items():
@@ -832,6 +850,22 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     c.print("[dim]best_params.yaml = centre (exported). best_params_argmax.yaml = single best trial.\n"
             "Yellow rows are undetermined: the top-k covers most of the search range, so the centre "
             "is a midpoint, not an optimum.[/dim]")
+
+    # ── parameter importance ──  the other half of the screen->focus decision
+    imps = _importances(completed)
+    if imps:
+        it = Table(title="Parameter importance (fANOVA, successful trials)", box=rbox.SIMPLE_HEAD,
+                   header_style="bold dim")
+        it.add_column("Parameter", justify="left")
+        it.add_column("Share", justify="right")
+        it.add_column("", justify="left")
+        for path, v in imps.items():
+            it.add_row(path.split(".")[-1], f"{v * 100:.1f}%", "█" * int(round(v * 40)))
+        c.print(it)
+        c.print("[dim]Importance says a parameter MATTERS (share of objective variance it explains); "
+                "the top-k spread above says it was DETERMINED. Carry a parameter into a focus sweep "
+                "only when both agree — high importance with a wide spread means it matters and the "
+                "study did not pin it down.[/dim]")
 
     # print top-10 table
     top = sorted(completed, key=lambda t: t.value, reverse=True)
