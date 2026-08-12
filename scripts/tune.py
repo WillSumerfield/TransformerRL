@@ -740,6 +740,22 @@ def _noise_report(study, tune_cfg: dict, output_dir: Path, c) -> None:
 
 # ── results ───────────────────────────────────────────────────────────
 
+def _kde(sns, ax, xs, ys, color):
+    """Bivariate density behind a scatter, or nothing if the sample cannot support one.
+
+    A KDE over a near-degenerate cloud raises from deep inside matplotlib ("Contour levels must be
+    increasing"), which used to abort _show_results ENTIRELY -- losing the winner, the noise report
+    and results.png over a decoration. That is most likely exactly when the report matters most: a
+    study whose trials mostly OOM'd or failed has few points left to plot. Needing >=3 distinct
+    values on both axes screens the common cases; the guard catches the rest."""
+    if len(set(xs)) < 3 or len(set(ys)) < 3:
+        return
+    try:
+        sns.kdeplot(x=xs, y=ys, ax=ax, fill=True, color=color, alpha=0.7, warn_singular=False)
+    except Exception:
+        pass
+
+
 def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_dir: Path):
     import matplotlib.pyplot as plt
     import numpy as np
@@ -867,16 +883,12 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
             scores    = [t.value for t in completed]
             dur_pairs = [(t.params[path], d) for t in completed if (d := _duration(t)) is not None]
 
-            if len(set(pvals)) > 1:
-                sns.kdeplot(x=pvals, y=scores, ax=ax_r, fill=True,
-                            color="#4c72b0", alpha=0.7, warn_singular=False)
+            _kde(sns, ax_r, pvals, scores, "#4c72b0")
             ax_r.scatter(pvals, scores, s=18, color="#4c72b0", alpha=0.6, zorder=3)
 
             if dur_pairs:
                 tvs, tds = zip(*dur_pairs)
-                if len(set(tvs)) > 1:
-                    sns.kdeplot(x=list(tvs), y=list(tds), ax=ax_t, fill=True,
-                                color="#dd8452", alpha=0.7, warn_singular=False)
+                _kde(sns, ax_t, list(tvs), list(tds), "#dd8452")
                 ax_t.scatter(list(tvs), list(tds), s=18, color="#dd8452", alpha=0.6, zorder=3)
 
             if p.get("log", False):
