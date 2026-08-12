@@ -74,7 +74,9 @@ Subsystem-keyed. `<slot>` ∈ {F, FR, R, BR, B, BL, L, FL} (limb compass slots);
 | `build/limbcount_realized` | mean #limbs actually **built/run** (post-ramp); `R` is measured on these | ≈ `limbcount` once ramp off | persistent gap after RL onset = ramp logic bug |
 | `build/limbcount_base` | mean #limbs of the base±flip **draws** (pretrain only, ~flat ≈3.2) | flat reference line | (reference only) |
 | `build/limbcount_var` | variance of generated limb count across envs | > 0 | →0 = **mode collapse** (every env builds one body) |
-| `build/n_distinct` | # distinct bodies sampled this window (RL only) | ≳ 5 | < 5 = low diversity; also voids `gencrit/value_rank_corr` |
+| `build/n_distinct` | # distinct **typed** bodies sampled this window (RL only) | ≳ 5 | < 5 voids `gencrit/value_rank_corr`. **Not a collapse detector** — see `n_modes` |
+| `build/n_modes` | **the diversity headline** (RL only): effective # distinct designs = Hill(q=1) over single-linkage `d_struct` clusters at τ=1, on the **subtype-collapsed** skeleton | > 1, ideally ≳ 2 | **1.0 = one design = full collapse**, by construction |
+| `build/div_struct` | mean pairwise `d_struct` over the sampled skeletons (RL only) — threshold-free companion | > 0 | 0 = every draw identical. High here with `n_modes`≈1 = jitter around one design, not branching |
 | `build/p/<slot>` | per-limb built on-rate | base limbs ~1; useful limbs climb | a useful slot stuck at 0 = generator won't add it |
 
 ### `gen/` — GenAct (generator actor) learning (per window)
@@ -130,8 +132,13 @@ If `loss_prefix` is stuck near 1, raise `gencrit_coef` or generator `epochs`; if
 encode/mode path, not the optimizer.
 
 ### 2. Mode / diversity collapse
-**Looks like:** `build/limbcount_var`→0 · `build/n_distinct`<5 · `gen/entropy`→0 fast ·
-`build/limbcount` pinned at 1 or 8 · `gencrit/value_rank_corr` goes NaN (too few bodies).
+**Looks like:** `build/n_modes`→1 · `build/div_struct`→0 · `build/limbcount_var`→0 ·
+`gen/entropy`→0 fast · `build/limbcount` pinned at 1 or 8 · `gencrit/value_rank_corr` goes NaN.
+**Read `n_modes`, not `n_distinct`:** `n_distinct` counts *typed* designs, and per the
+`free_entropy` finding the skeleton commits while the subtype axis stays free — so subtype jitter
+alone pins it near the sample size **through a total skeleton collapse** (measured: never below
+286/4096 across an entire 20-trial study). `build/body_diversity` fails the same way for the same
+reason. Only `n_modes` (collapsed skeleton) actually bottoms out at 1.
 **Means:** the generator collapsed to one body; no exploration ⇒ no signal to improve.
 **Fix:** raise generator `entropy_coef`; lower generator LR / `clip`; lengthen pretrain
 (`n_pretrain`) so it doesn't commit early.

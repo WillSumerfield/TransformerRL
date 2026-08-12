@@ -33,7 +33,8 @@ from .morphology import designs_from_arrays
 from .vocab import GEN_EFF, GEN_CAP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
-from experiments.diversity_p5 import population_to_repr, redundancy, rao_blackwell_h_body
+from experiments.diversity_p5 import (population_to_repr, redundancy, rao_blackwell_h_body,
+                                      modes_and_spread)
 
 # embedding-like matrices excluded from weight decay despite being nn.Linear (3b, grill 2026-07-15):
 # pos_emb/depth_emb are nn.Embedding tables; embed_module/embed_root are content projections treated
@@ -875,7 +876,10 @@ class CodesignAgent(LoggingA2CAgent):
             w.add_scalar('build/limbcount_var', limbc.var().item(), frame)  # diversity / collapse canary
             w.add_scalar('build/modulecount', modc.mean().item(), frame)
             w.add_scalar('build/modulecount_var', modc.var().item(), frame)
-            self._log_diversity(w, frame)                  # M1: perplexity metrics (both BC + RL)
+            # M1 perplexity metrics log in BOTH phases; the M4 headline (build/n_modes) is RL-only,
+            # keyed off the same 'n_distinct_bodies' presence that marks an RL window (set under
+            # `if not pretrain` in _resample_update), so the two series always cover the same windows.
+            self._log_diversity(w, frame, rl='n_distinct_bodies' in g)
         if 'n_distinct_bodies' in g:                       # kept as a saturating canary (M1)
             w.add_scalar('build/n_distinct', g['n_distinct_bodies'], frame)
         # realized TYPE mix (5a collapse canary: all-canonical => the vocabulary is unused)
@@ -916,7 +920,7 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_log = None
 
     @torch.no_grad()
-    def _log_diversity(self, w, frame):
+    def _log_diversity(self, w, frame, rl):
         """build/* perplexity diversity from the current window's generator trace (native/typed
         view). Replaces the saturating build/n_distinct (M1) -- a body count hard-capped at the
         sample size -- with perplexities that have no ln(M) rail:
@@ -929,9 +933,10 @@ class CodesignAgent(LoggingA2CAgent):
         Typed reprs pair with the FULL step_entropy (== step_entropy_cat + step_entropy_sub), so the
         joint-entropy term is alphabet-matched to the repr and C is not inflated (M3b)."""
         tr = self._cur_trace
-        reprs = population_to_repr(tr['counts'].detach().cpu().numpy().astype(int),
-                                   tr['eff_sub'].detach().cpu().numpy().astype(int),
-                                   tr['cap_sub'].detach().cpu().numpy().astype(int))
+        counts = tr['counts'].detach().cpu().numpy().astype(int)
+        eff = tr['eff_sub'].detach().cpu().numpy().astype(int)
+        cap = tr['cap_sub'].detach().cpu().numpy().astype(int)
+        reprs = population_to_repr(counts, eff, cap)
         h_body = rao_blackwell_h_body(tr['step_entropy'].detach().cpu().numpy(),
                                       tr['active_step'].detach().cpu().numpy())
         red = redundancy(reprs, h_body)                    # N_body, C_nats, N_limb, H_within_sum, ...
@@ -941,6 +946,21 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('build/body_structure', red['C_nats'] / sumH if sumH > 1e-9 else 0.0, frame)
         for i in range(self._n_limbs):
             w.add_scalar(f'build/limb_diversity/{_LIMB_CODE[i]}', float(red['N_limb'][i]), frame)
+
+        # M4: the diversity HEADLINE (docs/reference/Metrics.md), on the SUBTYPE-COLLAPSED skeleton.
+        #   n_modes    = Hill(q=1) over single-linkage d_struct clusters at tau = 1 module
+        #   div_struct = mean pairwise d_struct (threshold-free companion)
+        # Collapsed because the free_entropy finding is that the skeleton commits while the subtype
+        # axis stays FREE: every typed statistic (build/n_distinct, build/body_diversity) therefore
+        # stays near its ceiling under total skeleton collapse and cannot detect it. n_modes == 1.0
+        # is one design, by construction. This is what the tuner gates on -- ADR-0020.
+        # RL-only, exactly matching build/n_distinct, so a tail over the whole series is precisely
+        # "all RL windows" whatever n_pretrain is set to, with no arithmetic on the tuner side.
+        if rl:
+            n_modes, spread = modes_and_spread(
+                population_to_repr(counts, eff, cap, collapse_subtypes=True))
+            w.add_scalar('build/n_modes', n_modes, frame)
+            w.add_scalar('build/div_struct', spread, frame)
 
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):
