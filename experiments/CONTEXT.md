@@ -1,6 +1,112 @@
 # Analysis
 
-Studies of what a trained limb transformer attends to, and how that relates to reward — the groundwork for using attention as a future bridge to a generative morphology policy. Owns `experiments/`, `notebooks/`, and the figures/`.npz` in `data/`. Shared terms live in the [Context Map](../CONTEXT-MAP.md); architecture terms (token, limb transformer) in [Control](../transformer_rl/CONTEXT.md).
+The paper's experiments and the shared measurement layer they run on. Owns `experiments/`, `notebooks/`, `docs/experiments/`, and the artifacts in `data/`. Shared terms live in the [Context Map](../CONTEXT-MAP.md); architecture terms (token, limb transformer) in [Control](../transformer_rl/CONTEXT.md).
+
+## Paper metrics
+
+The five measurements nearly every experiment reports. Each is a *comparison* between conditions,
+never a single run's number.
+
+All five presuppose a **generator**. Experiments 4 and 5 do not have one — experiment 4 by design
+(`resample_interval: 0`, one fixed body), experiment 5 because its baselines lack one — so both define
+their own measurements in their own docs and none of the terms below apply to them.
+_Avoid_: putting a no-resample return on shared axes with a resampling one. They run on different LR
+schedules (warmup is gated on a nonzero interval) and over different body distributions.
+
+**Return curve**:
+Task performance over time: mean true body return over the bodies of the window that just ended,
+one point per [resample window](#). Measured on the generator's **own** bodies, so it is a joint
+body×control score — a run that collapses onto one easy body can beat one that keeps exploring.
+That is the intended headline ("which method ends up better"); the other metrics are what
+decompose it.
+_Avoid_: reading it as a control-quality curve.
+
+**Specialized return**:
+Best-case performance of the body a run committed to: control fine-tuned on that **one** body alone,
+with the codesign scaffolding stripped (no resampling, no generator, no aux heads). Deliberately
+collapses control from generalist to specialist, so every method is given the same chance to
+specialize and **generalization stops reading as weak performance** in the
+[return curve](#return-curve). Reported as markers on that curve, at the
+[spread ladder](#spread-ladder)'s checkpoints.
+_Avoid_: reading it as a control measure — it is a **body-quality** measure. Enough fine-tuning
+drives every method's control to the same single-body policy by construction, so a null here means
+the designs were comparable and says nothing about the policies that found them.
+
+**Spread ladder**:
+The one-parameter family of body distributions obtained by scaling the randomness of the
+generator's own output, from fully committed to fully random. Its three landmarks are the existing
+body sources: zero spread = the generator's **committed body**, default spread = the trained
+distribution, maximum spread = a **random policy on the same grammar**. Levels are indexed by
+**perturbation distance** — mean [`d_struct`](#tip-aligned-structural-distance) from the committed
+body, in modules — so the axis is the same for every run, and its top end is set by the grammar
+rather than by the run.
+_Avoid_: reading a level as "bodies exactly this far out" — a level is a *distribution* whose mean
+distance is that number.
+
+**Control-generalization curve**:
+Control performance as a function of [perturbation distance](#spread-ladder), with the generator's
+default spread marked. How far outside its own distribution the control policy remains valid —
+the difference between a method doing local and global optimization. At zero distance every body is
+the same committed body, so the spread there is pure measurement noise and serves as the metric's
+own noise floor.
+_Avoid_: reading a flat curve as "control handles new body plans" without checking the **skeleton
+share** of the distance — the [free vs committed axes](#free-vs-committed-axes) finding means a
+ladder can move subtypes while leaving the body plan untouched.
+
+**GenCrit-generalization curve**:
+The paired metric: GenCrit's accuracy as a function of the same [perturbation distance](#spread-ladder).
+Whether the *generator's* judgement, not just control's competence, survives outside the
+distribution it trained on. Global optimization needs both curves to hold up; either one decaying
+pins the method to local search.
+
+**Exploration curves**:
+How much searching the generator actually does, over a run. Two independent components, both
+required — [breadth](#effective-number-of-modes) (how many designs at once) and
+[travel](#travel) (how far the distribution moves between windows). They come apart: a generator
+holding one design that marches across design space explores while reading as fully collapsed, and
+one holding the same three designs forever reads as healthy while exploring nothing.
+_Avoid_: reporting breadth alone as "exploration".
+
+**Boundary-recovery trace**:
+Per-epoch reward (`control/r_step`) folded on the resample boundaries and averaged over all RL
+windows, giving a dip depth and a recovery time. The only per-epoch series in the paper series —
+every other measurement is per-window, so the transient is invisible in them. Built for
+[experiment 3](../docs/experiments/clone.md).
+_Avoid_: folding `rewards/iter` instead. That series is rl_games' `game_rewards` meter — a ring
+buffer of the last 100 **finished episodes** pooled over all envs — so it moves only when episodes
+end, and at `resample_interval: 1` every env truncates simultaneously at the same instant as the
+resample. Its fold is a fourfold excursion that tracks `episode_lengths/iter` exactly and would look
+the same in a run that never resamples: it measures which episodes happened to finish, not
+re-adaptation. `control/r_step` is the mean raw reward per env-step over the epoch, unlagged and
+sampled from every step of the rollout.
+_Avoid_: reading the dip as interference. It mixes two causes — *the bodies are new* and *the trunk
+moved under control* — and only [uncorrected clone drift](#uncorrected-clone-drift) isolates the
+second. Also avoid deriving the fold origin from a `clone/*` scalar's step index without converting
+it: those steps are **frames**, and the frame counter lags by one epoch (window *k* closes at the end
+of epoch `63k` but is logged at frame `(63k−1)·num_actors·horizon_length`). The epoch spacing itself
+is exact — `_steps_since_resample` resets to 0 at the boundary instead of subtracting, so the 8-step
+overshoot per window never accumulates.
+
+**Boundary checkpoint**:
+A checkpoint saved at the end of epoch `k·epochs_per_window`, which the [spread ladder](#spread-ladder)
+and [specialized return](#specialized-return) both read. It is written *after* that epoch's resample,
+so it holds `gen_window = k`: the generator has had exactly *k* updates and the next window's bodies
+are already installed. `save_frequency` is set to one window so every save is one of these
+(`harness/launch.py`); the shipped config's 50 epochs would put each one 4–14 epochs into the
+*following* window, one generator update short of its own label.
+_Avoid_: warm-starting from one without overriding the epoch budget. `set_full_state_weights` restores
+`epoch_num`, and training stops at `epoch_num >= max_epochs`, so a 250-epoch fine-tune off a
+3024-epoch checkpoint exits after one epoch. Also avoid assuming `resample_interval: 0` keeps the
+restored run on the committed body — restoring **re-installs the checkpoint's sampled population**
+(`codesign_agent.py:993-996`), which is not the committed body and must be replaced explicitly.
+
+**Uncorrected clone drift**:
+`clone/actor_kl` and `clone/critic_mse` read off a run whose clone coefficients are **zero**. Both
+terms are computed before being scaled by `beta`/`lam`, so switching the clone off leaves them fully
+measured and merely unoptimized — the ablation reports its own counterfactual for free. This is what
+makes an experiment-3 null attributable: small drift means there was nothing to preserve (the clone is
+dead weight), large drift with no return gap means control absorbs it unaided.
+_Avoid_: skipping these scalars for zero-coefficient arms — they are the arms where they mean the most.
 
 ## Diversity
 
@@ -20,6 +126,31 @@ _Avoid_: root-aligned / positional limb comparison (misranks unequal-length limb
 Prevalence-weighted count of *distinct designs* a converged generator produces: Hill number (order q=1, perplexity) over `d_struct`-clusters (τ = 1 module) of the sampled bodies. `1.0` = single design (ES-like); `>1` = branching (EA-like). The Phase-8 diversity target. Between-seed variant adds **mode-overlap** (fraction of seed-pairs sharing a mode).
 _Avoid_: generator-entropy as the diversity headline (inflates independent-component flipping without breaking the common core — see Phase 8).
 
+## Travel
+
+The complement to [Diversity](#diversity), which is a snapshot: how far the generator's body
+distribution **moves** from one [resample window](#) to the next. Measured on the same
+subtype-collapsed skeleton, and reported alongside the typed version — "skeleton travel stops while
+subtype churn continues" is a finding, not a nuisance.
+
+**Energy distance**:
+The travel headline. A window-to-window divergence built from
+[`d_struct`](#tip-aligned-structural-distance): the mean cross-window distance with **each window's
+own breadth subtracted off**, so it is zero exactly when the two windows' distributions match and
+positive in proportion to real movement, still in module units. Its same-distribution null is
+measured rather than assumed — one window's sample split in half and compared against itself.
+_Avoid_: plain mean cross-window distance as travel. For two *identical* distributions it equals
+the within-window mean pairwise distance, so a wide static generator scores as fast-moving; breadth
+and travel are inseparable in it.
+
+**Mode coverage**:
+Cumulative count of distinct [modes](#effective-number-of-modes) seen up to a given window, matched
+across windows by the same single-linkage clustering so a mode that shifts by one module is not
+counted as new. Its **slope** is the discovery rate; still-climbing vs long-plateaued is the
+local-vs-global-search reading at a glance.
+_Avoid_: reading a plateau as "the generator stopped moving" — the curve is monotone by
+construction and only reports finding, not motion. Pair it with [energy distance](#energy-distance).
+
 ## Committance
 
 A **separate axis from [Diversity](#diversity)**: not *how many* distinct designs a generator produces, but *how committed vs. free* it is, and whether its limbs form a coordinated body plan. Measured by entropy-decomposition of the generator's own per-step distributions (analytic Rao–Blackwell), not by clustering samples — so it is confounded with total entropy and must not be read as diversity. Formulas + column names live in [docs/reference/Metrics.md](../docs/reference/Metrics.md).
@@ -29,7 +160,54 @@ Total correlation across the 8 limb slots, in perplexity units — how much more
 _Avoid_: reading `rho` alone — a fully-committed generator has `rho = 1` **trivially** (no variance left to correlate), so it is confounded with total entropy; pair it with the effective-skeleton count.
 
 **Free vs. committed axes**:
-The [free_entropy finding](#): under training the **skeleton commits** (effective skeleton count → 1) while the **subtype axis stays free** (effective subtype count > 1). This split is why [Diversity](#diversity) is measured on the subtype-collapsed skeleton — the free subtype axis would otherwise inflate any count.
+The **free-entropy finding** (from a since-retired study, cited by ADR-0020 and `Metrics.md`): under
+training the **skeleton commits** (effective skeleton count → 1) while the **subtype axis stays free** (effective subtype count > 1). This split is why [Diversity](#diversity) is measured on the subtype-collapsed skeleton — the free subtype axis would otherwise inflate any count.
+
+## Joint optimization
+
+A **toy abstraction** of codesign on a 2D domain, in `experiments/joint_optimization/`: two coupled
+optimizations where one agent's search is gated by another's accuracy. Deliberately shares *no*
+vocabulary with the real system — the terms below are not the generator, control, or GenCrit, and a
+finding here transfers only as far as the abstraction does.
+
+**Designer**:
+The agent that picks a point `(x,y)` in the domain, minimizing the loss it observes. The
+generator-analogue, but it emits a point in ℝ² rather than a morphology under a grammar. It is
+**unconditional** (no observation), so its analogue of a generalization radius is not an input→output
+radius; the symmetric comparison the experiment wants needs a *model-based* designer that fits a
+surrogate over `(x,y)`.
+_Avoid_: generator (reserved for the morphology generator).
+
+**Predictor**:
+The agent that predicts the [target landscape](#target-landscape) from `(x,y)` alone. It **fuses two
+roles** the real system separates: it *acts by predicting* a scalar (GenCrit's job) but its
+competence *gates what the designer observes* (control's job). Because it sees only `(x,y)`, it must
+implicitly learn the quality landscape too.
+_Avoid_: critic (a critic fits the return; the predictor fits an exogenous surface it cannot
+influence), controller (it does not act on the world).
+
+**Quality landscape** (`L1`):
+The surface the designer searches, non-positive by construction. What the designer would minimize if
+the predictor were perfect.
+
+**Target landscape** (`L2`):
+The surface the predictor fits — a function of position *and* of `L1` at that position. Pure
+regression target: its value never enters the loss, only the predictor's error on it. Unconstrained
+in sign and offset; only its scale matters, through [fidelity](#fidelity).
+
+**Fidelity** (`A`):
+The predictor's accuracy as a multiplicative gate in `(0,1]`, a Gaussian in its error. The whole
+coupling: since the loss is non-positive, low fidelity drags it toward 0, so **good points the
+predictor does not understand look bad**. That is the exploration/exploitation pin the experiment
+exists to measure.
+_Avoid_: reading it as a penalty term — it scales the loss, it is not subtracted from it, so its
+effect is proportional to how good the point already is.
+
+**Dead zone**:
+The region where the quality landscape is clamped flat at 0 — points so bad that no fidelity helps,
+since the gate multiplies zero. Its size is the one calibration knob on the landscape: shifting the
+landscape down shrinks the dead zone and deepens the wells. A dead zone exists only if the raw
+landscape actually rises above that offset, so the formula is written in absolute units, not shape.
 
 ## Language
 
@@ -49,21 +227,33 @@ _Avoid_: comparing the network's raw normalized output to reward — wrong units
 **Aggregation granularity** (per-token vs grouped):
 Plots come in `_tokens` and `_groups` families. `_tokens` keeps individual tokens; `_groups` pools them — but *how* it pools is intentionally not fixed (could be per limb, per token type, or per morphology depending on the view). Treat "group" as the coarser aggregation, defined per plot.
 
-## Historical scripts
+## Harness
 
-Eight analysis scripts read constants the CoDesigner migration abolished — `_OBS_TOTAL`,
-`_N_DOFS_FULL`, `_N_LIMBS`, `_slot` — which were module-level facts of the deleted `task_envs/` and
-have **no aliasable successor**: slot count and chain depth belong to the live `ModuleLibrary`, and
-the observation offsets are published per-Task by `Task.obs_layout()`. Both need a run's library
-instance, which a bare import cannot supply.
+`experiments/harness/` is the shared measurement layer — one implementation per metric, imported by
+the per-experiment scripts, by `scripts/eval.py`, and (for the logged diversity/committance) by the
+training agent itself:
 
-**Historical**, i.e. their env-touching entry points raise on import and are repaired on demand, not
-kept green: `ant_codesign.py`, `vocab_ablation.py`, `free_entropy.py`, `teacher_fidelity.py`
-(only its checkpoint path), `gen_ratio_staleness.py`, `commit_metrics.py`, `lengthonly_recheck.py`.
-Half of them were already broken before the migration — four import `_OBS_TOTAL` from a module that
-stopped defining it at the ModuleLibrary port. Their pure-analysis halves (`diversity*.py`,
-metric functions, notebook readers) are untouched and still work.
+- `diversity.py` — morphology distances (`d_comp`, `d_struct`) and `N_modes`.
+- `committance.py` — typed population representations + the entropy-decomposition committance
+  metrics (`rho`, `N_body`, `N_limb_mean`). Was `diversity_p5.py`.
+- `policy.py` — checkpoint → `(net, obs normalizer)`. Was `ppg_parity._load_policy`.
+- `slots.py` — what a slot is, how a process is pinned to one, why it died, and which checkpoint is
+  newest. Shared with `scripts/tune.py`, which imports these names rather than keeping its own copy:
+  two implementations of GPU pinning means two runs on one slice.
+- `launch.py` — the run scheduler. Studies are **data** (`STUDIES`): an arm is a name plus the
+  `--set` overrides that define it, taken from the build plans. Also owns the two derived budget
+  numbers — `max_epochs` as a whole number of windows, and `save_frequency` as one window.
+- `evalpass.py` — one eval pass: open a task, load a checkpoint's policy, install bodies, roll out at
+  μ. Lifted out of `scripts/eval.py`, which imports it; the ladder and the specialization pass need
+  that exact rollout, and it is the rollout that defines what "return" means for every metric.
+- `specialize.py` — the [specialized return](#specialized-return): doctor a boundary checkpoint onto
+  the [committed body](#committed-body), fine-tune 250 epochs with the scaffolding stripped, roll out.
+- `scrape.py` — run dirs → one per-experiment rollup npz. The only place a scalar's TensorBoard step
+  becomes a window index, and the only reader of a resumed run's two overlapping event files.
 
-`ppg_parity.py` and `phase_comparison.py` are **not** in this bucket: `eval.py` depends on the
-former's checkpoint loader, so both were ported. Repairing one of the others means the same three
-moves — construct the library, `setup()` the Task, read widths off `obs_layout()`.
+[Joint optimization](#joint-optimization) is **not** part of the harness — it is a self-contained toy
+with no dependency on the repo's tasks, checkpoints or metrics.
+
+The pre-CoDesigner-migration analysis scripts (the phase-comparison harness, `ppg_parity`, and the
+one-off `free_entropy`/`commit_metrics`/`teacher_fidelity`/… studies) and their notebooks were
+**deleted** with the move to the paper-experiment series; only the code above survived them.

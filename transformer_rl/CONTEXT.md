@@ -77,6 +77,36 @@ Generalized roles, used when control and generator live on **one network** as fo
 
 The merge: GenCrit and the old separate V1.0 head are now **one function**, not a distill pair. It's fit on two data sources toward the same body-quality target — rollout states (per-step return-to-go) and generation-token prefixes (toward the body's realized `R`). At resample the trunk learns **only** the generator side (GenAct + GenCrit/V1.0); **both** control heads are held by a clone term — **KL[ContAct_old, ContAct]** for the actor, **MSE(ContCrit, ContCrit_old)** for the critic. Per-step, control trains as **plain combined PPO** (trunk moves freely).
 
+## Auxiliary prediction heads
+
+Three separate mechanisms that shape the trunk's representation with a signal denser than PPO's
+advantage. All independently config-gated; only the first two are on. Ablated together as
+[experiment 2](../docs/experiments/aux.md).
+
+**Forward-dynamics head** (FD):
+Predicts the **next** physical state from the current one. Two targets, chosen by `fd_variant`:
+`raw` regresses the next observation directly, `latent` predicts the content-only **embedding** of
+the next state against a stop-grad target anchored by `embed_module`. `latent` is the shipped
+variant and is JEPA-*like* — it predicts the network's own representation rather than the world —
+which is why "the JEPA head" informally names it. Fused into the PPO loss; no extra forward pass.
+
+**Forward-kinematics head** (FK):
+Predicts each module's **torso-frame pose** (position + rot6D + velocity) at the current state,
+against the **truly composed** target from the morphology. Not self-supervised and not JEPA at all —
+ground-truth regression. Its job is to force the encoder to represent where a body's parts actually
+are, which design mode then reads as tokens. Fused into the PPO loss.
+_Avoid_: reading FK as evidence about transfer without checking it had signal to give — at a **rest
+pose** the target is nearly a deterministic function of the morphology, which design mode already
+sees, so a flat `gen/fk` makes an ablation uninterpretable.
+
+**Masked-token JEPA** (`config.jepa`):
+The literal I-JEPA: mask a random subset of tokens (CLS + present modules), swap in a learned
+`[MASK]` latent, and predict the stop-grad unmasked hidden states through a BYOL-style predictor.
+Same-step, not predictive over time. **Currently disabled** and unvalidated; carries its own
+backward pass and a representation-anchor term in the resample update.
+_Avoid_: saying "JEPA" for FD. In this codebase `jepa` names **this** head; FD's latent variant is
+JEPA-like but is a different mechanism with a different gate.
+
 ## Codesign tokens (single-network)
 
 The merged net's limb-token vocabulary, spanning both reading **modes** (the net reads a real body vs a blueprint).
@@ -95,6 +125,10 @@ A **persistent** per-slot anchor (one per limb slot), distinct from the content 
 
 **CLS token** (= the **root** token, reused):
 Global-obs aggregator feeding the value heads (V0.98 + V1.0/GenCrit). `v(prefix)` is its design-mode readout over committed tokens (pending slots are simply **absent/masked**, not tokens). Its *content* differs by mode — root state embed in **live** mode, a learned `cls_design` parameter in **design** mode (generation has no root state) — but the same trunk and value heads read its output in both.
+
+**Attention scope** (`network.transformer.attn_scope`):
+Which tokens a token may attend to on the **control** encode path (`_encode_codesign`) — `full` (every token, the shipped network), `self_cls` (itself and the CLS/root token: own state plus torso, no inter-limb information), `self` (itself alone). A boolean mask only: all three are **parameter-identical**, and with `n_layers: 1` there is exactly one round of token mixing to switch off. Exists for [experiment 4](../docs/experiments/attention.md).
+_Avoid_: wiring it into `_encode_design`. The generator is autoregressive over its generation prefix, so restricting its attention breaks generation outright. _Avoid_ also: replacing the `full` path with an all-True mask instead of `None` — an explicit mask changes the SDPA kernel path, so the control arm would stop being bit-identical to the shipped network.
 
 ## Generation (morphology generator)
 
