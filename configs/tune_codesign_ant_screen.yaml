@@ -88,6 +88,10 @@ study:
 
   # ── parallel scheduling (ADR-0017) ──
   slots: auto                   # 8 MIG slices on the tuning box; --slots 1 --allow-busy locally
+  expect_slots: 8               # refuse to start on the wrong width. Without this, forgetting the
+                                # MIG setup is silent: `auto` finds 2 whole cards and the study runs
+                                # 4x slower for days. Partitioning itself is a separate, sudo,
+                                # machine-level step -- `python -m experiments.harness.mig`.
   launch_stagger_seconds: 30
   max_attempts: 3               # rebuild crash resumes from checkpoint; OOM never relaunches
   keep_checkpoints: 2

@@ -1184,6 +1184,18 @@ def main():
             spec = None if spec == "auto" else (int(spec) if spec.isdigit() else spec.split(","))
         slots = _make_slots(spec, allow_busy=args.allow_busy)
         print(f"[slots] {len(slots)}: " + ", ".join(f"{s.name}={s.device}" for s in slots), flush=True)
+        # Forgetting the MIG setup is SILENT otherwise: `slots: auto` finds 2 whole cards instead of
+        # 8 slices and the study runs 4x slower for days without a single warning. Declaring the
+        # expected width turns that into a refusal at second zero. Non-destructive on purpose -- the
+        # partitioning itself needs sudo and lives in `experiments/harness/mig.py`.
+        # Only when the width came from DISCOVERY: an explicit --slots is the operator stating the
+        # width deliberately (the local `--slots 1 --allow-busy` path), and _make_slots already
+        # treats an explicit spec as an override to be honoured verbatim.
+        if (want := sc.get("expect_slots")) and args.slots is None and len(slots) != want:
+            raise RuntimeError(
+                f"expect_slots: {want} but discovered {len(slots)}. On the tuning box run "
+                f"`sudo python -m experiments.harness.mig --gpus 0,1 --profile 67 --count 4`; "
+                f"elsewhere override with --slots or drop expect_slots from the config.")
 
     param_names = [p["path"] for p in tune_cfg["params"]]
     state = _State(sc["n_trials"], param_names, [s.name for s in slots])
