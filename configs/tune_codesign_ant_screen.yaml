@@ -123,6 +123,10 @@ params:
     # BC warmup length in WINDOWS. 8 of 24 today -- a third of the run -- and it installs the
     # generator's prior, which makes it the highest-leverage untuned knob here.
 
+  # ── aux heads ──
+  - {path: params.config.fd.coef, type: float, low: 0.001, high: 1.0, log: true}
+  - {path: params.config.fk.coef, type: float, low: 0.001, high: 1.0, log: true}
+
   # ── timing / batch ──
   - {path: params.config.horizon_length, type: categorical, choices: [8, 16, 32]}
   - {path: params.config.mini_epochs, type: int, low: 2, high: 8}
