@@ -9,6 +9,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 ├── CONTEXT-MAP.md                    ← this file; shared kernel below
 ├── docs/
 │   ├── adr/                          ← system-wide decisions
+│   ├── experiments/                  ← the paper's experiments (README.md = index + one doc per experiment)
 │   ├── reference/                    ← lookup docs
 │   │   ├── transformer_architecture.md (living doc: full obs→action flow, shapes, why)
 │   │   ├── Metrics.md                (eval.py metric reference: meaning/formula/reading)
@@ -45,9 +46,10 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   └── tune_config.yaml
 ├── experiments/                      ← Analysis context
 │   ├── CONTEXT.md
-│   ├── phase_comparison.py           (cross-phase harness; ADR-0015)
-│   └── diversity_p5.py               (population diversity estimators)
-├── notebooks/                        ← Analysis context
+│   ├── harness/                      (shared measurement layer: diversity, committance, policy)
+│   ├── joint_optimization/           (2D toy: designer/predictor coupling; standalone, no repo deps)
+│   └── <slug>.py                     (one data-gathering script per paper experiment)
+├── notebooks/                        ← Analysis context (one <slug>.ipynb per experiment)
 ├── data/                             ← Analysis context (figures, .npz)
 ├── logs/  runs/  videos/             (run artifacts, gitignored/untracked)
 ```

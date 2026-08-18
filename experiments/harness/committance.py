@@ -24,7 +24,7 @@ from collections import Counter
 
 import numpy as np
 
-from experiments.diversity import TAU_MODE, _dedup, _hill, d_struct  # noqa: F401  (d_struct: self-test)
+from experiments.harness.diversity import TAU_MODE, _dedup, _hill, d_struct  # noqa: F401  (d_struct: self-test)
 
 EFF_NAMES = ("swing", "knee", "twist")             # vocab.py effector subtype order
 CAP_NAMES = ("bare", "foot", "pad", "ball")        # vocab.py cap subtype order; 0 == bare
@@ -250,7 +250,7 @@ def rao_blackwell_h_body(step_entropy, active_step):
 
 
 if __name__ == "__main__":
-    from experiments.diversity import N_modes, TAU_MODE, counts_to_repr
+    from experiments.harness.diversity import N_modes, TAU_MODE, counts_to_repr
 
     cnt = np.array([2, 0, 3, 0, 0, 0, 0, 0])
     eff = np.zeros((8, 4), dtype=int)
@@ -287,4 +287,4 @@ if __name__ == "__main__":
 
     se = np.array([[0.5, 0.25, 0.0], [0.5, 0.25, 99.0]])
     assert abs(rao_blackwell_h_body(se, np.array([[1, 1, 0], [1, 1, 0]], bool)) - 0.75) < 1e-12
-    print("diversity_p5 OK")
+    print("committance OK")

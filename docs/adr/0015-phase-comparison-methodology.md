@@ -1,8 +1,13 @@
 ---
-status: accepted
+status: superseded
 ---
 
 # Phase-comparison methodology: the frozen per-phase artifact every Complexity-Escalation phase writes into
+
+> **Superseded by [ADR-0021](0021-paper-experiment-metric-protocol.md):** the harness, scripts and
+> notebooks this ADR specifies were deleted with the move to the paper-experiment series. The
+> shared measurement code that survived lives in `experiments/harness/`. Kept for the record of why
+> the per-phase comparison contract was chosen.
 
 ## Context & Decision
 
