@@ -11,7 +11,7 @@ dependencies = [
     "python-xlib>=0.33",
     "pyyaml>=6.0.3",
     "rich>=13.0.0",
-    "scikit-learn>=1.4",    # optuna's fANOVA importance evaluator (scripts/tune.py --report)
+    "scikit-learn>=1.4", # optuna's fANOVA importance evaluator (scripts/tune.py --report)
     "seaborn>=0.13.0",
     "setuptools<81",
     "rl_games>=1.6.0",
@@ -30,7 +30,4 @@ notebook = [
 
 [tool.uv.sources]
 vlearn = { path = "../vlearn-main/vlearn-0.3.9-cp311-cp311-linux_x86_64.whl" }
-# Editable against the source tree while both sides of the observation contract are in flight, so an
-# edit there is visible here without a wheel rebuild. `../SoftwarePackage/package_and_install`
-# refreshes Packages/ for a handover; switch back to that wheel to ship one.
-codesigner = { path = "../SoftwarePackage", editable = true }
+codesigner = { path = "Packages/codesigner-1.0.0-py3-none-any.whl" }
