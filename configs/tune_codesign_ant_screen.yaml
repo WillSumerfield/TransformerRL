@@ -41,18 +41,44 @@ study:
   score_mode: recovered
   score_window: 5               # windows, not epochs
   gate:
-    key: "build/n_modes"        # the diversity HEADLINE: Hill(q=1) over single-linkage d_struct
-                                # clusters at tau=1, on the SUBTYPE-COLLAPSED skeleton. 1.0 == one
-                                # design == full collapse, by construction. NOT build/n_distinct:
-                                # that counts typed designs, and the free_entropy finding is that
-                                # the skeleton commits while subtypes stay free, so it never left
-                                # 286-4096/4096 across a whole prior study. It cannot detect this.
-    floor: null                 # null == gate INERT. Set after the calibration wave (by eye, from
-                                # the anchor's n_modes band). The anchor passes any sane floor, so
-                                # calibration and search stay comparable either way.
-    window: 0                   # 0 == whole series. n_modes is logged RL-only, so that is exactly
-                                # "all RL windows" -- the gate asks "did it ever search", not "is it
-                                # still searching": late commitment is success, not collapse.
+    key: "build/div_struct"     # mean pairwise d_struct on the SUBTYPE-COLLAPSED skeleton.
+                                # 0.0 == one design, the same absolute anchor n_modes was picked
+                                # for, but threshold-free: no clustering, so no percolation.
+                                # NOT build/n_modes (ADR-0020 as first written -- amended after the
+                                # calibration wave). n_modes is single-linkage Hill at tau=1, and
+                                # single linkage is TRANSITIVE, so it merges along 1-edit CHAINS
+                                # rather than ignoring 1-edit differences. Measured: 16x more
+                                # samples from an IDENTICAL distribution drops n_modes 5x (13.50 ->
+                                # 2.64) while div_struct moves 1% (5.59 -> 5.65). It also compresses
+                                # a 20x range of real spread into [1.0, 3.0]. In the calibration
+                                # anchor n_modes fell 260x (1595 -> 6) while div_struct fell 32%
+                                # (11.9 -> 8.0): the population concentrated, it did not collapse,
+                                # and only div_struct says so. NOT build/n_distinct either -- that
+                                # counts typed designs, and per the free_entropy finding the
+                                # skeleton commits while subtypes stay free, so it never left
+                                # 286-4096/4096 across a whole prior study.
+    floor: 3                    # From the 8-seed calibration wave, tail-5: div_struct 5-8
+                                # (mean 6.8, SD 1.1, CV 16%). Sits 1.8 SD below the WORST seed and
+                                # 3.5 SD below the mean, so seed noise never crosses it and the
+                                # saturation contributes exactly zero score variance on healthy
+                                # configs. Targeted at genuine degeneracy, not at concentration:
+                                # measured reference points are div_struct 1.74 / 0.92 / 0.37 for
+                                # populations clustered ever tighter around one design, so the
+                                # x0.5 half-discount lands at 1.5 -- inside that degenerate band and
+                                # far below anything the anchor produces. Full collapse -> 0.0 -> a
+                                # score of exactly 0. Deliberately NOT set to price "how much
+                                # concentration is too much" -- refusing that trade rate is the
+                                # point of a saturating floor (ADR-0020).
+    window: 5                   # TAIL, not whole series -- matched to the reward tail. A whole-
+                                # series mean is dominated by the early exploration transient (the
+                                # anchor opens near-uniform), so it cannot fire on a run that
+                                # degenerates later: no floor passing the anchor also penalises one
+                                # ending collapsed. The tail is only SAFE because the metric is
+                                # div_struct -- ADR-0020 chose whole-series to avoid punishing
+                                # healthy late commitment, which under n_modes is indistinguishable
+                                # from collapse (both -> ~1). Under div_struct healthy commitment
+                                # reads 8.0 and collapse reads ~0, so the tail asks the right
+                                # question without the false positive.
 
   experiment_name_path: params.config.full_experiment_name
   train_dir_path: params.config.train_dir
@@ -70,7 +96,8 @@ study:
   top_k: null                   # -> max(3, 15% of completed) == ~36 at 240 completed
   noise_metrics:                # window 24 >= the total window count, i.e. the WHOLE series -- so
     - {key: "quality/R_mean", window: 5}    # the reported n_modes CV is the CV of the quantity the
-    - {key: "build/n_modes",  window: 24}   # gate actually reads, not of some other tail
+    - {key: "build/div_struct", window: 5}  # gate actually reads, not of some other tail
+    - {key: "build/n_modes",  window: 24}   # kept as a diagnostic only -- no longer the gate
 
 pruner:
   enabled: false                # ADR-0018: stays off until a calibration wave shows mid-run rank
