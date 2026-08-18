@@ -5,11 +5,8 @@ Usage: python tune.py <tune_config.yaml> [--calibrate N | --confirm N | --report
 """
 
 import json
-import os
 import random
-import re
 import signal
-import subprocess
 import sys
 import threading
 import time
@@ -172,158 +169,12 @@ def _final_frac_score(series: list[float], params: dict, sc: dict, base_cfg: dic
 
 
 # ── slot layer ────────────────────────────────────────────────────────
-# A SLOT is one unit of trial concurrency: a single pinned CUDA device running one trial process.
-# How slots are supplied is a property of the machine, not of the tuner -- the tuning server splits
-# its two cards by MIG into 8, a workstation offers one per GPU -- so everything below deals in
-# device STRINGS (what goes into CUDA_VISIBLE_DEVICES) and MIG is just one way to produce them.
-# A trial sees exactly one device and calls it cuda:0, which is why the hardcoded `cuda:0` sites in
-# train_utils/algorithm need no change. slots=1 reproduces the old serial tuner exactly.
-
-_MIG_RE = re.compile(r"UUID:\s*(MIG-[^)\s]+)")
-_GPU_RE = re.compile(r"^GPU\s+(\d+):.*UUID:\s*(GPU-[^)\s]+)")
-_EP_RE  = re.compile(r"_ep_(\d+)_")
-
-# Ordered most-specific first: an OOM often cascades into a generic CUDA error, so testing the
-# rebuild signatures first would misfile a genuine out-of-memory as a transient fault and resume it
-# forever. See docs/troubleshooting/resample_rebuild_crash.md for the rebuild signatures.
-_OOM_SIG     = ("CUDA out of memory", "torch.OutOfMemoryError", "CUDA error: out of memory")
-_REBUILD_SIG = ("Error deallocating pinned host memory", "CUDA error: invalid argument",
-                "AcceleratorError")
-
-
-class _Slot:
-    __slots__ = ("name", "device")
-
-    def __init__(self, name: str, device: str):
-        self.name   = name      # short display label for the slot table
-        self.device = device    # the CUDA_VISIBLE_DEVICES value
-
-
-def _smi(query: str) -> str:
-    """`nvidia-smi <query>` stdout, or "" if nvidia-smi is absent/fails (caller degrades)."""
-    try:
-        return subprocess.run(["nvidia-smi", *query.split()], capture_output=True,
-                              text=True, timeout=30).stdout
-    except (OSError, subprocess.SubprocessError):
-        return ""
-
-
-def _discover_devices() -> list[tuple[str, str]]:
-    """(name, device) for every schedulable device, MIG instances if the box is partitioned else
-    whole GPUs. Uses UUIDs, not indices: indices are reorderable by driver/env, UUIDs are not."""
-    out = _smi("-L")
-    devices, gpu_idx = [], -1
-    for line in out.splitlines():
-        g = _GPU_RE.match(line.strip())
-        if g:
-            gpu_idx = int(g.group(1))
-            devices.append((f"gpu{gpu_idx}", g.group(2)))
-            continue
-        m = _MIG_RE.search(line)
-        if m:                                    # indented MIG line: belongs to the GPU above it
-            devices.append((f"g{gpu_idx}m{sum(1 for n, _ in devices if n.startswith(f'g{gpu_idx}m'))}",
-                            m.group(1)))
-    migs = [d for d in devices if d[0].startswith("g") and "m" in d[0][1:]]
-    return migs if migs else [d for d in devices if d[0].startswith("gpu")]
-
-
-def _busy_devices() -> set[str]:
-    """UUIDs with a compute app on them right now. On a MIG box the driver may attribute an app to
-    the PARENT GPU rather than the instance, in which case no slot matches and nothing is skipped --
-    deliberately the safe direction: over-matching would mark all four slices of a card busy the
-    moment one is used, and leave the tuner with nothing to schedule. Unattributable apps are
-    reported by _make_slots so an operator can see the check is not biting."""
-    out = _smi("--query-compute-apps=gpu_uuid,pid --format=csv,noheader")
-    return {ln.split(",")[0].strip() for ln in out.splitlines() if ln.strip()}
-
-
-def _make_slots(spec, allow_busy: bool = False) -> list[_Slot]:
-    """spec: an explicit list of device strings (used verbatim, no idle check -- the operator's
-    override and the escape hatch if attribution misbehaves); an int N (first N idle discovered);
-    or None/"auto" (every idle discovered device). `allow_busy` keeps devices that already carry a
-    foreign compute app -- needed on a workstation, where a desktop session permanently occupies the
-    only GPU, and never wanted on the compute-only tuning server."""
-    if isinstance(spec, (list, tuple)) and spec:
-        return [_Slot(f"s{i}", str(d)) for i, d in enumerate(spec)]
-
-    found = _discover_devices()
-    if not found:
-        raise RuntimeError("no CUDA devices found via `nvidia-smi -L` (pass --slots to override)")
-    busy = set() if allow_busy else _busy_devices()
-    idle = [(n, d) for n, d in found if d not in busy]
-    stray = busy - {d for _, d in found}
-    if stray:
-        print(f"[slots] {len(stray)} compute app(s) on {', '.join(sorted(stray))} could not be "
-              f"attributed to a slot; idle-checking is not filtering them", flush=True)
-    for n, d in found:
-        if d in busy:
-            print(f"[slots] skipping busy slot {n} ({d})", flush=True)
-    if not idle:
-        raise RuntimeError(f"all {len(found)} discovered devices are busy")
-    if isinstance(spec, int) and spec > 0:
-        idle = idle[:spec]
-    return [_Slot(n, d) for n, d in idle]
-
-
-def _launch(cmd: list[str], device: str, log_path: Path, header: str):
-    """Start a trial pinned to `device`, streaming stdout+stderr to `log_path`. Own session
-    (setsid) so the scheduler can killpg the whole cohort without the signal racing its children.
-    Streams to a file rather than PIPE: the 64KB OS buffer would fill and deadlock the trainer."""
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    logf = open(log_path, "w")
-    logf.write(header)
-    logf.flush()
-    # Unbuffered: stdout block-buffers into a file, so a trial killed (timeout, Ctrl-C) would lose
-    # its last writes and the log would not be tailable while it runs. Tracebacks flush on their own
-    # at interpreter exit, so _classify_exit is safe either way -- this is for liveness.
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES=device, PYTHONUNBUFFERED="1")
-    proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, text=True,
-                            env=env, start_new_session=True)
-    return proc, logf
-
-
-def _classify_exit(log_path: Path, tail_bytes: int = 200_000) -> str:
-    """Why a trial died: 'oom' (a real property of the hyperparameters -- score it, never relaunch),
-    'rebuild' (the known gym-teardown race -- resume from checkpoint), or 'unknown' (also resumed;
-    a config that is genuinely broken will just fail again and exhaust its attempts)."""
-    try:
-        with open(log_path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - tail_bytes))
-            tail = f.read().decode("utf-8", "replace")
-    except OSError:
-        return "unknown"
-    if any(s in tail for s in _OOM_SIG):
-        return "oom"
-    if any(s in tail for s in _REBUILD_SIG):
-        return "rebuild"
-    return "unknown"
-
-
-def _newest_ckpt(nn_dir: Path) -> Path | None:
-    """Latest periodic checkpoint, by the `_ep_<N>_` field rather than mtime -- the filename also
-    carries a float reward, so the epoch must be matched anchored."""
-    best, best_ep = None, -1
-    for p in nn_dir.glob("last_*.pth"):
-        m = _EP_RE.search(p.name)
-        if m and int(m.group(1)) > best_ep:
-            best, best_ep = p, int(m.group(1))
-    return best
-
-
-def _purge_ckpts(nn_dir: Path, keep: int = 1) -> None:
-    """Drop all but the newest `keep` checkpoints in ONE trial's own nn/ dir. Tuning checkpoints
-    exist solely so a crashed trial can resume -- the tuner scores from TensorBoard and never reads
-    one -- so retaining every 19MB save would cost ~150GB over a full sweep. Only unlinks regular
-    files matching last_*.pth, by resolved name; never touches a directory."""
-    items = []
-    for p in nn_dir.glob("last_*.pth"):
-        m = _EP_RE.search(p.name)
-        if m:
-            items.append((int(m.group(1)), p))
-    for _, p in sorted(items, key=lambda x: x[0], reverse=True)[max(0, keep):]:
-        if p.is_file():
-            p.unlink(missing_ok=True)
+# Slot discovery, pinned launch, exit classification and checkpoint bookkeeping live in
+# experiments/harness/slots.py: the paper-experiment launcher schedules onto the same 8-slice machine,
+# and which GPU a process lands on must have ONE implementation or two runs will share a slice.
+from experiments.harness.slots import (   # noqa: E402
+    _Slot, _classify_exit, _kill, _launch, _make_slots, _newest_ckpt, _purge_ckpts,
+)
 
 
 # ── state ─────────────────────────────────────────────────────────────
@@ -980,26 +831,6 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
 
 
 # ── trial runner ──────────────────────────────────────────────────────
-
-def _kill(proc, grace: float = 30.0):
-    """SIGTERM the trial's whole process group, then SIGKILL whatever survives. Group-wide, not
-    proc.terminate(): a trial spawns its own children (compile workers, VSim threads) and signalling
-    only the leader leaves them alive holding the slot's GPU memory, so the next trial OOMs."""
-    try:
-        pgid = os.getpgid(proc.pid)
-    except OSError:
-        return
-    for sig, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, 10.0)):
-        try:
-            os.killpg(pgid, sig)
-        except OSError:
-            return
-        try:
-            proc.wait(timeout=wait)
-            return
-        except subprocess.TimeoutExpired:
-            continue
-
 
 class _Job:
     """One trial in flight on one slot: the process plus everything needed to score, resume or
