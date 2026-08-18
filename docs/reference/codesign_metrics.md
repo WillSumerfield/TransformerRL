@@ -138,7 +138,8 @@ encode/mode path, not the optimizer.
 ### 2. Mode / diversity collapse
 **Looks like:** `build/n_modes`→1 · `build/div_struct`→0 · `build/limbcount_var`→0 ·
 `gen/entropy`→0 fast · `build/limbcount` pinned at 1 or 8 · `gencrit/value_rank_corr` goes NaN.
-**Read `n_modes`, not `n_distinct`:** `n_distinct` counts *typed* designs, and per the
+**Read `div_struct` for severity, `n_modes` for presence.** `n_modes` bottoms out at 1 for *any* tightly-clustered population, so it says *that* something collapsed, not *how far*: a 20× range of real spread maps into `[1.0, 3.0]`. It is also density-confounded (16× more samples from an identical distribution drops it 5×; `div_struct` moves 1%), so never compare it across populations of different size. `div_struct` is threshold-free and linear in structural spread — measured reference points: 1.74 / 0.92 / 0.37 for populations clustered ever tighter around one design, `0.0` only when every draw is identical. A run at `n_modes`≈6 with `div_struct`≈8 has **not** collapsed; it concentrated enough to percolate the 1-edit graph.
+**Neither, rather than `n_distinct`:** `n_distinct` counts *typed* designs, and per the
 `free_entropy` finding the skeleton commits while the subtype axis stays free — so subtype jitter
 alone pins it near the sample size **through a total skeleton collapse** (measured: never below
 286/4096 across an entire 20-trial study). `build/body_diversity` fails the same way for the same
