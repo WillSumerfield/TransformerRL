@@ -1049,7 +1049,12 @@ def run_training(
         # Stamp the RESOLVED config (extends chain + base.yaml + every --set/CLI override applied)
         # into the run dir. `extends` and `--set` both resolve at load, so the yaml on disk no
         # longer answers "what knobs did this run use?" -- this file does.
-        stamp = Path(cfg["train_dir"], run_name)
+        # Keyed on full_experiment_name, NOT on run_name: rl_games puts the run in
+        # train_dir/full_experiment_name, and a caller that sets it directly (the paper launcher does,
+        # to route around the run_name existence check above and stay resumable) would otherwise
+        # stamp its config into a stray timestamp dir while nn/ and summaries/ went elsewhere. Every
+        # reader of a run -- eval.py, harness/scrape.py, harness/specialize.py -- opens this file.
+        stamp = Path(cfg["train_dir"], cfg["full_experiment_name"])
         stamp.mkdir(parents=True, exist_ok=True)
         with open(stamp / "config.yaml", "w") as f:
             yaml.safe_dump(config, f, default_flow_style=False, sort_keys=False)
