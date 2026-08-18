@@ -33,7 +33,7 @@ from .morphology import designs_from_arrays
 from .vocab import GEN_EFF, GEN_CAP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
-from experiments.diversity_p5 import (population_to_repr, redundancy, rao_blackwell_h_body,
+from experiments.harness.committance import (population_to_repr, redundancy, rao_blackwell_h_body,
                                       modes_and_spread)
 
 # embedding-like matrices excluded from weight decay despite being nn.Linear (3b, grill 2026-07-15):
@@ -241,6 +241,10 @@ class CodesignAgent(LoggingA2CAgent):
         self._ep_ret = torch.zeros(N, device=dev)
         self._win_ret_sum = torch.zeros(N, device=dev)
         self._win_ret_cnt = torch.zeros(N, device=dev)
+        # control/r_step accumulator: raw reward per env-step over the EPOCH. Kept on-device and
+        # flushed once per epoch in write_stats, so it costs one sync per epoch and none per step.
+        self._epoch_r_sum = torch.zeros((), device=dev)
+        self._epoch_r_n = 0
 
     def _net(self):
         return self.model.a2c_network.net
@@ -526,6 +530,8 @@ class CodesignAgent(LoggingA2CAgent):
         obs, rewards, dones, infos = super().env_step(actions)
         r = rewards if rewards.dim() == 1 else rewards[:, 0]   # raw per-env reward (value_size==1)
         self._ep_ret += r
+        self._epoch_r_sum += r.mean()                         # -> control/r_step, per-epoch cadence
+        self._epoch_r_n += 1
         # flush completed episodes fully vectorized -- NO `if d.any()` host sync per rollout step.
         df = dones.float()
         self._win_ret_sum += self._ep_ret * df                # add ep return for done envs
@@ -846,6 +852,20 @@ class CodesignAgent(LoggingA2CAgent):
         if w is None:
             return
         frame = args[11] if len(args) > 11 else kwargs.get('frame')
+
+        # control/r_step -- mean RAW reward per env-step this epoch. The per-epoch performance
+        # signal, and the only one the boundary-recovery trace can be folded on: rl_games'
+        # rewards/iter is `game_rewards.get_mean()`, a ring buffer of the last 100 FINISHED episodes
+        # pooled over all envs, so it moves only when episodes end. At resample_interval=1 every env
+        # truncates at max_episode_length simultaneously -- the same instant as the resample -- so
+        # that series' post-boundary shape is which episodes happened to finish (it folds to a 4x
+        # excursion that tracks episode_lengths/iter exactly, and would appear identically with no
+        # resampling at all). This is unlagged, unshaped, un-bootstrapped, and samples every
+        # num_actors x horizon_length step of the epoch. ADR-0021.
+        if self._epoch_r_n:
+            w.add_scalar('control/r_step', (self._epoch_r_sum / self._epoch_r_n).item(), frame)
+            self._epoch_r_sum.zero_()
+            self._epoch_r_n = 0
         # JEPA loss logs every epoch (independent of the resample-boundary _gen_log).
         if self._jepa_losses:
             w.add_scalar('losses/jepa', torch.stack(self._jepa_losses).mean().item(), frame)

@@ -16,6 +16,10 @@ One control net and one morphology generator share a trunk. Training alternates:
 
 - **Per step** (body fixed for the whole window): plain combined PPO on control
   (ContAct + V0.98). The generator heads get no gradient. → `control/*`, `rewards/*`, `losses/*`.
+  Of these, **`control/r_step`** (mean raw reward per env-step over the epoch) is the per-epoch
+  *performance* signal. Prefer it to `rewards/*`, which is rl_games' `game_rewards` ring buffer over
+  the last 100 finished episodes — that series only moves when episodes end, and at
+  `resample_interval: 1` every env truncates at once, at the instant of the resample.
 - **At each resample** (window boundary, `resample_interval` episodes): `_resample_update` runs
   once, then a new body is sampled and the gym is rebuilt. In one update it:
   1. fits **GenCrit/V1.0** to body quality `R` (on rollout states *and* designed prefixes),
