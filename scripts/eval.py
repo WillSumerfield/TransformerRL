@@ -2,8 +2,9 @@
 
 Decouples (control policy) x (body source): for each run + epoch, install a FIXED body population,
 roll out K episodes/body with the DETERMINISTIC control policy (mu), and report reward, robustness,
-generator diversity/committance, and value calibration. Reuses the lightweight experiments/ path
-(ppg_parity._load_policy + a hand-driven rollout) -- no rl_games runner, no train-script mode.
+generator diversity/committance, and value calibration. The task build, policy load, body install and rollout
+are `experiments/harness/evalpass.py`'s -- shared with the ladder and the specialization pass, so
+"return" means one thing across the series. No rl_games runner, no train-script mode.
 
 Body sources (all walk the SAME grammar-masked generation MDP; see net.sample):
   general  net.sample(N, 'stochastic')  -- the trained generator's distribution (in-distribution E)
@@ -13,7 +14,7 @@ Body sources (all walk the SAME grammar-masked generation MDP; see net.sample):
 
 EPM == 1 for codesign (one body per env), so per-env stats ARE per-body stats; B = num_envs bodies.
 Metrics come from two places: the rollout (reward/fall/ep_len/V0.98) and net.sample's own output
-(diversity via experiments/diversity_p5, GenCrit/V1.0 body-quality = v_states[:, -1]).
+(diversity via experiments/harness, GenCrit/V1.0 body-quality = v_states[:, -1]).
 
 Runs are compared SIDE-BY-SIDE: one wide CSV row per (run, epoch). Control uses mu always; the
 generator draws are stochastic (except 'best' = greedy), seeded for reproducibility across runs.
@@ -41,20 +42,15 @@ sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 import numpy as np
 import torch
-import vlearn as v
 import yaml
-from tqdm import tqdm
 
-from experiments.ppg_parity import _load_policy
-from experiments.diversity_p5 import population_to_repr, rao_blackwell_h_body, redundancy
-from experiments.diversity import within_run_metrics
-from transformer_rl.models import _raw_tail
-from transformer_rl.morphology import designs_from_arrays, seed_body
-from codesigner.components.modular_libraries import REGISTRY as ML_REGISTRY
-from transformer_rl.train_utils import _resolve_task
+from experiments.harness.committance import population_to_repr, rao_blackwell_h_body, redundancy
+from experiments.harness.diversity import within_run_metrics
+from experiments.harness.evalpass import (
+    EVAL_SEED, install, load_net, open_task, rollout, sample_bodies,
+)
 
 RUN_ROOT = _ROOT / "runs/ant_codesign/codesign_single_transformer"
-EVAL_SEED = 123
 
 # CSV column order (one wide row per run x epoch); console shows a subset.
 FIELDS = ["run", "epoch",
@@ -92,88 +88,7 @@ def _resolve_ckpts(run_dir: Path, epochs_spec: str):
     return sorted(out)
 
 
-# ---- forward / rollout ------------------------------------------------------------
-
-@torch.no_grad()
-def _forward(net, obs_norm, obs):
-    """Deterministic control step: normalized obs (raw {0,1} tail restored) -> (mu-clamped, V0.98)."""
-    normed = obs_norm(obs).clone()
-    t0, td = _raw_tail(net.net)                              # restore raw DOF-mask/type tail
-    normed[..., t0:t0 + td] = obs[..., t0:t0 + td]
-    mu, _, value, _ = net({"obs": normed})
-    value = value.squeeze(-1) if value is not None else None
-    return mu.clamp(-1.0, 1.0), value
-
-
-@torch.no_grad()
-def _rollout(net, obs_norm, env, device, *, episodes, label=""):
-    """K episodes per env on the currently-installed (fixed) bodies. EPM==1 => per-env == per-body.
-    Returns per-body arrays: return (mean over K), fall_rate (terminated vs truncated), ep_len, v0
-    (mean V0.98 at episode starts). Bodies are held fixed -- resample() is NOT called here.
-    `label` names the source (gen/best/rnd) in the tqdm progress bar."""
-    n, L = env.total_num_envs, env.max_episode_length
-    z = lambda: torch.zeros(n, device=device)
-    ret_sum, term_sum, len_sum = z(), z(), z()
-    v0_sum, v0_n = z(), z()
-    cur, curlen = z(), z()
-    ep_done = torch.zeros(n, device=device)
-    at_s0 = torch.ones(n, dtype=torch.bool, device=device)  # first obs of every env is an episode start
-
-    obs, _ = env.reset()
-    cap = (episodes + 2) * L
-    step = 0
-    # bar tracks the slowest env's episode count (min ep_done); the loop exits when it hits budget.
-    bar = tqdm(total=episodes, desc=f"[eval]   {label} rollout".rstrip(),
-               unit="ep", leave=False, dynamic_ncols=True)
-    while step < cap:
-        mn = int(ep_done.min().item())                      # == loop-exit driver; one sync/step
-        bar.update(mn - bar.n)
-        bar.set_postfix_str(f"step {step}/{cap}", refresh=False)
-        if mn >= episodes:
-            break
-        mu, value = _forward(net, obs_norm, obs)
-        collecting = ep_done < episodes
-        if value is not None:
-            take = at_s0 & collecting
-            v0_sum += torch.where(take, value, torch.zeros_like(value))
-            v0_n += take.float()
-        obs, rew, term, trunc, _ = env.step(mu)
-        rew = rew.squeeze(-1) if rew.ndim > 1 else rew
-        done = term | trunc
-        cur += torch.where(collecting, rew, torch.zeros_like(rew))
-        curlen += collecting.float()
-        finish = done & collecting                          # a within-budget episode just ended
-        ret_sum += torch.where(finish, cur, torch.zeros_like(cur))
-        len_sum += torch.where(finish, curlen, torch.zeros_like(curlen))
-        term_sum += (term & finish).float()
-        ep_done += done.float()
-        cur = torch.where(done, torch.zeros_like(cur), cur)
-        curlen = torch.where(done, torch.zeros_like(curlen), curlen)
-        at_s0 = done
-        step += 1
-
-    bar.update(episodes - bar.n)                             # fill to full (covers cap-exit)
-    bar.close()
-    e = float(episodes)
-    return {"return": (ret_sum / e).cpu().numpy(),
-            "fall_rate": (term_sum / e).cpu().numpy(),
-            "ep_len": (len_sum / e).cpu().numpy(),
-            "v0": (v0_sum / v0_n.clamp(min=1)).cpu().numpy()}
-
-
 # ---- body sources + generator-intrinsic metrics -----------------------------------
-
-def _sample(net, n, mode):
-    torch.manual_seed(EVAL_SEED)                            # reproducible draws across runs/epochs
-    return net.net.sample(n, mode=mode)
-
-
-def _install(env, out):
-    """Rebuild the scene onto the generator's designed bodies. The Task takes Morphologies now,
-    so the design grid is translated on this side of the boundary."""
-    env.resample(designs_from_arrays(env.module_library, out["counts"].long(),
-                                     out["eff_sub"], out["cap_sub"]))
-
 
 def _typed_reps(out):
     counts = out["counts"].cpu().numpy().astype(int)
@@ -192,7 +107,7 @@ def _diversity(out):
     subtype axis stays free). N_body_skel / N_sub are effective #designs -- lower == more committed."""
     active = out["active_step"].cpu().numpy()
     if "eff_sub" not in out:                                # phase-1/3 fallback (no subtype axis)
-        from experiments.diversity import counts_to_repr
+        from experiments.harness.diversity import counts_to_repr
         skel = [counts_to_repr(c) for c in out["counts"].cpu().numpy().astype(int)]
         h_skel = rao_blackwell_h_body(out["step_entropy"].cpu().numpy(), active)
         r = redundancy(skel, h_skel)
@@ -226,9 +141,9 @@ def evaluate(net, obs_norm, env, device, *, episodes, top_k):
     row = {}
 
     # --- general: in-distribution (metric E) + diversity/committance + calibration ---
-    gen = _sample(net, n, "stochastic")
-    _install(env, gen)
-    g = _rollout(net, obs_norm, env, device, episodes=episodes, label="gen")
+    gen = sample_bodies(net, n, "stochastic")
+    install(env, gen)
+    g = rollout(net, obs_norm, env, device, episodes=episodes, label="gen")
     gret = g["return"]
     topk = np.sort(gret)[::-1][:top_k]
     v1 = gen["v_states"][:, -1].cpu().numpy()               # GenCrit/V1.0 predicted body quality
@@ -239,16 +154,16 @@ def evaluate(net, obs_norm, env, device, *, episodes, top_k):
     row.update(_diversity(gen))
 
     # --- best morph: the generator's committed (greedy) body ---
-    best = _sample(net, n, "greedy")
+    best = sample_bodies(net, n, "greedy")
     row["best_n_unique"] = _n_unique(best)
-    _install(env, best)
-    b = _rollout(net, obs_norm, env, device, episodes=episodes, label="best")
+    install(env, best)
+    b = rollout(net, obs_norm, env, device, episodes=episodes, label="best")
     row.update(best_avg=float(b["return"].mean()), best_fall=float(b["fall_rate"].mean()))
 
     # --- random source: diverse reference (metric D) + gen-advantage-over-random ---
-    rnd = _sample(net, n, "uniform")
-    _install(env, rnd)
-    rr = _rollout(net, obs_norm, env, device, episodes=episodes, label="rnd")
+    rnd = sample_bodies(net, n, "uniform")
+    install(env, rnd)
+    rr = rollout(net, obs_norm, env, device, episodes=episodes, label="rnd")
     row.update(random_avg=float(rr["return"].mean()),
                gen_advantage=float(gret.mean() - rr["return"].mean()))
     return row
@@ -311,26 +226,15 @@ def main():
     n_envs = args.num_envs or int(jobs[0][3]["params"]["config"]["num_actors"])
     print(f"[eval] {n_envs} bodies x {args.episodes} episodes/body x 3 sources; seed={EVAL_SEED}",
           flush=True)
-    library = ML_REGISTRY[jobs[0][3].get("env", {}).get("module_library", "simple")]()
-    # The task comes from the run's OWN stamp, beside the library, for the same reason: a checkpoint
-    # whose task differs from the one it trained on reads the wrong obs offsets. Runs stamped before
-    # `env.task` existed are ant runs by construction, hence the default.
-    task_key, task_class = _resolve_task(jobs[0][3], default="ant")
-    env = task_class(device=device, rendering=False, raise_exception=False, with_window=False,
-                     enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
-    # One body per env, seeded with the canonical body; every source below rebuilds onto its own.
-    n_envs = env.setup(library, n_envs, n_envs, [seed_body(library)] * n_envs, seed=EVAL_SEED)
-    layout = env.obs_layout()
+    # Task, library and sizing all come from the run's own stamp; every source below rebuilds onto
+    # its own bodies.
+    env, library, layout = open_task(jobs[0][3], n_envs, device=device)
 
     rows = []
     for run_name, rd, ckpts, cfg in jobs:
-        net_params = cfg["params"]["network"]
-        value_size = int(cfg.get("env", {}).get("value_size", 1))
         for label, ckpt in ckpts:
             print(f"[eval] {run_name} @ {label}: {ckpt.name}", flush=True)
-            net, obs_norm = _load_policy(ckpt, net_params, device, value_size=value_size,
-                                         obs_base=layout["obs_total"],
-                                         n_act=layout["n_modules"] + layout["n_root_axes"])
+            net, obs_norm = load_net(ckpt, cfg, layout, device)
             row = {"run": run_name, "epoch": label}
             row.update(evaluate(net, obs_norm, env, device, episodes=args.episodes, top_k=args.top_k))
             rows.append(row)
