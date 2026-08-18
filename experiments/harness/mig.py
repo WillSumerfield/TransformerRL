@@ -2,9 +2,9 @@
 
 The layout is MACHINE state, not study state -- you set it once and run many studies against it --
 so this is a standalone CLI, never something a launcher does as a side effect. Three reasons it
-stays out of tune.py's run path: it needs sudo and a 4-day run should not hold a privilege it never
-uses; `-dci`/`-dgi` destroy instances OTHER jobs may be running on; and reconfiguration requires the
-card to be idle, which is exactly what a launcher cannot assume.
+stays out of tune.py's run path: `-dci`/`-dgi` destroy instances OTHER jobs may be running on;
+reconfiguration requires the card to be idle, which is exactly what a launcher cannot assume; and
+it may need privileges a 4-day run has no business holding.
 
 `slots._discover_devices` already returns MIG instances when the box is partitioned and whole GPUs
 otherwise, so nothing downstream needs to know this ran. Not running it is the off switch -- on a
@@ -13,32 +13,51 @@ session.
 
     python -m experiments.harness.mig --status
     python -m experiments.harness.mig --list-profiles
-    sudo python -m experiments.harness.mig --gpus 0,1 --profile 67 --count 4 [--dry-run]
-    sudo python -m experiments.harness.mig --gpus 0,1 --reset
+    python -m experiments.harness.mig --gpus 0,1 --profile 67 --count 4
+    python -m experiments.harness.mig --gpus 0,1 --reset
 
 Profile ids are per-GPU-model and NOT portable: 67 is this box's ~24GB slice. `--list-profiles`
 prints what the installed cards actually offer; there is no sane default to guess.
+
+Privileges are NOT pre-checked. Whether MIG reconfiguration needs root depends on the device and
+the driver's permission setup, so a euid test would refuse on machines where it would have worked.
+The commands are simply run, and a permission failure is reported as one.
 """
 import argparse
-import os
 import subprocess
 import sys
 
 from .slots import _discover_devices, _smi
 
+# nvidia-smi's wording for "you are not allowed to do this", across driver versions.
+_PERM = ("insufficient permission", "permission denied", "not permitted", "requires root",
+         "insufficient privileges", "operation not permitted")
 
-def _run(args: list[str], dry: bool) -> int:
-    """Echo then run one nvidia-smi call. Echoing always -- these are destructive and an operator
-    should be able to see, copy and re-run exactly what was issued."""
+
+def _run(args: list[str]) -> tuple[int, str]:
+    """Echo, run, echo output. Echoing the command always -- these are destructive and an operator
+    should be able to see, copy and re-run exactly what was issued. Output is captured rather than
+    inherited so the caller can tell a permission failure from a real one, then printed either way."""
     print("  $ " + " ".join(args), flush=True)
-    if dry:
-        return 0
-    return subprocess.run(args).returncode
+    r = subprocess.run(args, capture_output=True, text=True)
+    out = (r.stdout + r.stderr).strip()
+    if out:
+        print("    " + out.replace("\n", "\n    "), flush=True)
+    return r.returncode, out
+
+
+def _denied(rc: int, out: str, args: list[str]) -> bool:
+    """True (and explains) if this failed for want of privileges rather than for a real reason."""
+    if rc and any(p in out.lower() for p in _PERM):
+        print(f"\nMIG reconfiguration was denied on this device -- re-run under sudo:\n"
+              f"    sudo {' '.join(args)}", file=sys.stderr)
+        return True
+    return False
 
 
 def _busy(gpu: str) -> list[str]:
-    """PIDs of compute apps on GPU index `gpu`. Reconfiguring under a live job kills it, and the
-    driver reports a MIG app against either the instance or the parent, so this asks the parent."""
+    """Compute apps on GPU index `gpu`. Reconfiguring under a live job kills it, and the driver may
+    attribute a MIG app to either the instance or the parent, so this asks the parent."""
     out = _smi(f"-i {gpu} --query-compute-apps=pid,process_name --format=csv,noheader")
     return [ln.strip() for ln in out.splitlines() if ln.strip()]
 
@@ -55,42 +74,50 @@ def status() -> None:
     print(f"\n{len(found)} schedulable device(s) ({kind}): {', '.join(n for n, _ in found)}")
 
 
-def configure(gpus: list[str], profile: str, count: int, dry: bool) -> int:
-    """Destroy existing instances on each GPU, then create `count` instances of `profile`.
-
-    -dci/-dgi before -cgi because instance ids are not reusable while children exist; -C creates the
-    matching compute instance per GPU instance, which is what makes each slice actually schedulable.
-    """
-    # Preflight is ADVISORY under --dry-run: previewing the exact command sequence is the whole
-    # point of the flag, and it must stay useful on a machine that cannot run MIG at all.
-    for g in gpus:
-        if not _mig_enabled(g):
-            print(f"GPU {g}: MIG mode is not enabled. Enable it first (needs an idle card, and on "
-                  f"some drivers a reset or reboot):\n    sudo nvidia-smi -i {g} -mig 1",
-                  file=sys.stderr)
-            if not dry:
-                return 1
-        if (apps := _busy(g)):
-            print(f"GPU {g}: {len(apps)} compute app(s) running -- refusing to reconfigure.\n  "
-                  + "\n  ".join(apps), file=sys.stderr)
-            if not dry:
-                return 1
-
-    for g in gpus:
-        print(f"[mig] GPU {g}: {count} x profile {profile}")
-        _run(["nvidia-smi", "mig", "-i", g, "-dci"], dry)   # rc ignored: nothing to destroy is fine
-        _run(["nvidia-smi", "mig", "-i", g, "-dgi"], dry)
-        if (rc := _run(["nvidia-smi", "mig", "-i", g, "-cgi", ",".join([profile] * count), "-C"], dry)):
-            print(f"GPU {g}: create failed (rc={rc}). `--list-profiles` shows valid ids; a profile "
-                  f"the card cannot fit {count} of will fail here.", file=sys.stderr)
-            return rc
-    if not dry:
-        print()
-        status()
+def _teardown(gpu: str) -> int:
+    """Destroy compute instances then GPU instances. A non-permission failure is EXPECTED and
+    ignored -- there is usually nothing to destroy -- but a denial is fatal and worth saying."""
+    for sub in ("-dci", "-dgi"):
+        args = ["nvidia-smi", "mig", "-i", gpu, sub]
+        rc, out = _run(args)
+        if _denied(rc, out, args):
+            return 1
     return 0
 
 
-def reset(gpus: list[str], dry: bool) -> int:
+def configure(gpus: list[str], profile: str, count: int) -> int:
+    """Destroy existing instances on each GPU, then create `count` instances of `profile`.
+
+    Teardown precedes creation because instance ids are not reusable while children exist; -C
+    creates the matching compute instance per GPU instance, which is what makes a slice schedulable.
+    """
+    for g in gpus:
+        if not _mig_enabled(g):
+            print(f"GPU {g}: MIG mode is not enabled. Enable it first (needs an idle card, and on "
+                  f"some drivers a reset or reboot):\n    nvidia-smi -i {g} -mig 1", file=sys.stderr)
+            return 1
+        if (apps := _busy(g)):
+            print(f"GPU {g}: {len(apps)} compute app(s) running -- refusing to reconfigure.\n  "
+                  + "\n  ".join(apps), file=sys.stderr)
+            return 1
+
+    for g in gpus:
+        print(f"[mig] GPU {g}: {count} x profile {profile}")
+        if _teardown(g):
+            return 1
+        args = ["nvidia-smi", "mig", "-i", g, "-cgi", ",".join([profile] * count), "-C"]
+        rc, out = _run(args)
+        if rc:
+            if not _denied(rc, out, args):
+                print(f"GPU {g}: create failed (rc={rc}). `--list-profiles` shows valid ids; a "
+                      f"profile the card cannot fit {count} of will fail here.", file=sys.stderr)
+            return rc
+    print()
+    status()
+    return 0
+
+
+def reset(gpus: list[str]) -> int:
     """Back to whole GPUs. Leaves MIG MODE on -- flipping that needs an idle card and sometimes a
     reboot, so it stays a deliberate separate step."""
     for g in gpus:
@@ -99,11 +126,10 @@ def reset(gpus: list[str], dry: bool) -> int:
             return 1
     for g in gpus:
         print(f"[mig] GPU {g}: destroying instances")
-        _run(["nvidia-smi", "mig", "-i", g, "-dci"], dry)
-        _run(["nvidia-smi", "mig", "-i", g, "-dgi"], dry)
-    if not dry:
-        print()
-        status()
+        if _teardown(g):
+            return 1
+    print()
+    status()
     return 0
 
 
@@ -115,7 +141,6 @@ def main() -> int:
     p.add_argument("--reset", action="store_true", help="destroy instances, back to whole GPUs")
     p.add_argument("--status", action="store_true", help="show devices as the scheduler sees them")
     p.add_argument("--list-profiles", action="store_true", help="valid profile ids for these cards")
-    p.add_argument("--dry-run", action="store_true", help="print the nvidia-smi calls, run nothing")
     a = p.parse_args()
 
     if a.status:
@@ -125,11 +150,7 @@ def main() -> int:
         return 0
 
     gpus = [g.strip() for g in a.gpus.split(",") if g.strip()]
-    if os.geteuid() != 0 and not a.dry_run:
-        print("MIG reconfiguration needs root -- re-run under sudo (or --dry-run to preview).",
-              file=sys.stderr)
-        return 1
-    return reset(gpus, a.dry_run) if a.reset else configure(gpus, a.profile, a.count, a.dry_run)
+    return reset(gpus) if a.reset else configure(gpus, a.profile, a.count)
 
 
 if __name__ == "__main__":
