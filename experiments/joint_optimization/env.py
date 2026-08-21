@@ -54,7 +54,7 @@ def f(xy: torch.Tensor) -> torch.Tensor:
     norm = M + W + S
     F_m = torch.sin(F_mx * xy[..., 0]) * torch.cos(F_my * xy[..., 1])
     F_w = torch.sin(F_wx * xy[..., 0] + 1) * torch.cos(F_wy * xy[..., 1])
-    F_s = torch.abs(torch.pow(torch.cos(F_sx * xy[..., 0] + F_sy * xy[..., 1]), S_n))
+    F_s = torch.abs(torch.pow(torch.cos(F_sx * xy[..., 0] + torch.sin(F_sy * xy[..., 1])), S_n))
     return -(M * F_m + W * F_w + S * F_s) / norm
 
 
