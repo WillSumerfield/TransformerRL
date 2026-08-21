@@ -165,49 +165,73 @@ training the **skeleton commits** (effective skeleton count → 1) while the **s
 
 ## Joint optimization
 
-A **toy abstraction** of codesign on a 2D domain, in `experiments/joint_optimization/`: two coupled
-optimizations where one agent's search is gated by another's accuracy. Deliberately shares *no*
-vocabulary with the real system — the terms below are not the generator, control, or GenCrit, and a
-finding here transfers only as far as the abstraction does.
+A **toy abstraction** of codesign on a 2D domain, in `experiments/joint_optimization/`: two
+optimizers minimizing a single shared landscape, one choosing a design and one choosing how to act
+on it. Deliberately shares *no* vocabulary with the real system — the terms below are not the
+generator, control, or GenCrit, and a finding here transfers only as far as the abstraction does.
+The coupling is **emergent**, not imposed: nothing in the landscape links the two optimizers, but a
+design is only worth what the other optimizer manages to achieve on it.
 
 **Designer**:
-The agent that picks a point `(x,y)` in the domain, minimizing the loss it observes. The
-generator-analogue, but it emits a point in ℝ² rather than a morphology under a grammar. It is
-**unconditional** (no observation), so its analogue of a generalization radius is not an input→output
-radius; the symmetric comparison the experiment wants needs a *model-based* designer that fits a
-surrogate over `(x,y)`.
+The optimizer that chooses a design, minimizing the value it observes. **Unconditional** — it sees
+nothing and simply emits from a distribution, so its analogue of a radius is over its own output,
+not over any input. The generator-analogue, but it emits a scalar rather than a morphology under a
+grammar.
 _Avoid_: generator (reserved for the morphology generator).
 
-**Predictor**:
-The agent that predicts the [target landscape](#target-landscape) from `(x,y)` alone. It **fuses two
-roles** the real system separates: it *acts by predicting* a scalar (GenCrit's job) but its
-competence *gates what the designer observes* (control's job). Because it sees only `(x,y)`, it must
-implicitly learn the quality landscape too.
-_Avoid_: critic (a critic fits the return; the predictor fits an exogenous surface it cannot
-influence), controller (it does not act on the world).
+**Controller**:
+The optimizer that chooses how to act on a design, minimizing the same value. **Conditional** — its
+output is a function of the design it is handed. There is exactly one controller serving every
+design, which is what makes its [generalization](#generalization) a scarce resource: give each
+design its own controller and generalization becomes free.
+_Avoid_: control (reserved for the real policy), critic (it acts, it does not fit a return).
 
-**Quality landscape** (`L1`):
-The surface the designer searches, non-positive by construction. What the designer would minimize if
-the predictor were perfect.
+**Landscape**:
+The single surface both optimizers minimize, over (design, action). Neither optimizer sees it
+whole: the designer only ever sees a design's realized value, and the controller only ever sees the
+slice for the design in front of it.
 
-**Target landscape** (`L2`):
-The surface the predictor fits — a function of position *and* of `L1` at that position. Pure
-regression target: its value never enters the loss, only the predictor's error on it. Unconstrained
-in sign and offset; only its scale matters, through [fidelity](#fidelity).
+**Marginal landscape**:
+Design quality as actually observed — the landscape evaluated at whatever action the controller
+produced. Equals the true per-design optimum only for a perfect controller; otherwise it is a
+smeared, distorted version of it. **The designer never searches the true design landscape, only
+this one**, which is the entire coupling.
 
-**Fidelity** (`A`):
-The predictor's accuracy as a multiplicative gate in `(0,1]`, a Gaussian in its error. The whole
-coupling: since the loss is non-positive, low fidelity drags it toward 0, so **good points the
-predictor does not understand look bad**. That is the exploration/exploitation pin the experiment
-exists to measure.
-_Avoid_: reading it as a penalty term — it scales the loss, it is not subtracted from it, so its
-effect is proportional to how good the point already is.
+**Spread**:
+How much of the space an optimizer's outputs cover. Selects *which* region gets sampled, and so
+which coarse structure of the landscape an optimizer can perceive at all.
+_Avoid_: entropy (reserved for policy entropy in the real system).
 
-**Dead zone**:
-The region where the quality landscape is clamped flat at 0 — points so bad that no fidelity helps,
-since the gate multiplies zero. Its size is the one calibration knob on the landscape: shifting the
-landscape down shrinks the dead zone and deepens the wells. A dead zone exists only if the raw
-landscape actually rises above that offset, so the formula is written in absolute units, not shape.
+**Exploration**:
+How often an optimizer leaves a sample where it randomly landed rather than improving it. Gates
+[generalization](#generalization) rather than sitting beside it: an optimizer that never improves
+its samples has no use for a radius, so maximal exploration makes generalization inert. That
+degeneracy is a finding, not an artifact.
+
+**Generalization**:
+How reliably an optimizer can improve a sample as a function of distance from what it knows. A
+perfectly general optimizer improves any sample anywhere; a non-general one only improves samples
+near its current centre. For the controller this is the capacity to act well on *unfamiliar
+designs* — which is what makes designer spread and controller generalization compete directly: a
+designer that ranges beyond its controller's radius gets its good designs scored badly.
+_Avoid_: generalization gap (a train/test notion; this is a radius, not a gap).
+
+**Climb**:
+Improving a sample by descending into the basin it landed in, partially — the fraction of the way
+governed by [generalization](#generalization) and distance. Deliberately *local*: a sample is
+improved within its own basin, never teleported to the global optimum, so which basin
+[spread](#spread) put it in still decides the outcome.
+
+**Sampling ratio**:
+How many times the controller updates per designer update. High ratio buys the controller time to
+adapt to the designs in front of it before they are judged, so it can partially *substitute* for
+controller generalization. Compared only under a fixed total evaluation budget — otherwise a high
+ratio just buys more compute.
+
+**Design fitness**:
+What a design is judged on: its mean value across the controller's whole adaptation window, not its
+best single moment. Rewards designs the controller can exploit *reliably and soon*, and denies
+credit for a lucky one-off.
 
 ## Language
 
