@@ -61,6 +61,27 @@ def _fmt(v) -> str:
     return f"{v:.3g}" if isinstance(v, float) else str(v)
 
 
+def _labels(paths) -> dict[str, str]:
+    """Display name per parameter: the fewest trailing path segments that are unique across the
+    swept set. `params.config.entropy_coef` and `params.config.generator.entropy_coef` both end in
+    `entropy_coef`, so a bare leaf renders two different knobs under one column name in every table
+    -- and the report is the artefact the focus stage is authored from. Unambiguous names stay bare.
+
+    Note this is display only: derived_params and feasibility_expr still bind swept params by their
+    LAST segment, where the same collision is resolved by last-wins.
+    """
+    paths = list(paths)
+    out = {}
+    for path in paths:
+        segs = path.split(".")
+        for n in range(1, len(segs) + 1):
+            tail = segs[-n:]
+            if sum(1 for o in paths if o.split(".")[-n:] == tail) == 1:
+                break
+        out[path] = ".".join(tail)
+    return out
+
+
 def _fmt_t(s: float) -> str:
     m, sec = divmod(int(s), 60)
     h, m = divmod(m, 60)
@@ -346,8 +367,9 @@ def _build(state: _State, tick: int) -> Layout:
     tbl = Table(box=box.SIMPLE_HEAD, expand=True, header_style="bold dim", show_edge=False)
     tbl.add_column("#",     justify="right", width=4)
     tbl.add_column("Score", justify="right", width=9)
+    lab = _labels(state.param_names)
     for name in state.param_names:
-        tbl.add_column(name.split(".")[-1], justify="right")
+        tbl.add_column(lab[name], justify="right")
     tbl.add_column("", width=2)
 
     best = state.best()
@@ -697,6 +719,7 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     k = min(k, len(completed))
     top_k = _topk(completed, k)
     centre, spread = _centre_and_spread(top_k, tune_cfg)
+    lab = _labels([p["path"] for p in tune_cfg["params"]])
     bt = study.best_trial
 
     _write_params(output_dir / "best_params.yaml", base_cfg, centre, tune_cfg)
@@ -710,7 +733,7 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     for p in tune_cfg["params"]:
         path = p["path"]
         conc, desc = spread.get(path, (1.0, "—"))
-        wt.add_row(path.split(".")[-1], _fmt(centre.get(path, "—")), _fmt(bt.params.get(path, "—")),
+        wt.add_row(lab[path], _fmt(centre.get(path, "—")), _fmt(bt.params.get(path, "—")),
                    desc, style="" if conc >= 0.5 else "yellow")
     c.print(wt)
     c.print("[dim]best_params.yaml = centre (exported). best_params_argmax.yaml = single best trial.\n"
@@ -726,7 +749,7 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
         it.add_column("Share", justify="right")
         it.add_column("", justify="left")
         for path, v in imps.items():
-            it.add_row(path.split(".")[-1], f"{v * 100:.1f}%", "█" * int(round(v * 40)))
+            it.add_row(lab.get(path, path), f"{v * 100:.1f}%", "█" * int(round(v * 40)))
         c.print(it)
         c.print("[dim]Importance says a parameter MATTERS (share of objective variance it explains); "
                 "the top-k spread above says it was DETERMINED. Carry a parameter into a focus sweep "
@@ -740,7 +763,7 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     tbl.add_column("#",    justify="right", width=4)
     tbl.add_column("Score", justify="right", width=10)
     for p in tune_cfg["params"]:
-        tbl.add_column(p["path"].split(".")[-1], justify="right")
+        tbl.add_column(lab[p["path"]], justify="right")
     for rank, t in enumerate(top[:10], 1):
         tbl.add_row(
             str(rank), str(t.number), f"{t.value:.4f}",
@@ -787,7 +810,7 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
         ax_t = axes[1, idx]
 
         path  = p["path"]
-        label = path.split(".")[-1]
+        label = lab[path]
         pvals = [t.params[path] for t in completed]
 
         # discrete: categorical OR int/float with an explicit step > 1
