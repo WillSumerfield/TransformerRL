@@ -546,12 +546,27 @@ def _importances(completed: list):
         return None
 
 
-def _write_params(cfg_path: Path, base_cfg: dict, params: dict):
-    out = deepcopy(base_cfg)
+def _apply_params(cfg: dict, params: dict, tune_cfg: dict) -> dict:
+    """Overlay a trial's swept params onto `cfg`, then the derived params computed from them. Shared
+    by the trial materialiser and the winner export so the config a trial RAN and the config the
+    report EXPORTS can never disagree."""
     for path, value in params.items():
-        _set(out, path.split("."), value)
+        _set(cfg, path.split("."), value)
+    ns = {path.split(".")[-1]: val for path, val in params.items()}
+    for dp in tune_cfg.get("derived_params", []):
+        val = eval(dp["expr"], {"__builtins__": {}}, ns)
+        if isinstance(val, float) and val.is_integer():
+            val = int(val)
+        _set(cfg, dp["path"].split("."), val)
+    return cfg
+
+
+def _write_params(cfg_path: Path, base_cfg: dict, params: dict, tune_cfg: dict):
+    """The export must be RUNNABLE as-is: a focus stage takes best_params.yaml as its base_config, so
+    omitting the derived pass would hand it the BASE's max_epochs (3000) rather than the winner's
+    (1500 at horizon_length 16) -- twice the frame budget, silently."""
     with open(cfg_path, "w") as f:
-        yaml.dump(out, f)
+        yaml.dump(_apply_params(deepcopy(base_cfg), params, tune_cfg), f)
 
 
 # ── noise floor ───────────────────────────────────────────────────────
@@ -684,8 +699,8 @@ def _show_results(study: optuna.Study, tune_cfg: dict, base_cfg: dict, output_di
     centre, spread = _centre_and_spread(top_k, tune_cfg)
     bt = study.best_trial
 
-    _write_params(output_dir / "best_params.yaml", base_cfg, centre)
-    _write_params(output_dir / "best_params_argmax.yaml", base_cfg, bt.params)
+    _write_params(output_dir / "best_params.yaml", base_cfg, centre, tune_cfg)
+    _write_params(output_dir / "best_params_argmax.yaml", base_cfg, bt.params, tune_cfg)
 
     wt = Table(title=f"Winner — top-{k} centre vs argmax", box=rbox.SIMPLE_HEAD, header_style="bold dim")
     wt.add_column("Parameter", justify="left")
@@ -868,15 +883,7 @@ def _write_trial_cfg(num: int, params: dict, seed: int, base_cfg: dict, tune_cfg
     with byte-identical settings, the seed included, and a file that outlives the attempt is the
     simplest way to guarantee that."""
     sc = tune_cfg["study"]
-    trial_cfg = deepcopy(base_cfg)
-    for path, value in params.items():
-        _set(trial_cfg, path.split("."), value)
-    ns = {path.split(".")[-1]: val for path, val in params.items()}
-    for dp in tune_cfg.get("derived_params", []):
-        val = eval(dp["expr"], {"__builtins__": {}}, ns)
-        if isinstance(val, float) and val.is_integer():
-            val = int(val)
-        _set(trial_cfg, dp["path"].split("."), val)
+    trial_cfg = _apply_params(deepcopy(base_cfg), params, tune_cfg)
 
     # Seed goes through the CONFIG, never the trainer's --seed flag: --seed additionally forces
     # cudnn.deterministic, CUBLAS_WORKSPACE_CONFIG and set_num_threads(1) (train_utils.py:835-851),
