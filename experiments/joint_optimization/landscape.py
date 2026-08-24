@@ -21,32 +21,40 @@ import math
 
 import torch
 
-BOUNDS = (-1.0, 1.0)
+BOUNDS = (-2.0, 2.0)
 
-# --- placeholder landscape ------------------------------------------------------------------
-# PLACEHOLDER. Will is writing the real f. This is the old two-design-axis landscape with its
-# axes reinterpreted as (design, action); it is a valid multi-scale surface so the pipeline can
-# be smoke-tested end to end, but the axes are near-isotropic, so designer and controller face
-# structurally identical problems and no asymmetry result from it should be believed.
-M = 0.766
-W = 0.406
-S = 0.224
-F_md, F_ma = 5.0, 6.0
-F_wd, F_wa = 13.5, 20.0
-F_sd, F_sa = 6.2, 4.6
-S_n = 12
+# --- the landscape --------------------------------------------------------------------------
+M = 2.04
+W = 0.55
+S = 1.07
+P = 2.0
+F_md, F_ma = 4.08, 3.0
+F_wd, F_wa = 8.44, 15.1
+F_sd, F_sa = 0.63, 2.64
+F_nd, F_na = 20, 19
+F_pd, F_pa = 0.8, 3.5
 
 
 def f(da: torch.Tensor) -> torch.Tensor:
     """Landscape, (..., 2) -> (...). Index 0 is the design, index 1 is the action.
 
-    Negated so that wells are minima. Range is roughly [-1, 1].
+    Four superposed terms. F_p is a sum of two sines rather than a product, so it spans +-2 and
+    the normalization does not bound f to [-1, 1]; only relative scale matters here.
+
+      F_m  broad sinusoid   -- the coarse basins a wide searcher can see
+      F_w  fine sinusoid    -- local structure only a narrow searcher resolves, and much finer
+                               along the action axis than the design axis
+      F_s  separable spike  -- cos^F_nd(d) * sin^F_na(a), near-zero except in a small region
+      F_p  periodic pattern -- sin(F_pd d) + sin(F_pa a), separable, adds complexity
+
+    Both optimizers minimize this.
     """
     d, a = da[..., 0], da[..., 1]
-    F_m = torch.sin(F_md * d) * torch.cos(F_ma * a)
+    F_m = torch.sin(F_md * d - 1) * torch.cos(F_ma * a + 1.5)
     F_w = torch.sin(F_wd * d + 1) * torch.cos(F_wa * a)
-    F_s = torch.abs(torch.pow(torch.cos(F_sd * d + torch.sin(F_sa * a)), S_n))
-    return -(M * F_m + W * F_w + S * F_s) / (M + W + S)
+    F_s = torch.abs(torch.pow(torch.cos(F_sd * d), F_nd) * torch.pow(torch.sin(F_sa * a), F_na))
+    F_p = torch.sin(F_pd * d + 1.9) + torch.sin(F_pa * a)
+    return (M * F_m + W * F_w + S * F_s + P * F_p) / (M + W + S + P)
 
 
 # --- grid and basin tables ------------------------------------------------------------------
