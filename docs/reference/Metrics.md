@@ -350,9 +350,10 @@ $$\text{quality/R\_mean}(w) = \frac{s}{N}\sum_{i=1}^{N} \bar R_w(b_i)$$
 where $\bar R_w(b_i)$ is body $i$'s mean completed-episode return over window $w$ under the
 *training* (sampled) control policy, and $s$ = reward-shaper scale.
 
-`quality/Window_Rew_Mean` is logged beside it: the same population average over the window's
-**total** reward per env, counting every step rather than only completed episodes. It is a
-diagnostic, not part of this protocol — see `codesign_metrics.md` for when the two diverge.
+`quality/Window_Rew_Mean` is logged beside it: the same population average over the window's mean
+reward per env-**step**, counting every step rather than only completed episodes, and normalised by
+the step count so it is invariant to `horizon_length`. It is a diagnostic, not part of this
+protocol — see `codesign_metrics.md` for when the two diverge.
 
 #### Reading it
 Higher = better. **This is a joint body × control score**, not a control-quality curve: it is

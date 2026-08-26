@@ -55,15 +55,18 @@ study:
   # weight per episode, and the episode still in flight at the window boundary is discarded. Since
   # episode length ramps hard across a window (measured 65 -> 849 steps on a screen trial), the
   # discarded one is systematically the BEST one, and a handful of short post-rebuild failures get
-  # equal billing with one long good run. Window_Rew_Mean is the env's TOTAL reward over the
-  # window: equal weight per step, nothing dropped.
+  # equal billing with one long good run. Window_Rew_Mean weights every STEP equally and drops
+  # nothing: mean reward per env-step over the window.
   #
-  # CAVEAT, and the reason this is not free: Window_Rew_Mean carries the window LENGTH in its
-  # units -- ceil(resample_interval * max_episode_length / horizon_length) * horizon_length steps,
-  # which is 1000 / 1008 / 1024 for horizon_length 8 / 16 / 32. That is a 2.4% systematic edge for
-  # h=32 in a study that SWEEPS h, on a metric whose seed noise floor is ~6%. Small, but free and
-  # in one direction, so read any h result against it. R_mean is invariant here; that invariance is
-  # what it buys in exchange for discarding the in-flight episode.
+  # Per-step, not a window TOTAL, and that matters HERE specifically: the window is
+  # ceil(resample_interval * max_episode_length / horizon_length) * horizon_length steps == 1000 /
+  # 1008 / 1024 at horizon_length 8 / 16 / 32, so a total would hand h=32 a free 2.4% in a study
+  # that SWEEPS h -- a third of the seed noise floor, free and in one direction. Dividing by the
+  # accumulated step count removes it, leaving both metrics invariant to h.
+  #
+  # Note the scale change against the old R_mean objective: this is a per-STEP mean (order 0.01 on
+  # the ant after the 0.01 reward-shaper scale), not a per-episode return (order 10). Ranking is
+  # unaffected; absolute numbers from earlier reports are not comparable.
   metric_key: "quality/Window_Rew_Mean"
   score_mode: recovered
   score_window: 5               # windows, not epochs

@@ -13,8 +13,8 @@ Two training regimes, both on self.optimizer:
   Then sample the next body, ramp, full gym rebuild.
 
 R_i = the body's true mean completed-episode return over the window (gamma=1), accumulated in
-env_step. W_i is the same window's TOTAL reward per env, episode structure ignored -- logged beside
-it as quality/Window_Rew_Mean, never used as a training target. Requires codesign_tokens (the
+env_step. W_i is the same window's mean reward per env-STEP, episode structure ignored -- logged
+beside it as quality/Window_Rew_Mean, never used as a training target. Requires codesign_tokens (the
 gen/critic heads). Supersedes the SeqGenerator path."""
 import math
 import os
@@ -243,13 +243,18 @@ class CodesignAgent(LoggingA2CAgent):
         self._ep_ret = torch.zeros(N, device=dev)
         self._win_ret_sum = torch.zeros(N, device=dev)
         self._win_ret_cnt = torch.zeros(N, device=dev)
-        # W_i accumulator: TOTAL raw reward per env over the window, episode structure ignored.
+        # W_i accumulator: mean raw reward per env-STEP over the window, episode structure ignored.
         # The companion to R_i, and the two answer different questions. R_i averages over COMPLETED
         # episodes, so it weights every episode equally and DISCARDS the one still in flight at the
         # boundary -- which, since episode length ramps from ~65 to ~850 steps across a window, is
-        # systematically the best one. W_i weights every STEP equally and drops nothing, so it is
-        # the honest "how much reward did this body actually earn while it held the sim".
+        # systematically the best one. W_i weights every STEP equally and drops nothing.
+        # Divided by the step count rather than left as a window TOTAL: the window is
+        # ceil(interval * max_episode_length / horizon_length) * horizon_length steps == 1000/1008/
+        # 1024 at horizon_length 8/16/32, so a total would hand h=32 a free 2.4% and make the metric
+        # illegal to sweep h against. The count is accumulated, not derived, so it stays right on a
+        # checkpoint resume that lands mid-window.
         self._win_r_sum = torch.zeros(N, device=dev)
+        self._win_n_steps = 0
         # control/r_step accumulator: raw reward per env-step over the EPOCH. Kept on-device and
         # flushed once per epoch in write_stats, so it costs one sync per epoch and none per step.
         self._epoch_r_sum = torch.zeros((), device=dev)
@@ -540,6 +545,7 @@ class CodesignAgent(LoggingA2CAgent):
         r = rewards if rewards.dim() == 1 else rewards[:, 0]   # raw per-env reward (value_size==1)
         self._ep_ret += r
         self._win_r_sum += r                                  # -> quality/Window_Rew_Mean (W_i)
+        self._win_n_steps += 1
         self._epoch_r_sum += r.mean()                         # -> control/r_step, per-epoch cadence
         self._epoch_r_n += 1
         # flush completed episodes fully vectorized -- NO `if d.any()` host sync per rollout step.
@@ -816,7 +822,7 @@ class CodesignAgent(LoggingA2CAgent):
 
         N = env.total_num_envs
         R = self._window_Ri() * self._r_scale               # true body return, scaled to control units
-        W = self._win_r_sum * self._r_scale                 # window TOTAL reward, same scale as R
+        W = self._win_r_sum * (self._r_scale / max(1, self._win_n_steps))   # per-step, R's scale
         obses = self.experience_buffer.tensor_dict['obses']  # (H,N,obs) rollout-state sample
         phase = 'pretrain' if self._in_pretrain() else 'rl'  # regime of the update just performed
         self._resample_update(R, obses)
@@ -848,7 +854,7 @@ class CodesignAgent(LoggingA2CAgent):
         self.current_rewards.zero_(); self.current_lengths.zero_()
         # reset the R_i / W_i accumulators for the new window
         self._ep_ret.zero_(); self._win_ret_sum.zero_(); self._win_ret_cnt.zero_()
-        self._win_r_sum.zero_()
+        self._win_r_sum.zero_(); self._win_n_steps = 0
         self._morph_meta = None
         self._steps_since_resample = 0
 
@@ -945,10 +951,9 @@ class CodesignAgent(LoggingA2CAgent):
         # --- quality/: body-quality outcome (the optimization target) ---
         w.add_scalar('quality/R_mean', g['R_mean'], frame)
         w.add_scalar('quality/R_std', g['R_std'], frame)
-        # Window TOTAL reward per env -- counts every step, including the episode still running at
-        # the boundary. Its SCALE is the window length in steps (ceil(interval * max_episode_length
-        # / horizon_length) * horizon_length), so it is comparable across a study only while
-        # horizon_length is fixed; 1008 steps at h=16 vs 1024 at h=32 is a 1.6% skew.
+        # Mean reward per env-step over the window -- counts every step, including the episode still
+        # running at the boundary, and divided by the step count so it does not carry the window
+        # length in its units. Invariant to horizon_length, which is what makes it legal to sweep.
         w.add_scalar('quality/Window_Rew_Mean', g['W_mean'], frame)
         w.add_scalar('quality/Window_Rew_Std', g['W_std'], frame)
         for k, v in g['by_limbcount'].items():             # does more limbs earn more R?

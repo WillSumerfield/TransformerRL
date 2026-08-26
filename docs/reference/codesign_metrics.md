@@ -105,8 +105,8 @@ Subsystem-keyed. `<slot>` ∈ {F, FR, R, BR, B, BL, L, FL} (limb compass slots);
 |---|---|---|---|
 | `quality/R_mean` | mean body return `R` (scaled) over the window | rises as bodies improve | flat/falling = bodies not improving |
 | `quality/R_std` | spread of `R` across bodies | > 0 while exploring; shrinks as generator converges | →0 early = no body diversity to learn from |
-| `quality/Window_Rew_Mean` | mean **total** reward per env over the window (scaled), every step counted — unfinished episode included | rises with `R_mean` | diverging from `R_mean` = the two weightings disagree (see below) |
-| `quality/Window_Rew_Std` | spread of the window total across bodies | as `R_std` | as `R_std` |
+| `quality/Window_Rew_Mean` | mean reward per env-**step** over the window (scaled), every step counted — unfinished episode included | rises with `R_mean` | diverging from `R_mean` = the two weightings disagree (see below) |
+| `quality/Window_Rew_Std` | spread of that per-step mean across bodies | as `R_std` | as `R_std` |
 | `quality/by_limbcount/<k>` | mean `R` of bodies with exactly `<k>` limbs | monotone-ish in k (no limb cost ⇒ more limbs earn ≥) | non-monotone = controller can't yet exploit extra limbs |
 
 **`R_mean` vs `Window_Rew_Mean`.** Both average over the same 4096 bodies; they differ in what they
@@ -118,9 +118,15 @@ equal-weights a handful of short post-rebuild failures against one long good run
 long run dominate in proportion to how long it lasted. `R` is the training target because GenCrit
 regresses a per-episode quantity; `W` is a scoring/diagnostic metric only.
 
-`W` also carries the window length in its units — `ceil(interval × max_episode_length ÷
-horizon_length) × horizon_length` steps — so it is only comparable across runs at a fixed
-`horizon_length` (1008 steps at h=16 vs 1024 at h=32, a 1.6% skew). `R` is invariant to this.
+Both are invariant to `horizon_length`. `W` is divided by the window's accumulated step count
+rather than left as a window total, because the window is `ceil(interval × max_episode_length ÷
+horizon_length) × horizon_length` steps — 1000 / 1008 / 1024 at h = 8 / 16 / 32 — and a total would
+hand h=32 a free 2.4%, which is disqualifying for a study that sweeps `h`. The divisor is counted in
+`env_step`, not derived from the config, so it stays correct on a checkpoint resume that lands
+mid-window.
+
+Note the scales differ: `R` is a per-*episode* return (order 10 on the ant) while `W` is a per-*step*
+mean (order 0.01). Neither is comparable to the other in absolute terms — only their trends are.
 
 ### `clone/` — control preservation at resample (per window)
 | metric | meaning | healthy | bad → likely cause |

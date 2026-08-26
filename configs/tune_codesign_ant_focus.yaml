@@ -80,11 +80,12 @@ study:
   # construction. Same objective as the screen -- both were moved to Window_Rew_Mean together, which
   # is what keeps the anchor comparison in the header legal.
   #
-  # Window_Rew_Mean is the env's TOTAL reward over the window (every step counted) rather than
-  # R_mean's mean over COMPLETED episodes (equal weight per episode, in-flight one discarded). See
-  # the screen config for the full argument and for the one caveat: W carries the window LENGTH in
-  # its units, so it is only comparable at fixed horizon_length. That caveat is INERT here --
-  # horizon_length is frozen at 32 by base_config and is not swept below.
+  # Window_Rew_Mean is the env's mean reward per STEP over the window (every step counted,
+  # normalised by the accumulated step count) rather than R_mean's mean over COMPLETED episodes
+  # (equal weight per episode, in-flight one discarded). See the screen config for the full
+  # argument. Being per-step rather than a window total also makes it invariant to horizon_length,
+  # which is moot here -- h is frozen at 32 by base_config -- but keeps the two stages on one
+  # definition. Scale note: per-STEP means order 0.01 on the ant, not R_mean's order 10.
   metric_key: "quality/Window_Rew_Mean"
   score_mode: recovered
   score_window: 5               # windows, not epochs
