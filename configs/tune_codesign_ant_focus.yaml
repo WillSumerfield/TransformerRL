@@ -1,0 +1,173 @@
+# FOCUS stage: re-sweep the handful of hyperparameters the screen showed actually matter, over
+# ranges narrowed to the screen's top-k IQR, with the other ~12 frozen at the screen centre.
+#
+#   1. freeze:     cp logs/tune/codesign_ant_screen/best_params.yaml \
+#                     configs/ppo_ant_codesign_focus_base.yaml       (then commit it)
+#   2. calibrate:  python scripts/tune.py configs/tune_codesign_ant_focus.yaml --calibrate 8 --headless
+#                  -> read the noise floor, then set study.gate.floor
+#   3. run:        python scripts/tune.py configs/tune_codesign_ant_focus.yaml --headless
+#   4. report:     python scripts/tune.py configs/tune_codesign_ant_focus.yaml --report
+#
+# ============================== DO NOT RUN THIS YET ==============================
+# This config is BLOCKED on the screen being re-run. The screen it inherits from was scored under
+# a reward bug: reset_idx did not move `old_root_pos_buf` to the spawn pose, so the teleport home
+# at an episode boundary was priced as velocity and charged -(x_final - x_spawn)/dt on the terminal
+# step -- EXACTLY cancelling the episode's accumulated forward reward (measured: total x_vel
+# contribution 0.000000). Locomotion was worth nothing, so the optimum was to stand still, and the
+# screen's winner did: control/r_step pinned at 2.000 == healthy_reward for its whole final window,
+# scoring 99.3% of the 20.0 stand-still ceiling that no trial in 247 ever cleared.
+#
+# Consequences for this file:
+#   - `base_config` below is the screen's exported centre, i.e. hyperparameters tuned to freeze.
+#   - The `params` ranges below bracket that centre's top-37, so they inherit the same bias.
+#   - The trial DURATIONS quoted under trial_timeout_seconds remain valid: a reward fix changes no
+#     shape and no step count. That section is the one part of this config that survives.
+# Fix: SoftwarePackage src/codesigner/backend/modular.py, reset_idx. Re-run the screen, re-export
+# the centre, then re-derive the ranges below before this is worth a single slot-hour.
+# =================================================================================
+#
+# Step 2 is ALSO the screen winner's confirmation, which is why the screen ran no --confirm: the
+# anchor is the screen centre by construction (_defaults() reads each swept param straight out of
+# base_config, and base_config IS the exported centre), so the wave's Window_Rew_Mean band is
+# directly comparable to the screen calibration anchor's -- an out-of-sample test of an in-sample
+# maximum (ADR-0018). The screen's anchor figure (R_mean 11.8 +/- 0.7) is NOT that comparison point
+# any more: different metric, and measured under the broken reward. Re-measure both sides.
+#
+# FRAMES ARE NOT DOUBLED. The screen plan penciled in 196608000, written before the anchor was
+# measured. ADR-0020 records quality/R_mean plateauing by ~window 15 of 24, the second half
+# contributing +9.2% == 1.5 SD of seed noise: 2x the cost per trial for very little signal. Holding
+# frames also keeps the calibration comparison above unconfounded (same budget both sides), keeps
+# D_floor on the same scale, and buys ~2x the trials -- which is what a 5-6 param sweep wants.
+study:
+  name: codesign_ant_focus
+  n_trials: 128                 # 8 calibration + 120 search. A wave runs as ordinary trials in this
+                                # study and CONSUMES budget, so n_trials carries it (ADR-0018).
+  output_dir: logs/tune/codesign_ant_focus
+  script: scripts/train_codesign_single.py
+
+  # A COMMITTED COPY of the screen's best_params.yaml, not the file in logs/. That file is rewritten
+  # by every `--report` on the screen study, so pointing at it directly would let a later re-report
+  # silently redefine what the ~12 frozen parameters are, mid-study. Copy once, commit, freeze.
+  base_config: configs/ppo_ant_codesign_focus_base.yaml
+
+  # 14400s == 4h. Set from the screen, not estimated: 75 of its 248 completed trials ran THIS
+  # EXACT frozen configuration (mini_epochs 5, horizon_length 32, d_model 224, n_pretrain 2),
+  # differing only in the six parameters swept below -- so they are a direct sample of what a focus
+  # trial costs. They took a median of 11202s (3.1h), max 11733s. Widening to all 115 trials at the
+  # frozen COST point (n_pretrain free) gives mean 11253s, SD 273s -- a 2.4% CV, tighter than the
+  # objective's own noise floor. The six swept parameters are loss scalars: they change no shape and
+  # no step count, and within that subset none moves duration by more than a few hundred seconds.
+  #
+  # So 14400 sits 1.23x above the worst exact-match trial and ~11 SD above the mean. A legitimate
+  # trial will not reach it; a hung one frees its slot an hour sooner than the screen's 18000 did.
+  # The screen needed that larger cap because mini_epochs 2->8 swung its trials 6046s -> 14874s.
+  # Frozen at 5, that swing is gone, which is what makes a tighter cap safe here.
+  #
+  # Margin still errs generous on purpose: the failure modes are not symmetric. _score_job SCORES a
+  # timed-out run on its partial series rather than discarding it, so a cap that bites systematically
+  # penalises whichever configs are slow -- a silent bias in the objective, not a visible error. An
+  # over-generous cap only wastes slot-hours on a genuinely hung trial. (For reference: 0 of the
+  # screen's 248 completed trials hit its 18000 cap, so no such bias contaminates its report.)
+  #
+  # The cap is PER ATTEMPT -- _start resets job.t0 on every relaunch -- so a checkpoint-resumed
+  # trial gets a fresh 4h rather than inheriting what it already spent.
+  trial_timeout_seconds: 14400
+
+  # ── objective (ADR-0020) ──
+  #   score = mean(quality/Window_Rew_Mean, last 5 windows)
+  #           x min(1, mean(build/div_struct, last 5)/floor)
+  # WINDOW-indexed, not epoch-indexed: one point per resample window is phase-aligned by
+  # construction. Same objective as the screen -- both were moved to Window_Rew_Mean together, which
+  # is what keeps the anchor comparison in the header legal.
+  #
+  # Window_Rew_Mean is the env's TOTAL reward over the window (every step counted) rather than
+  # R_mean's mean over COMPLETED episodes (equal weight per episode, in-flight one discarded). See
+  # the screen config for the full argument and for the one caveat: W carries the window LENGTH in
+  # its units, so it is only comparable at fixed horizon_length. That caveat is INERT here --
+  # horizon_length is frozen at 32 by base_config and is not swept below.
+  metric_key: "quality/Window_Rew_Mean"
+  score_mode: recovered
+  score_window: 5               # windows, not epochs
+  gate:
+    key: "build/div_struct"     # mean pairwise d_struct on the SUBTYPE-COLLAPSED skeleton;
+                                # threshold-free, so density-invariant. NOT build/n_modes, which is
+                                # single-linkage Hill at tau=1 and percolates: 16x more samples from
+                                # an IDENTICAL distribution drops it 5x while div_struct moves 1%
+                                # (ADR-0020, amended after the screen's calibration wave).
+    floor: null                 # SET AFTER STEP 2. null disables the gate entirely (_gate_factor
+                                # returns 1.0), which is the correct pre-calibration state -- a floor
+                                # guessed before the anchor is measured is a second objective.
+                                # Rule: well below the WORST anchor seed, targeting genuine
+                                # degeneracy rather than concentration. The screen's wave gave
+                                # div_struct tail-5 of 5-8 (mean 6.8, SD 1.1) -> floor 3, at 1.8 SD
+                                # below the worst seed. Expect a similar landing spot since frames
+                                # and windows are unchanged, but the anchor here is the screen
+                                # WINNER, not the screen anchor, so its diversity band is its own
+                                # question. Re-measure; do not copy 3 across on faith.
+    window: 5                   # TAIL, matched to the reward tail. Safe only because the metric is
+                                # div_struct: healthy late commitment reads ~8 and collapse reads
+                                # ~0, so a tail can tell them apart. Under n_modes both -> ~1.
+
+  experiment_name_path: params.config.full_experiment_name
+  train_dir_path: params.config.train_dir
+  summaries_subdir: summaries
+  sampler_seed: 42              # Deliberately the SAME as the screen. The per-trial seed RNG is
+                                # seeded from this, so the calibration wave here should draw the
+                                # same 8 seeds the screen's wave did -- making the anchor comparison
+                                # PAIRED, which detects a real shift with far less budget than two
+                                # independent 8-samples would.
+
+  slots: auto                   # 8 MIG slices on the tuning box; --slots 1 --allow-busy locally
+  expect_slots: 8               # refuse to start on the wrong width -- `auto` finding 2 whole cards
+                                # instead of 8 slices runs the study 4x slower, silently. Partition
+                                # first: `python -m experiments.harness.mig --gpus 0,1 --count 4`.
+  launch_stagger_seconds: 30
+  max_attempts: 3               # rebuild crash resumes from checkpoint; OOM never relaunches
+  keep_checkpoints: 2
+
+  top_k: null                   # -> max(3, 15% of completed) == 18 at 120 completed
+  noise_metrics:
+    - {key: "quality/Window_Rew_Mean", window: 5}   # the CV of the quantity the score actually reads
+    - {key: "quality/R_mean", window: 5}    # kept alongside; the gap between the two is diagnostic
+    - {key: "build/div_struct", window: 5}  # the CV of the quantity the gate actually reads
+    - {key: "build/n_modes",  window: 24}   # diagnostic only. 24 >= the total window count, i.e.
+                                            # the WHOLE series -- still correct here because frames
+                                            # are unchanged. Doubling frames would make it a
+                                            # half-series tail without any error.
+
+pruner:
+  enabled: false                # ADR-0018: stays off until a calibration wave shows mid-run rank
+                                # predicts final rank -- a wave that varies SEEDS cannot show that.
+                                # Structurally unavailable here anyway: a pruned trial produces no
+                                # tail, so the tail-5 objective cannot score it at all.
+# Ranges bracket the screen's top-37 p10-p90 with padding, clipped to the screen's own bounds. Each
+# one contains BOTH the exported centre and the argmax: the top-k scores span 18.50-19.86, a 1.37
+# gap against a 6% seed noise floor worth ~1.2 at that level, so those 37 trials are statistical
+# TIES and the argmax's coordinates are close to a random draw from the blob (it sits at p3, p95,
+# p95, p5, p81, p65 across the six). Excluding it would be excluding a plausible optimum on noise.
+params:
+  # ── control PPO ──
+  - {path: params.config.kl_threshold, type: float, low: 0.01, high: 0.03, log: true}
+    # top-k p10-p90 0.0154-0.0264, already at the screen's own upper bound.
+  - {path: params.config.entropy_coef, type: float, low: 1.5e-4, high: 2.5e-3, log: true}
+    # THE parameter this stage exists to resolve: 21-25% of screen variance (fANOVA, with and
+    # without the two collapsed trials), against 1-2.5% for the other five here. Cut from the
+    # screen's 1e-4..3e-2 -- a 300x span the top-k occupies 1.9e-4..1.9e-3 of. Upper bound is the
+    # argmax (1.87e-3) plus headroom, not p90 (1.2e-3), which would have excluded it.
+  - {path: params.config.critic_coef, type: float, low: 2.0, high: 6.7, log: true}
+    # top-k p10-p90 2.95-4.46; argmax 6.59 sits at p95, hence the wide upper bound.
+
+  # ── generator ──
+  - {path: params.config.generator.entropy_coef, type: float, low: 0.02, high: 0.16, log: true}
+    # top-k p10-p90 0.030-0.105. Note the screen's own comment: 0.05 rode in with the phase-5
+    # factored decoder and was never calibrated in those units. The top-k centres on 0.068, so the
+    # screen has now calibrated it -- this range refines rather than rediscovers.
+  - {path: params.config.generator.beta, type: float, low: 0.1, high: 0.72, log: true}
+    # top-k p10-p90 0.129-0.477, hard against the screen's lower bound of 0.1. If the focus centre
+    # lands at 0.1 again, the optimum is likely BELOW the range and wants a lower floor next time.
+  - {path: params.config.generator.lam, type: float, low: 0.1, high: 7.5, log: true}
+    # DELIBERATELY WIDE -- the top-37 are BIMODAL in lam, 23 trials in 0.11-0.91 and 14 in 2.17-5.36
+    # with nothing between. The exported centre (0.459) is not a compromise between the modes, it
+    # sits inside the lower one, and only because that mode has more members. Narrowing to either
+    # cluster would pick a mode on trial COUNT rather than on score, so the range spans both and the
+    # focus decides. Re-read the top-k spread on lam in the focus report before trusting its centre.

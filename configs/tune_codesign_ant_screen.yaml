@@ -16,6 +16,18 @@
 #
 # NOTE: `base_config` is the ordinary task leaf, not a tune-only config. The deleted
 # ppo_ant_codesign_tune.yaml only ever supplied max_epochs, and that is derived per trial now.
+# NOTE: the completed run of this study (logs/tune/codesign_ant_screen, 248 trials) predates two
+# changes and its ranking does NOT carry over.
+#   1. The objective is now Window_Rew_Mean, not R_mean (see metric_key).
+#   2. More importantly, it was scored under a reward bug: reset_idx did not move
+#      `old_root_pos_buf` to the spawn pose, so an episode's terminal step was charged
+#      -(x_final - x_spawn)/dt -- exactly cancelling all accumulated forward reward (measured:
+#      total x_vel contribution 0.000000). Locomotion was worth nothing and standing still was
+#      optimal; the winner scored 99.3% of the 20.0 stand-still ceiling and no trial of 247 ever
+#      cleared it. Fixed in SoftwarePackage src/codesigner/backend/modular.py, reset_idx.
+# Every calibration-derived constant below (gate.floor, the noise floor, the anchor band) was
+# measured under that reward and must be re-derived from a fresh --calibrate wave. The trial
+# DURATIONS are unaffected: a reward fix changes no shape and no step count.
 study:
   name: codesign_ant_screen
   n_trials: 248                 # 8 calibration + 240 search. A wave runs as ordinary trials in this
@@ -31,13 +43,28 @@ study:
   trial_timeout_seconds: 18000
 
   # ── objective (ADR-0020) ──
-  #   score = mean(quality/R_mean, last 5 windows) x min(1, mean(build/n_modes, whole series)/floor)
+  #   score = mean(quality/Window_Rew_Mean, last 5 windows)
+  #           x min(1, mean(build/div_struct, last 5 windows)/floor)
   # WINDOW-indexed, not epoch-indexed: one point per resample window is phase-aligned by
   # construction, which is the only reason horizon_length is a legal sweep parameter below. An
   # epoch-indexed tail (rewards/iter) lands at an arbitrary phase within a window once timing moves,
   # and score_mode: final_frac does not rescue it -- that path subtracts n_pretrain (a WINDOW count)
   # from n (an EPOCH count), a cap only meaningful for a window-indexed series.
-  metric_key: "quality/R_mean"
+  # Window_Rew_Mean, NOT R_mean. Both average over the same sampled bodies; they differ in what
+  # they average WITHIN one body. R_mean is the mean over that env's COMPLETED episodes -- equal
+  # weight per episode, and the episode still in flight at the window boundary is discarded. Since
+  # episode length ramps hard across a window (measured 65 -> 849 steps on a screen trial), the
+  # discarded one is systematically the BEST one, and a handful of short post-rebuild failures get
+  # equal billing with one long good run. Window_Rew_Mean is the env's TOTAL reward over the
+  # window: equal weight per step, nothing dropped.
+  #
+  # CAVEAT, and the reason this is not free: Window_Rew_Mean carries the window LENGTH in its
+  # units -- ceil(resample_interval * max_episode_length / horizon_length) * horizon_length steps,
+  # which is 1000 / 1008 / 1024 for horizon_length 8 / 16 / 32. That is a 2.4% systematic edge for
+  # h=32 in a study that SWEEPS h, on a metric whose seed noise floor is ~6%. Small, but free and
+  # in one direction, so read any h result against it. R_mean is invariant here; that invariance is
+  # what it buys in exchange for discarding the in-flight episode.
+  metric_key: "quality/Window_Rew_Mean"
   score_mode: recovered
   score_window: 5               # windows, not epochs
   gate:
@@ -98,10 +125,16 @@ study:
 
   # ── reporting (ADR-0018) ──
   top_k: null                   # -> max(3, 15% of completed) == ~36 at 240 completed
-  noise_metrics:                # window 24 >= the total window count, i.e. the WHOLE series -- so
-    - {key: "quality/R_mean", window: 5}    # the reported n_modes CV is the CV of the quantity the
-    - {key: "build/div_struct", window: 5}  # gate actually reads, not of some other tail
-    - {key: "build/n_modes",  window: 24}   # kept as a diagnostic only -- no longer the gate
+  noise_metrics:
+    # Each metric gets its OWN tail, so every reported CV is the CV of the quantity that actually
+    # uses it -- the objective's tail for the objective, the gate's tail for the gate.
+    - {key: "quality/Window_Rew_Mean", window: 5}   # the objective; the number that gates the study
+    - {key: "quality/R_mean", window: 5}            # kept alongside: the two weightings disagree
+                                                    # whenever episodes end mid-window, and the gap
+                                                    # between them is itself a diagnostic
+    - {key: "build/div_struct", window: 5}          # what the collapse gate reads
+    - {key: "build/n_modes",  window: 24}           # diagnostic only, no longer the gate. 24 >= the
+                                                    # total window count, i.e. the WHOLE series
 
 pruner:
   enabled: false                # ADR-0018: stays off until a calibration wave shows mid-run rank
