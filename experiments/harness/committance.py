@@ -176,8 +176,21 @@ def _mm_entropy(counts):
 
 
 def _limb_keys(bodies):
-    """(M, n_slots) object array of hashable per-slot limb keys."""
-    return np.array([[tuple(limb) if limb else None for limb in b] for b in bodies], dtype=object)
+    """(M, n_slots) object array of hashable per-slot limb keys.
+
+    The shape is PRE-ALLOCATED rather than inferred. `np.array(nested, dtype=object)` still walks
+    the nesting: a limb key is a tuple of type codes, so if EVERY limb in the population is present
+    and holds the same number of tokens, numpy descends one level further and returns
+    (M, n_slots, n_tokens). `K[:, n]` is then 2-D, and `Counter` over it raises "unhashable type:
+    numpy.ndarray". That homogeneous case is exactly total generator collapse -- observed live at
+    limbcount 8.00 / modules 24.00, i.e. all 8 limbs at 3 modules on all 4096 bodies -- so the
+    inferred-shape version crashed on the one population state these metrics exist to report. One
+    absent limb anywhere is enough to keep it 2-D, which is why it survived everything else."""
+    K = np.empty((len(bodies), len(bodies[0])), dtype=object)
+    for i, b in enumerate(bodies):
+        for n, limb in enumerate(b):
+            K[i, n] = tuple(limb) if limb else None
+    return K
 
 
 def limb_entropies(bodies):
