@@ -983,6 +983,29 @@ class CodesignAgent(LoggingA2CAgent):
         counts = tr['counts'].detach().cpu().numpy().astype(int)
         eff = tr['eff_sub'].detach().cpu().numpy().astype(int)
         cap = tr['cap_sub'].detach().cpu().numpy().astype(int)
+        # M4 FIRST: the diversity HEADLINE (docs/reference/Metrics.md), on the SUBTYPE-COLLAPSED
+        # skeleton.
+        #   n_modes    = Hill(q=1) over single-linkage d_struct clusters at tau = 1 module
+        #   div_struct = mean pairwise d_struct (threshold-free companion)
+        # Collapsed because the free_entropy finding is that the skeleton commits while the subtype
+        # axis stays FREE: every typed statistic (build/n_distinct, build/body_diversity) therefore
+        # stays near its ceiling under total skeleton collapse and cannot detect it. n_modes == 1.0
+        # is one design, by construction. This is what the tuner gates on -- ADR-0020.
+        # RL-only, exactly matching build/n_distinct, so a tail over the whole series is precisely
+        # "all RL windows" whatever n_pretrain is set to, with no arithmetic on the tuner side.
+        #
+        # ORDER MATTERS, and this block goes first BECAUSE the tuner gates on div_struct. It used to
+        # run after the perplexity metrics below, so when _limb_keys crashed on a fully homogeneous
+        # population the collapsed window logged no div_struct at all -- the gate could not fire on
+        # total collapse, because the run died before reporting it, and "collapsed" and "crashed"
+        # became the same observation. That crash is fixed, but the dependency was the real defect:
+        # the gate's input must not sit downstream of a richer, more fragile statistic.
+        if rl:
+            n_modes, spread = modes_and_spread(
+                population_to_repr(counts, eff, cap, collapse_subtypes=True))
+            w.add_scalar('build/n_modes', n_modes, frame)
+            w.add_scalar('build/div_struct', spread, frame)
+
         reprs = population_to_repr(counts, eff, cap)
         h_body = rao_blackwell_h_body(tr['step_entropy'].detach().cpu().numpy(),
                                       tr['active_step'].detach().cpu().numpy())
@@ -993,21 +1016,6 @@ class CodesignAgent(LoggingA2CAgent):
         w.add_scalar('build/body_structure', red['C_nats'] / sumH if sumH > 1e-9 else 0.0, frame)
         for i in range(self._n_limbs):
             w.add_scalar(f'build/limb_diversity/{_LIMB_CODE[i]}', float(red['N_limb'][i]), frame)
-
-        # M4: the diversity HEADLINE (docs/reference/Metrics.md), on the SUBTYPE-COLLAPSED skeleton.
-        #   n_modes    = Hill(q=1) over single-linkage d_struct clusters at tau = 1 module
-        #   div_struct = mean pairwise d_struct (threshold-free companion)
-        # Collapsed because the free_entropy finding is that the skeleton commits while the subtype
-        # axis stays FREE: every typed statistic (build/n_distinct, build/body_diversity) therefore
-        # stays near its ceiling under total skeleton collapse and cannot detect it. n_modes == 1.0
-        # is one design, by construction. This is what the tuner gates on -- ADR-0020.
-        # RL-only, exactly matching build/n_distinct, so a tail over the whole series is precisely
-        # "all RL windows" whatever n_pretrain is set to, with no arithmetic on the tuner side.
-        if rl:
-            n_modes, spread = modes_and_spread(
-                population_to_repr(counts, eff, cap, collapse_subtypes=True))
-            w.add_scalar('build/n_modes', n_modes, frame)
-            w.add_scalar('build/div_struct', spread, frame)
 
     # ---- checkpointing (gen heads live on self.model -> saved by base) --------------
     def get_full_state_weights(self):
