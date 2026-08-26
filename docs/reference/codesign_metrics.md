@@ -105,7 +105,22 @@ Subsystem-keyed. `<slot>` ∈ {F, FR, R, BR, B, BL, L, FL} (limb compass slots);
 |---|---|---|---|
 | `quality/R_mean` | mean body return `R` (scaled) over the window | rises as bodies improve | flat/falling = bodies not improving |
 | `quality/R_std` | spread of `R` across bodies | > 0 while exploring; shrinks as generator converges | →0 early = no body diversity to learn from |
+| `quality/Window_Rew_Mean` | mean **total** reward per env over the window (scaled), every step counted — unfinished episode included | rises with `R_mean` | diverging from `R_mean` = the two weightings disagree (see below) |
+| `quality/Window_Rew_Std` | spread of the window total across bodies | as `R_std` | as `R_std` |
 | `quality/by_limbcount/<k>` | mean `R` of bodies with exactly `<k>` limbs | monotone-ish in k (no limb cost ⇒ more limbs earn ≥) | non-monotone = controller can't yet exploit extra limbs |
+
+**`R_mean` vs `Window_Rew_Mean`.** Both average over the same 4096 bodies; they differ in what they
+average *within* one body. `R` is the mean over that env's **completed** episodes — equal weight per
+episode, and the episode still running at the window boundary is thrown away. `W` is the env's
+**total** reward over the window — equal weight per step, nothing discarded. The gap is not
+cosmetic: episode length ramps across a window (measured 65 → 849 steps on a screen trial), so `R`
+equal-weights a handful of short post-rebuild failures against one long good run, while `W` lets the
+long run dominate in proportion to how long it lasted. `R` is the training target because GenCrit
+regresses a per-episode quantity; `W` is a scoring/diagnostic metric only.
+
+`W` also carries the window length in its units — `ceil(interval × max_episode_length ÷
+horizon_length) × horizon_length` steps — so it is only comparable across runs at a fixed
+`horizon_length` (1008 steps at h=16 vs 1024 at h=32, a 1.6% skew). `R` is invariant to this.
 
 ### `clone/` — control preservation at resample (per window)
 | metric | meaning | healthy | bad → likely cause |

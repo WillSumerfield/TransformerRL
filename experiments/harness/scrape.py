@@ -68,6 +68,8 @@ FOLD_OFFSETS = (-8, 24)          # epochs either side of a resample boundary, fo
 WINDOW_TAGS = {                  # every study that has a generator
     "R_mean":     "quality/R_mean",
     "R_std":      "quality/R_std",
+    "W_mean":     "quality/Window_Rew_Mean",
+    "W_std":      "quality/Window_Rew_Std",
     "n_modes":    "build/n_modes",
     "div_struct": "build/div_struct",
     "gen_entropy": "gen/entropy",

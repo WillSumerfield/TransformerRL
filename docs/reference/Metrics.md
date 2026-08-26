@@ -350,6 +350,10 @@ $$\text{quality/R\_mean}(w) = \frac{s}{N}\sum_{i=1}^{N} \bar R_w(b_i)$$
 where $\bar R_w(b_i)$ is body $i$'s mean completed-episode return over window $w$ under the
 *training* (sampled) control policy, and $s$ = reward-shaper scale.
 
+`quality/Window_Rew_Mean` is logged beside it: the same population average over the window's
+**total** reward per env, counting every step rather than only completed episodes. It is a
+diagnostic, not part of this protocol — see `codesign_metrics.md` for when the two diverge.
+
 #### Reading it
 Higher = better. **This is a joint body × control score**, not a control-quality curve: it is
 measured on the generator's own bodies, so a run that collapses onto one easy body can beat one
