@@ -42,15 +42,16 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── evaluate_codesign.py          (score a checkpoint on named bodies)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
+│   ├── defaults/base.yaml            (shared rl_games boilerplate; ADR-0006)
 │   ├── ppo_*.yaml
-│   └── tune_config.yaml
+│   └── tune_codesign_ant_*.yaml      (screen then focus; ADR-0018)
 ├── experiments/                      ← Analysis context
 │   ├── CONTEXT.md
 │   ├── harness/                      (shared measurement layer: diversity, committance, policy)
 │   ├── joint_optimization/           (2D toy: designer/predictor coupling; standalone, no repo deps)
 │   └── <slug>.py                     (one data-gathering script per paper experiment)
-├── notebooks/                        ← Analysis context (one <slug>.ipynb per experiment)
-├── data/                             ← Analysis context (figures, .npz)
+├── Paper/                            (main.tex + iclr2026 dependencies)
+├── data/  evals/                     ← Analysis context (figures, .npz; eval.py CSV rows)
 ├── logs/  runs/  videos/             (run artifacts, gitignored/untracked)
 ```
 
