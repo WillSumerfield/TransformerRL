@@ -267,9 +267,9 @@ def scrape(study: str, arms: list[str] | None = None,
 
     out = {k: np.full((*shape, n_win), np.nan) for k in win_tags}
     out |= {k: np.full((*shape, n_ep), np.nan) for k in ep_tags}
-    for k in ("energy", "energy_null", "coverage"):
-        if n_win:
-            out[k] = np.full((*shape, n_win), np.nan)
+    if n_win:
+        from experiments.harness import travel
+        out |= {k: np.full((*shape, n_win), np.nan) for k in travel.SERIES}
     if n_win:
         out["rew_fold"] = np.full((*shape, FOLD_OFFSETS[1] - FOLD_OFFSETS[0] + 1), np.nan)
     status = np.full(shape, "missing", dtype=object)
