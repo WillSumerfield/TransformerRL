@@ -1,7 +1,8 @@
 """Wave scheduler for the paper experiments: a fixed queue of runs onto a fixed pool of slots.
 
-    python -m experiments.harness.launch aux              # 16 runs, 8 slots
-    python -m experiments.harness.launch clone --dry-run  # print the plan, launch nothing
+    python -m experiments.harness.launch aux                      # one study
+    python -m experiments.harness.launch baseline aux clone       # several, as ONE mixed pool
+    python -m experiments.harness.launch clone --dry-run          # print the plan, launch nothing
     python -m experiments.harness.launch attention --slots 4 --arms full,self_cls
 
 The tuner (`scripts/tune.py`) schedules an *open* set of trials it invents as it goes and scores
@@ -16,6 +17,13 @@ time, so slot degradation, another tenant, or thermal drift over a 9-hour sessio
 on one arm -- where it would be invisible as a uniform per-arm shift. This is the "mixed waves" rule
 in every build plan and it is a property of the *order*, not of any synchronisation: slots refill
 from the queue as they free, since a lock-step wave would idle 7 slots waiting for the slowest run.
+
+**Several studies queue as one pool, and usually should.** The rule above is about conditions that
+get COMPARED, and since the baseline was split into its own study those conditions now span studies:
+running `baseline` in one session and `clone` hours later puts the shared comparison point on the
+far side of exactly the drift mixed waves exist to cancel. Naming several studies interleaves them
+seed-major across all of them, which restores the property. `--arms` is single-study only, since an
+arm name means nothing across a set.
 
 **Seeds go through the config, never `--seed`.** The trainer's `--seed` flag additionally forces
 cudnn.deterministic, CUBLAS_WORKSPACE_CONFIG and single-threaded torch (train_utils.py:888-894),
@@ -268,6 +276,22 @@ def study_runs(name: str, arms: list[str] | None = None, seeds: tuple[int, ...] 
     return runs
 
 
+def queue_runs(studies: list[str], arms: list[str] | None = None,
+               seeds: tuple[int, ...] | None = None, epochs: int | None = None) -> list[Run]:
+    """Several studies as ONE queue, still seed-major so every wave spreads across all of them.
+
+    Concatenating the studies instead would run each to completion in turn, which is the arm-major
+    order the whole scheduler exists to avoid -- just at study granularity, and therefore invisible
+    as a per-study shift in whatever the studies are compared on. Within a seed the order is the one
+    given on the command line, so a wave carries a spread of every queued condition.
+    """
+    per_seed: dict[int, list[Run]] = {}
+    for name in studies:
+        for run in study_runs(name, arms, seeds, epochs):
+            per_seed.setdefault(run.meta["seed"], []).append(run)
+    return [run for seed in sorted(per_seed) for run in per_seed[seed]]
+
+
 def _budget(study: Study, config: Path, sets: tuple[str, ...],
             epochs: int | None) -> tuple[str, ...]:
     """The two overrides that put a run's budget and its checkpoints on window boundaries.
@@ -472,7 +496,8 @@ def run_pool(runs: list[Run], slots: list[_Slot], log_dir: Path, *, poll: float 
 
 def main():
     ap = argparse.ArgumentParser(description="Launch a paper experiment's runs across GPU slots")
-    ap.add_argument("study", choices=sorted(STUDIES), help="which experiment")
+    ap.add_argument("studies", nargs="+", choices=sorted(STUDIES), metavar="STUDY",
+                    help="one or more experiments; several queue as one mixed pool")
     ap.add_argument("--arms", help="comma-separated subset of the study's arms (default: all)")
     ap.add_argument("--seeds", help="comma-separated seeds (default: 42-49)")
     ap.add_argument("--epochs", type=int,
@@ -489,13 +514,17 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the queue and the plan, launch nothing")
     args = ap.parse_args()
 
-    runs = study_runs(args.study,
-                      arms=args.arms.split(",") if args.arms else None,
-                      seeds=tuple(int(s) for s in args.seeds.split(",")) if args.seeds else None,
-                      epochs=args.epochs)
+    studies = list(dict.fromkeys(args.studies))       # de-dup, keep the order given
+    if args.arms and len(studies) > 1:
+        ap.error("--arms selects arms of ONE study; an arm name does not identify a run across a set")
+
+    seeds = tuple(int(x) for x in args.seeds.split(",")) if args.seeds else None
+    runs = queue_runs(studies, arms=args.arms.split(",") if args.arms else None,
+                      seeds=seeds, epochs=args.epochs)
+    label = "+".join(studies)
 
     if args.dry_run:
-        print(f"[dry-run] {args.study}: {len(runs)} runs, queue order (seed-major, arm-minor)\n")
+        print(f"[dry-run] {label}: {len(runs)} runs, queue order (seed-major, arm-minor)\n")
         for run in runs:
             state, _, note = _classify_pending(run)
             print(f"  {state:8} {run.name:28} -> {run.train_dir}")
@@ -506,7 +535,7 @@ def main():
         return
 
     slots = _make_slots(parse_slot_spec(args.slots), allow_busy=args.allow_busy)
-    log_dir = _ROOT / "logs" / "paper" / args.study
+    log_dir = _ROOT / "logs" / "paper" / label
     try:
         status = run_pool(runs, slots, log_dir,
                           timeout=args.timeout_hours * 3600 if args.timeout_hours else None,
@@ -517,7 +546,7 @@ def main():
     tally = {}
     for st in status.values():
         tally[st] = tally.get(st, 0) + 1
-    print(f"\n[launch] {args.study}: " + ", ".join(f"{n} {s}" for s, n in sorted(tally.items())))
+    print(f"\n[launch] {label}: " + ", ".join(f"{n} {s}" for s, n in sorted(tally.items())))
     bad = [n for n, s in status.items() if s not in ("done",)]
     if bad:
         print(f"[launch] not complete: {', '.join(sorted(bad))}")

@@ -44,6 +44,17 @@ algorithms (BodyGen, NGE, RoboGrammar) do not yet, which is what blocks it.
 
 **2, 3, 4 in parallel → Phase5 port → 1**, then 5 when the rival algorithms land.
 
+Queue the studies that share the baseline as **one pool**, so the mixed-wave rule holds across them
+and not just inside each:
+
+```
+python -m experiments.harness.launch baseline aux clone --slots auto   # 40 runs
+python -m experiments.harness.launch attention --slots auto            # 24, its own baseline
+```
+
+Running them as separate sessions would put the shared baseline on the far side of the drift mixed
+waves exist to cancel.
+
 Experiments 2, 3 and 4 all run on `HEAD` with no new arms — 2 and 3 are pure `--set` overrides, 4 adds
 only an attention mask — so they run first and shake the harness out on cheap runs. Experiment 3 must
 precede experiment 1's real waves because it decides how experiment 1's `single` arm is configured:
