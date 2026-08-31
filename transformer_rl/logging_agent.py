@@ -271,7 +271,7 @@ class LoggingA2CAgent(A2CAgent):
             if self._on_iteration is not None:
                 have_reward = self.game_rewards.current_size > 0
                 self._on_iteration(Progress(
-                    step=epoch_num,
+                    tick=epoch_num,
                     reward=float(self.game_rewards.get_mean()[0]) if have_reward else None,
                     wall_time=time.perf_counter() - start_time))
 

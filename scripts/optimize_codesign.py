@@ -66,16 +66,20 @@ def main():
     library = algorithm.make_library()
     task = algorithm.make_task()
 
-    def on_iteration(record):
-        if record.step % 20 == 0 and record.reward is not None:
-            print(f"    epoch {record.step}: reward {record.reward:.1f}", flush=True)
+    def on_iteration(p):
+        if p.tick % 20 == 0 and p.reward is not None:
+            print(f"    epoch {p.tick}: reward {p.reward:.1f}", flush=True)
 
+    # The run directory, not a checkpoint path: the package names what goes inside it (latest,
+    # best, retained/, config.json, the metric record). rl_games' own nn/ and summaries/ land
+    # beside them, so one run is one folder. Constructed before the first run(), so an occupied
+    # directory is refused while nothing has been spent.
     run_dir = Path(algorithm._cfg["params"]["config"]["train_dir"],
                    algorithm._cfg["params"]["config"]["full_experiment_name"])
-    best, policy, generator = optimize(
+    best, policy, generator, record = optimize(
         algorithm, task, library,
         on_iteration=None if args.quiet_iterations else on_iteration,
-        checkpoint_path=run_dir / "codesign.ckpt",
+        checkpoint_dir=run_dir,
     )
 
     print(f"\nbest reward {best:.2f}")
@@ -83,6 +87,9 @@ def main():
     print(f"  generator {generator}")
     best_body = generator.generate(1, deterministic=True)[0]
     print(f"  best body {best_body}")
+    print(f"  run dir   {run_dir}")
+    for name, value in record.summary().items():
+        print(f"    {name:24s} {value}")
 
 
 if __name__ == "__main__":
