@@ -168,17 +168,40 @@ def _find_xwindow(display, title_fragments):
 class _VideoRecorder:
     """Captures the vsim X11 window each render_callback and writes to mp4."""
 
-    def __init__(self, path: Path, max_frames: int, stop_env: bool):
+    # A capture that returns no frame counts nothing, so a permanently failing capture would
+    # never reach max_frames and play would run until the window is closed. Bail after this many
+    # consecutive misses (~10s at 60fps) -- long enough to ride out a transient X error or a
+    # workspace switch, short enough that a hidden window doesn't hang the run.
+    MAX_CONSECUTIVE_FAILURES = 600
+
+    def __init__(self, path: Path, num_episodes: int, stop_env: bool):
+        # Import here, at construction, NOT in the per-frame callback: the callback catches
+        # Exception, so a missing opencv used to surface as one log line per frame with the frame
+        # counter stuck at zero. Failing now aborts before the sim and viewer are built.
+        import cv2                                   # noqa: F401  (declared: opencv-python-headless)
+        from Xlib import display as xdisplay         # noqa: F401  (declared: python-xlib)
         self.path = path
-        self.max_frames = max_frames
+        self.num_episodes = num_episodes
+        self.max_frames = None                       # derived at the first capture, from the env
         self.stop_env = stop_env
         self._writer = None
         self._display = None
         self._window = None
         self._size = None
         self._frames = 0
+        self._misses = 0
         self.done = False
         self._warned = False
+
+    def _abort(self, env, why: str):
+        print(f"[video] ERROR: {why} -- giving up after "
+              f"{self.MAX_CONSECUTIVE_FAILURES} consecutive failed captures "
+              f"({self._frames} frames written)")
+        if self._writer is not None:
+            self._writer.release()
+        self.done = True
+        if self.stop_env:
+            env.render_finished = True
 
     def _warn_once(self, msg):
         if not self._warned:
@@ -238,11 +261,26 @@ class _VideoRecorder:
                     self._init()
                 frame = self._capture()
                 if frame is None:
+                    self._misses += 1
+                    if self._misses >= self.MAX_CONSECUTIVE_FAILURES:
+                        self._abort(env, "no frame captured")
                     return
+                self._misses = 0
                 if self._writer is None:
                     h, w = frame.shape[:2]
                     self._size = (w, h)
-                    fps = round(1.0 / env.dt) if hasattr(env, "dt") else 60
+                    # One frame per render() call. render() fires once per PHYSICS SUBSTEP when
+                    # render_substep is on (simulation.py's default), i.e. frame_skip times per
+                    # control step -- so both the playback rate and the frame budget are in
+                    # substeps, not control steps. Getting this wrong made bodygen (frame_skip=4)
+                    # and swimmer (32) videos that many times too slow and that many times short.
+                    substep = bool(getattr(env, "render_substep", False))
+                    skip = getattr(env, "frame_skip", 1) if substep else 1
+                    step_dt = (env.timestep if substep else env.dt) if hasattr(env, "dt") else 1 / 60
+                    fps = round(1.0 / step_dt)
+                    # max_episode_length off the live env, not a hardcoded 1000: task defaults
+                    # differ (ant/bodygen 1000, adroit 200).
+                    self.max_frames = self.num_episodes * env.max_episode_length * skip
                     self.path.parent.mkdir(parents=True, exist_ok=True)
                     self._writer = cv2.VideoWriter(
                         str(self.path),
@@ -262,7 +300,11 @@ class _VideoRecorder:
                     if self.stop_env:
                         env.render_finished = True
             except Exception as e:
-                print(f"[video] capture error: {e}")
+                self._misses += 1
+                if self._misses >= self.MAX_CONSECUTIVE_FAILURES:
+                    self._abort(env, f"capture error: {e}")
+                elif self._misses == 1:
+                    print(f"[video] capture error: {e}")
         return callback
 
 
@@ -718,10 +760,9 @@ def _run_random(config, args, video_path=None, num_episodes=1) -> None:
     env.reset()
     recorder = None
     if video_path is not None:
-        max_ep = getattr(env, "max_episode_length", 1000)
         # stop_env=False: we own this loop, so break on recorder.done instead of
         # tripping env.render_finished (which would raise via raise_exception).
-        recorder = _VideoRecorder(video_path, max_frames=num_episodes * max_ep, stop_env=False)
+        recorder = _VideoRecorder(video_path, num_episodes=num_episodes, stop_env=False)
     _attach_render_callback(env, recorder)
     from codesigner.backend.simulation import RenderFinished
     try:
@@ -986,9 +1027,8 @@ def run_training(
         if mode == "train":
             print("Error: --video is not supported in train mode")
             sys.exit(1)
-        max_ep = env_kwargs.get("max_episode_length", 1000)
-        max_frames = (args.num_episodes or 1) * max_ep
-        recorder = _VideoRecorder(video_path, max_frames=max_frames, stop_env=(mode == "play"))
+        recorder = _VideoRecorder(video_path, num_episodes=(args.num_episodes or 1),
+                                  stop_env=(mode == "play"))
 
     # --- Env + vecenv registration ---
     num_episodes = args.num_episodes
@@ -1018,8 +1058,7 @@ def run_training(
                   f"({len(switch.runs)} compatible run(s))", flush=True)
         _attach_render_callback(envs, recorder, switch)
         if mode == "play" and num_episodes is not None:
-            max_ep = env_kwargs.get("max_episode_length", 1000)
-            limiter = _PlayLimiter(envs, num_episodes * max_ep)
+            limiter = _PlayLimiter(envs, num_episodes * envs.max_episode_length)
             return NewToOldAPICompatilibity(limiter)
         return NewToOldAPICompatilibity(envs)
 
