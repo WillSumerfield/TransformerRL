@@ -29,6 +29,9 @@ _MODE_LIVE, _MODE_COMMITTED, _MODE_PAD = 0, 1, 2
 _N_MODE = 3
 _FD_MODULE_DIM = 21         # FD raw module target: relpos(3)+relrot6d(6)+relvel(6)+cfrc(6) (2b)
 _FK_MODULE_DIM = 15         # FK torso-frame target: pos(3)+rot6d(6)+vel(6, lin+ang) (2b)
+# The limb visit order a greedy draw walks. Arbitrary but FIXED, which is the whole point: it is
+# what makes "the committed design" one body rather than a family (LimbTransformer.sample).
+_GREEDY_ORDER_SEED = 0
 
 
 def _sixd_to_R(x6: torch.Tensor) -> torch.Tensor:
@@ -758,7 +761,8 @@ class LimbTransformer(nn.Module):
         cap_sub[arange, slot] = torch.where(is_cap, sub_a, cap_sub[arange, slot])
 
     @torch.no_grad()
-    def sample(self, N: int, mode: str = "stochastic") -> dict[str, torch.Tensor]:
+    def sample(self, N: int, mode: str = "stochastic",
+               beta: float | None = None) -> dict[str, torch.Tensor]:
         """Unroll the frontier generation MDP for N envs (fixed L = n*max_len steps). Each step:
         encode the current designed prefix, read v(prefix) from CLS, pick a RANDOM still-growable
         limb (one with no cap yet), read the FACTORED GenAct on its START token under the positional
@@ -771,12 +775,36 @@ class LimbTransformer(nn.Module):
           uniform     uniform over the grammar-VALID set (zero logits into gen_dist) -- a random
                       policy on the same MDP; the diversity-reference / random-generator body source.
 
+        `beta` is the same three modes as ONE continuous knob: an inverse temperature multiplying the
+        raw GenAct logits before the grammar mask. beta=1 is `stochastic`, beta=0 zeroes the logits
+        and so IS `uniform`, and beta=inf takes the argmax and so IS `greedy` -- the named modes are
+        exactly these three values, not approximations of them (argmax is invariant to a positive
+        scale, and masking after scaling leaves the valid set untouched at every beta). Passing it
+        overrides `mode`. What the package's **spread control** is expressed in: the interpolation
+        between a committed design and the grammar has to be continuous to be bisected on, and the
+        internal knob is deliberately never the axis reported.
+
+        NOTE `old_logp` and `step_entropy*` come back under the SAMPLED distribution, so a trace
+        drawn at beta != 1 is not a valid PPO trace. Sampling-only paths only.
+
         Emitting a cap finalizes the limb, and the grammar forces a cap at the deepest slot, so
         every limb ends with exactly one cap and costs at most (max_len-1 effectors + 1 cap) =
         max_len steps — L = n*max_len steps therefore always suffice.
         >=1-limb guard: force an EFFECTOR when the body is still empty and only one growable limb is
         left. Steps where an env has no growable limb are no-ops (active_step=False, masked later)."""
+        if beta is None:
+            beta = {"stochastic": 1.0, "uniform": 0.0, "greedy": float("inf")}[mode]
+        assert beta >= 0.0, f"beta must be non-negative, got {beta}"
         dev = self.type_ids.device
+        # A greedy draw has to be THE committed design: the same body on every row and the same
+        # body on the next call. Argmax alone does not give that -- the limb VISIT ORDER is random,
+        # and order changes the conditioning, so draws differ (which is why `evalpass.modal_design`
+        # exists). Under greedy the order is therefore drawn from a fixed seed and shared across
+        # rows. `None` leaves every other beta on the global stream, bit-for-bit as before.
+        order_rng = None
+        if beta == float("inf"):
+            order_rng = torch.Generator(device=dev)
+            order_rng.manual_seed(_GREEDY_ORDER_SEED)
         n, max_len = self.n_limbs, self.max_limb_length
         L = n * max_len
         count   = torch.zeros(N, n, dtype=torch.long, device=dev)
@@ -798,17 +826,20 @@ class LimbTransformer(nn.Module):
             v_states[:, t] = self.gencrit_head(H[:, 0]).squeeze(-1)
             growable = cap_sub < 0                                 # uncapped == still growable
             active = growable.any(1)                               # (N,) still deciding
-            r = torch.rand(N, n, device=dev)
+            r = (torch.rand(1, n, device=dev, generator=order_rng).expand(N, n)
+                 if order_rng is not None else torch.rand(N, n, device=dev))
             slot = torch.where(growable, r, r.new_full((), -1.0)).argmax(1)   # random growable limb
             depth = count[arange, slot]
             force = active & (count.sum(1) == 0) & (growable.sum(1) == 1)     # >=1-limb guard
             cat_mask, sub_mask = self._gen_masks(depth, force)
             h = H[arange, 1 + slot]                                # (N,d) from the START token
             cat_in, sub_in = self.gen_cat_head(h), self.gen_sub_head(h)
-            if mode == "uniform":                                  # random policy: uniform over valid
+            if beta == 0.0:                                        # random policy: uniform over valid
                 cat_in, sub_in = torch.zeros_like(cat_in), torch.zeros_like(sub_in)
+            elif beta != 1.0 and beta != float("inf"):             # argmax ignores a positive scale
+                cat_in, sub_in = cat_in * beta, sub_in * beta
             cat_logp, sub_logp = self.gen_dist(cat_in, sub_in, cat_mask, sub_mask)
-            if mode == "greedy":
+            if beta == float("inf"):
                 c = cat_logp.argmax(-1)
                 s = sub_logp[arange, c].argmax(-1)
             else:
