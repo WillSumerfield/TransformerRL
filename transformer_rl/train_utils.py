@@ -956,10 +956,20 @@ def run_training(
     if network is not None:
         params.setdefault("network", {})["name"] = network[0]
 
+    # --- play REQUIRES a checkpoint: it means "watch a trained controller". Playing with
+    # randomly-initialized weights was a semantic duplicate of `random` mode (which is the
+    # no-policy path) and left CodesignPlayer._gen unset, since it is assigned in restore().
+    # Checked here, before the sim and viewer build, so it fails in under a second. ---
+    if mode == "play" and checkpoint is None:
+        raise SystemExit(
+            "[play] a checkpoint is required (a .pth, a run dir, or a model dir) -- play watches a "
+            "trained controller. To watch the config's seed body with random actions, use "
+            "`random` mode.")
+
     # --- play: a run/model dir enables live policy switching (see policy_switch.py);
     # a plain .pth stays single-checkpoint. base name = `name` (the checkpoint stem). ---
     switch = None
-    if mode == "play" and checkpoint is not None:
+    if mode == "play":
         from .policy_switch import resolve_source, PolicySwitch
         source = resolve_source(Path(checkpoint), name)
         if source["mode"] != "file":
@@ -1200,10 +1210,7 @@ def run_training(
     if checkpoint:
         run_args["checkpoint"] = checkpoint
     if mode == "play":
-        if checkpoint:
-            print(f"[play] Loading model from checkpoint: {checkpoint}")
-        else:
-            print("[play] No checkpoint provided; running with randomly initialized model")
+        print(f"[play] Loading model from checkpoint: {checkpoint}")
     from codesigner.backend.simulation import RenderFinished
     try:
         runner.run(run_args)

@@ -5,7 +5,7 @@ PPO training, Optuna tuning, play/render orchestration, and headless checkpoint 
 ## Language
 
 **Run mode**:
-The first positional arg to any `train_*.py`: `train` (default), `play`, or `random`. Headless defaults: `train` is headless; `play` opens a render window. `--video` is not supported in `train` mode. In `play` the positional checkpoint arg accepts a directory (see [Controller](#) / [Policy switching](#)), not just a `.pth` file. Headless checkpoint evaluation is a separate concern owned by `eval.py` (not a run mode).
+The first positional arg to any `train_*.py`: `train` (default), `play`, or `random`. Headless defaults: `train` is headless; `play` opens a render window. `--video` is not supported in `train` mode. `play` means *watch a trained [controller](#)*, so its positional checkpoint arg is mandatory — it accepts a directory (see [Controller](#) / [Policy switching](#)) as well as a `.pth` file, but never nothing. Watching without a controller is `random`: the config's seed body, one per env, driven by uniform-random actions. There is deliberately no way to *watch* bodies drawn from an untrained generator; that comparison lives headless in `eval.py`'s random body source. Headless checkpoint evaluation is a separate concern owned by `eval.py` (not a run mode).
 
 **Run name**:
 The leaf label identifying a single training run, the last segment of its output dir (see [Family / experiment](#)). Defaults to a timestamp; `--name` overrides it with a chosen label. In `train` mode a name that already exists errors out rather than clobbering the prior run.

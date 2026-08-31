@@ -2,7 +2,9 @@
 shared trunk's GenAct head) instead of the fixed base morph. On each episode reset it unrolls the
 generator (net.sample), rebuilds the env to those bodies, and runs the control policy on them -- so
 you watch the morphology distribution the generator learned. Falls back to the env base build if the
-checkpoint's net has no codesign generator. See codesign_agent.py."""
+BUILT net has no codesign generator (the flag is a property of the architecture, not of the loaded
+file) -- and `play` refuses to start without a checkpoint, so restore() always runs. See
+codesign_agent.py."""
 import torch
 from rl_games.algos_torch.players import PpoPlayerContinuous
 
