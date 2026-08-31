@@ -860,11 +860,27 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_window += 1
         self._last_R = R
 
-        # final-scatter data: trace v(full) vs R (per env) for notebooks/ant_codesign.ipynb panel 4.
+        # The window's generator population (ADR-0021), dumped here because this is the one point
+        # where the closing window's trace and its R are both in hand -- which is what sidesteps the
+        # half-step between build/* (next window) and the learning metrics (window that ended).
+        # `_gen_window` was incremented just above, so the window that ENDED is `_gen_window - 1`.
+        # Window 0 ran the seed body and never had a trace, so w0000.npz is legitimately absent and
+        # the reader keys off the filename rather than position. Dumped from the trace -- the
+        # generator's INTENT, before `_apply_ramp` mixes in teacher draws -- so travel and
+        # build/n_modes describe the same object; R and v_full are per-env and pair with either.
+        # int16 + compression is not fastidiousness: int64 uncompressed is ~50 MB/run against this
+        # ADR's 5 MB budget. Supersedes gen_scatter.npz, whose two fields it contains.
         if self._cur_trace is not None:
-            np.savez(os.path.join(self.experiment_dir, 'gen_scatter.npz'),
-                     v_full=self._cur_trace['v_states'][:, -1].cpu().numpy(),
-                     R=R.cpu().numpy())
+            tr = self._cur_trace
+            pop_dir = os.path.join(self.experiment_dir, 'gen_pop')
+            os.makedirs(pop_dir, exist_ok=True)
+            np.savez_compressed(
+                os.path.join(pop_dir, f'w{self._gen_window - 1:04d}.npz'),
+                counts=tr['counts'].detach().cpu().numpy().astype(np.int16),
+                eff_sub=tr['eff_sub'].detach().cpu().numpy().astype(np.int16),
+                cap_sub=tr['cap_sub'].detach().cpu().numpy().astype(np.int16),
+                R=R.detach().cpu().numpy().astype(np.float32),
+                v_full=tr['v_states'][:, -1].detach().cpu().numpy().astype(np.float32))
 
         trace = self._net().sample(N)
         counts, eff_sub, cap_sub = self._apply_ramp(
