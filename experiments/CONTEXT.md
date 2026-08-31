@@ -151,12 +151,14 @@ the within-window mean pairwise distance, so a wide static generator scores as f
 and travel are inseparable in it.
 
 **Mode coverage**:
-Cumulative count of distinct [modes](#effective-number-of-modes) seen up to a given window, matched
-across windows by the same single-linkage clustering so a mode that shifts by one module is not
-counted as new. Its **slope** is the discovery rate; still-climbing vs long-plateaued is the
-local-vs-global-search reading at a glance.
+Cumulative count of distinct [modes](#effective-number-of-modes) seen up to a given window: a greedy
+cover, where a design opens a new mode when it is more than one module from every mode already
+found, so a mode that shifts by one module is not counted as new. Its **slope** is the discovery
+rate; still-climbing vs long-plateaued is the local-vs-global-search reading at a glance.
 _Avoid_: reading a plateau as "the generator stopped moving" — the curve is monotone by
 construction and only reports finding, not motion. Pair it with [energy distance](#energy-distance).
+_Avoid_: pooling the windows and counting single-linkage clusters. Those components merge as points
+accumulate, so the count can fall between windows and its slope is not a discovery rate.
 
 ## Committance
 

@@ -517,7 +517,15 @@ $$E(w) = 2\,\mathbb{E}\big[d_{\text{struct}}(A,B)\big]
         - \mathbb{E}\big[d_{\text{struct}}(A,A')\big]
         - \mathbb{E}\big[d_{\text{struct}}(B,B')\big]$$
 with $A, A' \sim P_w$ and $B, B' \sim P_{w-1}$ independent. The same-distribution null is measured,
-not assumed: split $P_w$'s sample in half and evaluate $E$ between the halves.
+not assumed: split $P_w$'s sample in half and evaluate $E$ between the halves, averaged over several
+random splits (one split is itself noisy, and this number is the yardstick every travel value is
+read against).
+
+The two subtracted terms are the **diagonal-excluded** means — exactly the statistic
+`build/div_struct` logs — so travel and breadth are read off one definition without either being
+rescaled, and the estimator is unbiased at the null. A consequence worth stating: at the null $E$ is
+**as often slightly negative as slightly positive**, and a small negative value is the estimator
+working, not a defect. Read $E$ against the split-half floor, never against $0$.
 
 #### Reading it
 $0$ ⇔ the two windows' distributions match; positive in proportion to real movement, in module
@@ -536,12 +544,15 @@ are exactly what fixes this.
 Cumulative exploration: how many distinct designs have been found by window $w$.
 
 #### Meaning
-`HARNESS` — distinct [modes](#effective-number-of-modes) seen in windows $0 \dots w$, matched
-across windows by single-linkage `d_struct` clustering at $\tau = 1$ over the *pooled* populations,
-so a mode that shifts by one module is not counted as new.
+`HARNESS` — a **greedy cover** at radius $\tau = 1$: walking the windows in time order, a design
+opens a new mode when it is further than $\tau$ from every mode already discovered, so a mode that
+shifts by one module is not counted as new.
 
 #### Formula
-$$C(w) = \Big|\,\text{clusters}_{\tau}\big(\textstyle\bigcup_{u \le w} P_u\big)\,\Big|$$
+$$M_w = M_{w-1} \cup \big\{x \in P_w : d_{\text{struct}}(x, m) > \tau \;\;\forall m \in M\big\},
+\qquad C(w) = |M_w|$$
+
+where $M$ accumulates within the window as designs are admitted, and $M_{-1} = \varnothing$.
 
 #### Reading it
 Monotone non-decreasing; its **slope is the discovery rate**. Still climbing at the final window ⇒
@@ -551,3 +562,10 @@ finished, whether by converging or by getting stuck.
 _Avoid_: reading a plateau as "the generator stopped moving" — the curve is monotone by
 construction and reports finding, not motion. A generator cycling among already-seen designs
 plateaus while travelling. Pair it with [energy distance](#travel-energy-distance).
+
+_Avoid_: counting single-linkage clusters of the *pooled* populations, the obvious cumulative
+reading of [$N_{\text{modes}}$](#effective-number-of-modes). It is **not monotone**: single-linkage
+components merge as points accumulate, so one window contributing a design that bridges two existing
+clusters makes $C$ go *down*. A curve whose slope is meant to be a discovery rate has to be monotone
+by construction, which is what the greedy cover buys. The price is order-dependence — windows are
+fed in time order, which is deterministic and is also the order the question is asked in.
