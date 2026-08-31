@@ -12,7 +12,7 @@ Every metric names its **provenance** — where the number comes from:
 | `HARNESS` | computed offline by `experiments/harness/` from a run's saved artifacts |
 
 Sections up to [Committance](#committance) are all `CSV` — each names its column, and each is a
-single number about a single run. The [paper metrics](#paper-metrics) at the end are the four
+single number about a single run. The [paper metrics](#paper-metrics) at the end are the five
 every experiment reports; they are curves compared *between conditions* and tag themselves.
 
 ## Setup
@@ -309,12 +309,15 @@ subtype variation inflates it relative to the skeleton diversity above.
 
 ## Paper metrics
 
-The four measurements nearly every [paper experiment](../experiments/README.md) reports. Unlike
+The five measurements nearly every [paper experiment](../experiments/README.md) reports. Unlike
 everything above, each is a **curve compared between conditions**, not a single run's number. Term
 definitions live in [*Paper metrics*](../../experiments/CONTEXT.md); formulas are here.
 
-**Shared conventions.** All four share one x-axis: the **resample window index** $w = 0 \dots W$,
-every window plotted, with a rule marking the pretrain→RL boundary at `n_pretrain`. Each condition
+**Shared conventions.** There are two x-axes, not one. Metrics 1 and 4 are per-window curves on the
+**resample window index** $w = 0 \dots W$, every window plotted, with a rule marking the pretrain→RL
+boundary at `n_pretrain`; metric 5's markers sit on that same axis at its three checkpoints. Metrics
+2 and 3 are on the **perturbation distance** $k$ of the [spread ladder](#spread-ladder), one panel
+per checkpoint. Each condition
 is run at **8 seeds**; unless stated otherwise a curve is the across-seed mean with a 95% CI band,
 read against the study's noise floor. Symbols from [Setup](#setup) carry over; $N$ = bodies per
 sample (= `num_actors`).
