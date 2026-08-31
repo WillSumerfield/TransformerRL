@@ -8,9 +8,9 @@ experiments. Recording them here because each was a real fork and each looks arb
 
 Both optimizers are the same object: a moving point `mu` that samples `x ~ N(mu, spread^2)`,
 optionally improves each sample, evaluates, and steps toward a top-half rank-weighted recombination
-of the good ones.
+of the good ones. `f` is a reward landscape and both optimizers **maximize** it.
 
-**Spread** is the sampling std dev. It selects which basin a sample lands in, and nothing else.
+**Spread** is the sampling std dev. It selects which hill a sample lands on, and nothing else.
 
 **Exploration** `e` is `P(leave the sample raw)`; with probability `1-e` the sample climbs. Note this
 is the *inverse* of a natural reading of "probability of climbing" — climbing is exploitation, so the
@@ -22,7 +22,7 @@ distance is measured in the **joint** (design, action) space for both optimizers
 the action term vanishes by construction, so it reduces to `|d - mu_d|`; for the controller it makes
 competence decay on designs far from what it has recently been handed.
 
-**Climb target** is the minimum of the basin the sample landed in — *not* the optimum of the whole
+**Climb target** is the local peak of the hill the sample landed on — *not* the optimum of the whole
 slice.
 
 **The designer's slice** is `f(., mu_a)`, i.e. through the controller's current mean action, one
@@ -42,14 +42,14 @@ The recombination rate is therefore a single global constant across every experi
 
 ## Considered options
 
-**Climbing toward the global optimum of the slice** instead of the local basin. Rejected: every
+**Climbing toward the best point of the whole slice** instead of the local peak. Rejected: every
 climbing sample converges to the same point, so the landscape's multi-scale structure is never felt
-and spread only affects raw samples. Basin-local descent is what makes spread (which basin),
-generalization (how far down), and exploration (whether at all) read three genuinely different
+and spread only affects raw samples. Hill-local ascent is what makes spread (which hill),
+generalization (how far up), and exploration (whether at all) read three genuinely different
 features of the landscape.
 
 **A gradient step with learning rate `eta`** as the climb. Rejected: `eta` is a seventh knob that
-confounds directly with both spread and generalization, and one step reaches no optimum, so
+confounds directly with both spread and generalization, and one step reaches no peak, so
 "perfectly general" has no limiting behaviour to anchor the axis.
 
 **Measuring the controller's radius in action space**, `|a - mu_a|` — the literal reading of "further
@@ -58,7 +58,7 @@ spread, and the central hypothesis (the two optimizers need comparable radii) ha
 by which to show up. Under joint distance, a designer ranging beyond its controller's radius gets its
 good designs scored badly, which is the effect being measured.
 
-**The designer climbing `min_a f(., a)`**, the oracle marginal. Rejected: it makes the designer's
+**The designer climbing `max_a f(., a)`**, the oracle marginal. Rejected: it makes the designer's
 model independent of how good the controller actually is, so the coupling survives only in
 evaluation and not in the search itself.
 

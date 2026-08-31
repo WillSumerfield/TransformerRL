@@ -17,10 +17,10 @@ import numpy as np
 import torch
 
 import sweep
-from sweep import DATA, PARAMS, RATIOS, Params
+from sweep import DATA, GEN, PARAMS, RATIOS, SPREAD, Params
 
 COARSE = 5
-SEEDS = 8
+SEEDS = 128
 DESIGNER_ITERS_AT_MAX = 25
 STEPS = max(RATIOS) * DESIGNER_ITERS_AT_MAX
 NAME = "exp4_ratios"
@@ -28,13 +28,17 @@ NAME = "exp4_ratios"
 
 def main() -> None:
     dev = "cuda" if torch.cuda.is_available() else "cpu"
+    # Endpoints taken from SPREAD/GEN rather than restated, at coarse resolution: the two must not
+    # drift apart again. They did once -- this grid was left on the pre-BOUNDS-change range
+    # (0.01, 1.0), which stops below the pilot's own optimum, so the sweep could not contain the
+    # good region and the two radii archetypes snapped to a single cell.
     axes = {
-        "sig_d": np.geomspace(0.01, 1.0, COARSE),
-        "sig_c": np.geomspace(0.01, 1.0, COARSE),
+        "sig_d": np.geomspace(SPREAD[0], SPREAD[-1], COARSE),
+        "sig_c": np.geomspace(SPREAD[0], SPREAD[-1], COARSE),
         "e_d": np.linspace(0.0, 1.0, COARSE),
         "e_c": np.linspace(0.0, 1.0, COARSE),
-        "g_d": np.geomspace(0.01, 1.0, COARSE),
-        "g_c": np.geomspace(0.01, 1.0, COARSE),
+        "g_d": np.geomspace(GEN[0], GEN[-1], COARSE),
+        "g_c": np.geomspace(GEN[0], GEN[-1], COARSE),
     }
     p = Params.from_grid(axes, SEEDS, dev)
     shape = (COARSE,) * len(PARAMS) + (SEEDS,)

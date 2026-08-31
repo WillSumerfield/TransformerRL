@@ -1,8 +1,9 @@
 """Named example configurations, run individually with their full trajectories recorded.
 
 No sweep output contains a trajectory -- the sweeps keep only best-so-far curves and summaries --
-so the path-taken figure needs its own artifact. The notebook draws the landscape as a surface,
-overlays visitation in red shaded by recency (whiter = earlier), and scatters the sampled points.
+so the path-taken figure needs its own artifact. All four archetypes start from the same stated
+`START` rather than a random draw, so the panels differ only by configuration. `analysis.py`
+windows the landscape around that point and shades the surface itself red where the pair went.
 
 The archetypes exist to be legible rather than optimal: each isolates one failure mode, and the
 matched/mismatched pair is the direct visual test of the hypothesis that the two optimizers need
@@ -20,15 +21,22 @@ from sweep import DATA, PARAMS, Params
 STEPS = 2000
 SUBSAMPLE = 8  # keep every Nth step's sampled points; a full run is millions
 
+# Every archetype starts here, rather than wherever the seed happened to land: comparing four
+# configurations only means something if they are handed the same problem. Chosen to be a hard
+# but not hopeless spot -- 2nd percentile of the landscape, 1.4 away in design from the global
+# max at (-0.20, +0.59), and at an action where the slice the designer climbs is *anti*-correlated
+# with the marginal it is scored on, so a pair that cannot escape stays badly wrong.
+START = (-1.5, 1.5)
+
 ARCHETYPES = {
-    # narrow and greedy: converges immediately, into whichever basin it started in
+    # narrow and greedy: converges immediately, onto whichever hill it started on
     "narrow_greedy": dict(sig_d=0.03, sig_c=0.03, e_d=0.05, e_c=0.05, g_d=0.3, g_c=0.3),
     # wide and undirected: covers the space, commits to nothing
-    "wide_exploratory": dict(sig_d=0.6, sig_c=0.6, e_d=0.8, e_c=0.8, g_d=0.3, g_c=0.3),
+    "wide_exploratory": dict(sig_d=4, sig_c=4, e_d=0.8, e_c=0.8, g_d=1.0, g_c=1.0),
     # comparable radii on both optimizers
-    "matched_radii": dict(sig_d=0.2, sig_c=0.2, e_d=0.2, e_c=0.2, g_d=0.3, g_c=0.3),
+    "matched_radii": dict(sig_d=2, sig_c=2, e_d=0.35, e_c=0.35, g_d=2.0, g_c=2.0),
     # designer ranges far beyond what its controller can handle
-    "mismatched_radii": dict(sig_d=0.6, sig_c=0.2, e_d=0.2, e_c=0.2, g_d=0.3, g_c=0.03),
+    "mismatched_radii": dict(sig_d=4, sig_c=2, e_d=0.35, e_c=0.35, g_d=1.0, g_c=2.0),
 }
 
 
@@ -39,8 +47,8 @@ def main() -> None:
     # one run per archetype, so build Params directly rather than as a cartesian product
     p = Params(**{k: torch.tensor(v, dtype=torch.float32, device=dev) for k, v in axes.items()})
 
-    print(f"paths: {len(names)} archetypes, {STEPS} steps, k=1 on {dev}")
-    res = sweep.run(p, k=1, total_steps=STEPS, device=dev, record_paths=True)
+    print(f"paths: {len(names)} archetypes, {STEPS} steps, k=1 from {START} on {dev}")
+    res = sweep.run(p, k=1, total_steps=STEPS, device=dev, record_paths=True, start=START)
 
     DATA.mkdir(exist_ok=True)
     np.savez_compressed(
@@ -48,6 +56,8 @@ def main() -> None:
         names=np.array(names),
         mu_d=res.paths["mu_d"].numpy(),
         mu_a=res.paths["mu_a"].numpy(),
+        start_d=res.paths["start_d"].numpy(),
+        start_a=res.paths["start_a"].numpy(),
         d=res.paths["d"][::SUBSAMPLE].numpy(),
         a=res.paths["a"][::SUBSAMPLE].numpy(),
         subsample=SUBSAMPLE,

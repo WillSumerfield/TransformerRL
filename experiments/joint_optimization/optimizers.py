@@ -1,7 +1,7 @@
 """The Simple-ES primitives shared by the designer and the controller.
 
 Both optimizers are the same object: a moving point `mu` that samples around itself, optionally
-improves each sample by descending into its basin, evaluates, and steps toward a rank-weighted
+improves each sample by climbing the hill it landed on, evaluates, and steps toward a rank-weighted
 recombination of the better half. They differ only in which axis they move along, what distance
 attenuates their climb, and how often they update.
 
@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from landscape import BOUNDS, to_coord, to_index
+from landscape import to_coord, to_index
 
 
 def rank_weights(m: int, device="cpu") -> torch.Tensor:
@@ -25,19 +25,22 @@ def rank_weights(m: int, device="cpu") -> torch.Tensor:
     return w / w.sum()
 
 
-def recombine(mu: torch.Tensor, x: torch.Tensor, v: torch.Tensor, alpha: float) -> torch.Tensor:
+def recombine(mu: torch.Tensor, x: torch.Tensor, v: torch.Tensor, alpha: float, top_percent: float) -> torch.Tensor:
     """Step `mu` toward the rank-weighted mean of the better half of `x`.
 
-    `x` and `v` are (..., P); lower `v` is better. The result stays inside the convex hull of the
+    `x` and `v` are (..., P); higher `v` is better. The result stays inside the convex hull of the
     samples, so the update cannot diverge however wide the spread. `alpha` is a global constant --
     step size is deliberately left coupled to spread (ADR-0023).
     """
-    m = max(x.shape[-1] // 2, 1)
-    elite = v.argsort(dim=-1)[..., :m]
+    m = max(int(x.shape[-1] * top_percent), 1)
+    # topk, not a full argsort: the controller keeps 40 of 4096, and sorting the rest is both
+    # slower and a 4x larger int64 allocation, which costs chunks (see `sweep.chunk_size`).
+    elite = torch.topk(v, m, dim=-1).indices
     target = (torch.gather(x, -1, elite) * rank_weights(m, x.device)).sum(-1)
     return mu + alpha * (target - mu)
 
 
+@torch.compile(dynamic=True)
 def climb(
     x: torch.Tensor,
     target: torch.Tensor,
@@ -46,13 +49,16 @@ def climb(
     e: torch.Tensor,
     gen: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Partially descend each sample into its basin.
+    """Partially climb each sample up its hill.
 
-    `target` is the basin floor, `dist2` the squared distance from the optimizer's centre in the
+    `target` is the local peak, `dist2` the squared distance from the optimizer's centre in the
     joint space, `g` the generalization radius, `e` the probability of leaving a sample raw.
 
     g -> inf lands exactly on target, g -> 0 never moves; e = 1 disables the climb entirely, which
     is why exploration gates generalization rather than sitting beside it.
+
+    Fused: like `landscape.f` this is elementwise over the sample cloud and bandwidth-bound, and
+    `dynamic=True` absorbs the ragged final chunk without a recompile.
     """
     w = torch.exp(-0.5 * dist2 / g.clamp_min(1e-8) ** 2)
     moved = x + w * (target - x)
@@ -80,11 +86,9 @@ def designer_propose(
     """
     mu_d, mu_a = mu_d.unsqueeze(-1), mu_a.unsqueeze(-1)
     d = torch.normal(mu_d.expand(-1, P_d), sig_d.unsqueeze(-1).expand(-1, P_d), generator=gen)
-    d = d.clamp(*BOUNDS)
 
     tgt = to_coord(T_d[to_index(d, n), to_index(mu_a, n).expand_as(d)], n)
-    d = climb(d, tgt, (d - mu_d) ** 2, g_d.unsqueeze(-1), e_d.unsqueeze(-1), gen)
-    return d.clamp(*BOUNDS)
+    return climb(d, tgt, (d - mu_d) ** 2, g_d.unsqueeze(-1), e_d.unsqueeze(-1), gen)
 
 
 def controller_act(
@@ -101,8 +105,8 @@ def controller_act(
 ) -> torch.Tensor:
     """Sample `P_a` actions for each of the given designs and climb them.
 
-    Returns (R, P_d, P_a). The sampled action still decides *which* basin is descended into, so
-    controller spread keeps its job; only the strength of the descent is attenuated, by joint
+    Returns (R, P_d, P_a). The sampled action still decides *which* hill is climbed, so
+    controller spread keeps its job; only the strength of the climb is attenuated, by joint
     distance from (mu_d_prev, mu_a). That is what makes designer spread compete with controller
     generalization: designs far from what the controller has recently seen get played badly.
     """
@@ -111,9 +115,7 @@ def controller_act(
     shape = (d.shape[0], d.shape[1], P_a)
 
     a = torch.normal(mu_a.expand(shape), sig_c.view(-1, 1, 1).expand(shape), generator=gen)
-    a = a.clamp(*BOUNDS)
 
     tgt = to_coord(T_a[to_index(d, n).expand_as(a), to_index(a, n)], n)
     dist2 = (d - mu_d_prev.view(-1, 1, 1)) ** 2 + (a - mu_a) ** 2
-    a = climb(a, tgt, dist2, g_c.view(-1, 1, 1), e_c.view(-1, 1, 1), gen)
-    return a.clamp(*BOUNDS)
+    return climb(a, tgt, dist2, g_c.view(-1, 1, 1), e_c.view(-1, 1, 1), gen)

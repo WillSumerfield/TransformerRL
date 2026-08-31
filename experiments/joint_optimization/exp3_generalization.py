@@ -1,7 +1,7 @@
 """Experiment 3 -- Generalization.
 
 Sweeps designer x controller generalization with the other four params pinned by `pilot.py`. Saves full
-best-so-far curves rather than metrics, so the notebook can redefine the convergence threshold
+best-so-far curves rather than metrics, so `analysis.py` can redefine the convergence threshold
 without re-running: those definitions are exactly what looks wrong once you see the first plot.
 
 Note when reading the result: this is the experiment the matching-radii hypothesis lives in. The
@@ -17,7 +17,7 @@ import torch
 import sweep
 from sweep import DATA, GEN, Params
 
-SEEDS = 32
+SEEDS = 2048
 STEPS = 4000
 NAME = "exp3_generalization"
 
@@ -30,7 +30,7 @@ def main() -> None:
     res = sweep.run(p, k=1, total_steps=STEPS, device=dev)
     DATA.mkdir(exist_ok=True)
     sweep.save(str(DATA / f"{NAME}.npz"), res, axes, SEEDS, ratio=1, steps=STEPS)
-    print(f"saved -> {DATA / (NAME + '.npz')}   best {float(res.best.min()):.4f}")
+    print(f"saved -> {DATA / (NAME + '.npz')}   best {float(res.best.max()):.4f}")
 
 
 if __name__ == "__main__":

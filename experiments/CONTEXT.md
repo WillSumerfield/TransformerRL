@@ -53,11 +53,18 @@ _Avoid_: reading a flat curve as "control handles new body plans" without checki
 share** of the distance — the [free vs committed axes](#free-vs-committed-axes) finding means a
 ladder can move subtypes while leaving the body plan untouched.
 
-**GenCrit-generalization curve**:
-The paired metric: GenCrit's accuracy as a function of the same [perturbation distance](#spread-ladder).
+**GenCrit excess bias**:
+The paired metric: the **signed** gap between GenCrit's predicted return and the actual return of
+the same bodies, over the same [perturbation distance](#spread-ladder), anchored at level 0.
 Whether the *generator's* judgement, not just control's competence, survives outside the
-distribution it trained on. Global optimization needs both curves to hold up; either one decaying
-pins the method to local search.
+distribution it trained on. Prediction flat while actual decays = over-optimism, the mechanism that
+lets a generator wander into bodies that do not work; prediction falling faster than actual =
+pessimism, which pins it to local search. Global optimization needs both this and the
+[control-generalization curve](#control-generalization-curve) to hold up.
+_Avoid_: reading it as an accuracy, or reporting a per-level correlation. At level 0 the bodies are
+identical, so `r = 0` however good GenCrit is, and a per-level `r` curve climbs with distance purely
+because the target's signal-to-noise improves — the reverse of the truth. Correlation is also blind
+to bias by construction, and bias is the whole mechanism.
 
 **Exploration curves**:
 How much searching the generator actually does, over a run. Two independent components, both
@@ -166,34 +173,34 @@ training the **skeleton commits** (effective skeleton count → 1) while the **s
 ## Joint optimization
 
 A **toy abstraction** of codesign on a 2D domain, in `experiments/joint_optimization/`: two
-optimizers minimizing a single shared landscape, one choosing a design and one choosing how to act
+optimizers maximizing reward on a single shared landscape, one choosing a design and one choosing how to act
 on it. Deliberately shares *no* vocabulary with the real system — the terms below are not the
 generator, control, or GenCrit, and a finding here transfers only as far as the abstraction does.
 The coupling is **emergent**, not imposed: nothing in the landscape links the two optimizers, but a
 design is only worth what the other optimizer manages to achieve on it.
 
 **Designer**:
-The optimizer that chooses a design, minimizing the value it observes. **Unconditional** — it sees
+The optimizer that chooses a design, maximizing the reward it observes. **Unconditional** — it sees
 nothing and simply emits from a distribution, so its analogue of a radius is over its own output,
 not over any input. The generator-analogue, but it emits a scalar rather than a morphology under a
 grammar.
 _Avoid_: generator (reserved for the morphology generator).
 
 **Controller**:
-The optimizer that chooses how to act on a design, minimizing the same value. **Conditional** — its
+The optimizer that chooses how to act on a design, maximizing the same reward. **Conditional** — its
 output is a function of the design it is handed. There is exactly one controller serving every
 design, which is what makes its [generalization](#generalization) a scarce resource: give each
 design its own controller and generalization becomes free.
 _Avoid_: control (reserved for the real policy), critic (it acts, it does not fit a return).
 
 **Landscape**:
-The single surface both optimizers minimize, over (design, action). Neither optimizer sees it
-whole: the designer only ever sees a design's realized value, and the controller only ever sees the
+The single reward surface both optimizers maximize, over (design, action). Neither optimizer sees
+it whole: the designer only ever sees a design's realized reward, and the controller only ever sees the
 slice for the design in front of it.
 
 **Marginal landscape**:
 Design quality as actually observed — the landscape evaluated at whatever action the controller
-produced. Equals the true per-design optimum only for a perfect controller; otherwise it is a
+produced. Equals the true per-design best only for a perfect controller; otherwise it is a
 smeared, distorted version of it. **The designer never searches the true design landscape, only
 this one**, which is the entire coupling.
 
@@ -217,9 +224,9 @@ designer that ranges beyond its controller's radius gets its good designs scored
 _Avoid_: generalization gap (a train/test notion; this is a radius, not a gap).
 
 **Climb**:
-Improving a sample by descending into the basin it landed in, partially — the fraction of the way
+Improving a sample by ascending the hill it landed on, partially — the fraction of the way
 governed by [generalization](#generalization) and distance. Deliberately *local*: a sample is
-improved within its own basin, never teleported to the global optimum, so which basin
+raised only to its own local peak, never teleported to the global optimum, so which hill
 [spread](#spread) put it in still decides the outcome.
 
 **Sampling ratio**:
@@ -229,9 +236,26 @@ controller generalization. Compared only under a fixed total evaluation budget �
 ratio just buys more compute.
 
 **Design fitness**:
-What a design is judged on: its mean value across the controller's whole adaptation window, not its
+What a design is judged on: its mean reward across the controller's whole adaptation window, not its
 best single moment. Rewards designs the controller can exploit *reliably and soon*, and denies
 credit for a lucky one-off.
+
+**Paired cell comparison**:
+Every configuration cell is run on the **same set of seed starting positions**, so any two cells are
+compared as a *paired* difference rather than as two independent means. The variance of that
+difference is far below what per-cell error bars imply -- x32.6 lower in Experiment 1 -- because the
+shared start is the dominant noise term and cancels. This is what makes an 11x11 grid readable at a
+few thousand seeds instead of tens of thousands. The factor is **recomputed per experiment**, never
+carried over as a constant.
+_Avoid_: reading a per-cell error bar as the resolution of a cell-to-cell difference, or comparing
+cells across two experiments (they draw different start sets, so nothing is paired between them).
+
+**Seed spread**:
+The companion reading, and a *different question*: how much a single cell's outcome varies over the
+starting positions -- whether that configuration is reliable or a lottery. A property of the config,
+not of any comparison, so it is the wrong scale for "is this cell above its neighbour". Both are
+reported; neither substitutes for the other.
+_Avoid_: calling it an error bar on the surface height.
 
 ## Language
 
