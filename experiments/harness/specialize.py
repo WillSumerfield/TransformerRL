@@ -41,11 +41,10 @@ sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT.parent / "vlearn-main" / "train"))
 
 from experiments.harness.launch import (            # noqa: E402
-    STUDIES, Run, _window_epochs, run_pool, study_runs,
+    STUDIES, WINDOWS, Run, _effective, _window_epochs, run_pool, study_runs,
 )
 from experiments.harness.slots import _make_slots, _newest_ckpt, _ckpt_epoch, parse_slot_spec  # noqa: E402
 
-CKPT_WINDOWS = (8, 28, 47)      # pretrain->RL boundary, mid-RL, final (ADR-0021's ladder points)
 FINETUNE_EPOCHS = 250           # chosen to APPROACH the fixed-body ceiling, not to avoid it
 SPEC_ROOT = _ROOT / "data" / "paper" / "spec"
 
@@ -53,6 +52,25 @@ SPEC_ROOT = _ROOT / "data" / "paper" / "spec"
 # off with the generator and must be named explicitly (ADR-0021).
 STRIP = ("params.config.resample_interval=0",
          "params.config.fd.enabled=false", "params.config.fk.enabled=false")
+
+
+def ckpt_windows(study: str) -> tuple[int, int, int]:
+    """ADR-0021's three ladder points for a study: pretrain->RL boundary, mid-RL, final window.
+
+    Derived from the study's own config rather than written down. The boundary IS
+    `generator.n_pretrain`, and tuning moves it -- the focus study took it 8 -> 7. A hardcoded tuple
+    survives that change silently: every run still completes and the panel still plots, but its first
+    point sits one window inside RL while claiming to be the pretrain->RL boundary, which is the one
+    place on the ladder the reader is asked to draw a conclusion from.
+    """
+    study_ = STUDIES[study]
+    _, _, cfg = _effective(_ROOT / study_.config, study_.common)
+    boundary = int(cfg["params"]["config"]["generator"]["n_pretrain"])
+    last = (study_.windows or WINDOWS) - 1
+    if not 0 <= boundary < last:
+        raise SystemExit(f"[spec] {study}: n_pretrain={boundary} does not sit inside a "
+                         f"{last + 1}-window budget, so there is no RL stretch to ladder over")
+    return (boundary, round((boundary + last) / 2), last)
 
 
 # ---- the training checkpoints being specialized ------------------------------------
@@ -64,8 +82,9 @@ def _boundary_ckpt(run: Run, epoch: int) -> Path | None:
     return hits[0] if hits else None
 
 
-def _targets(study: str, windows=CKPT_WINDOWS):
+def _targets(study: str, windows=None):
     """[(train_run, window, epoch, ckpt_path_or_None)] for every (run x ladder point) in a study."""
+    windows = ckpt_windows(study) if windows is None else windows
     out = []
     for run in study_runs(study):
         per_window = _window_epochs(_ROOT / run.config, run.sets)
@@ -87,7 +106,7 @@ def _warm_path(study: str, run: Run, w: int) -> Path:
 
 # ---- phase 1: committed body -> doctored warm-start checkpoint ---------------------
 
-def prepare(study: str, *, population: int, windows=CKPT_WINDOWS, device="cuda:0") -> list[dict]:
+def prepare(study: str, *, population: int, windows=None, device="cuda:0") -> list[dict]:
     """Write one warm-start checkpoint per (run x ladder point), each holding the run's committed body.
 
     Opens a **minimal** task — the sim is needed only for the Task's published `obs_layout`, which is
@@ -96,6 +115,7 @@ def prepare(study: str, *, population: int, windows=CKPT_WINDOWS, device="cuda:0
     """
     from experiments.harness.evalpass import load_net, modal_design, open_task, sample_bodies
 
+    windows = ckpt_windows(study) if windows is None else windows
     targets = _targets(study, windows)
     missing = [(r.name, w) for r, w, _, c in targets if c is None]
     if missing:
@@ -158,10 +178,11 @@ def prepare(study: str, *, population: int, windows=CKPT_WINDOWS, device="cuda:0
 
 # ---- phase 2: the fine-tune runs ---------------------------------------------------
 
-def spec_runs(study: str, windows=CKPT_WINDOWS, epochs: int = FINETUNE_EPOCHS) -> list[Run]:
+def spec_runs(study: str, windows=None, epochs: int = FINETUNE_EPOCHS) -> list[Run]:
     """The fine-tune queue, ordered window-major so the arms stay interleaved within each ladder
     point — the same confound argument as the training queue, and the ladder points are also the
     natural checkpoint at which to stop and look."""
+    windows = ckpt_windows(study) if windows is None else windows
     runs = []
     for w in windows:
         for run, ww, epoch, _ in _targets(study, (w,)):
@@ -187,7 +208,7 @@ def spec_runs(study: str, windows=CKPT_WINDOWS, epochs: int = FINETUNE_EPOCHS) -
 
 # ---- phase 3: measure --------------------------------------------------------------
 
-def measure(study: str, *, envs: int, episodes: int, windows=CKPT_WINDOWS,
+def measure(study: str, *, envs: int, episodes: int, windows=None,
             device="cuda:0") -> Path:
     """Roll out each fine-tuned policy at mu on its own committed body; write the metric-5 artifact.
 
@@ -197,6 +218,7 @@ def measure(study: str, *, envs: int, episodes: int, windows=CKPT_WINDOWS,
     """
     from experiments.harness.evalpass import install_design, load_net, open_task, rollout
 
+    windows = ckpt_windows(study) if windows is None else windows
     designs = {r["spec_run"]: r
                for r in json.loads((SPEC_ROOT / study / "designs.json").read_text())}
     arms = list(STUDIES[study].arms)
@@ -247,8 +269,9 @@ def main():
     ap = argparse.ArgumentParser(description="Metric 5: specialize control onto the committed body")
     ap.add_argument("study", choices=sorted(STUDIES))
     ap.add_argument("phase", choices=["prepare", "launch", "measure"])
-    ap.add_argument("--windows", default=",".join(str(w) for w in CKPT_WINDOWS),
-                    help="ladder points to specialize at (default 8,28,47)")
+    ap.add_argument("--windows", default=None,
+                    help="ladder points to specialize at; default derives them from the study's "
+                         "n_pretrain and window budget")
     ap.add_argument("--population", type=int, default=512,
                     help="greedy draws the committed body is the mode of (prepare)")
     ap.add_argument("--epochs", type=int, default=FINETUNE_EPOCHS, help="fine-tune length (launch)")
@@ -258,7 +281,8 @@ def main():
     ap.add_argument("--allow-busy", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    windows = tuple(int(w) for w in args.windows.split(","))
+    windows = (tuple(int(w) for w in args.windows.split(","))
+               if args.windows else ckpt_windows(args.study))
 
     if args.phase == "prepare":
         if args.dry_run:

@@ -322,14 +322,16 @@ is run at **8 seeds**; unless stated otherwise a curve is the across-seed mean w
 read against the study's noise floor. Symbols from [Setup](#setup) carry over; $N$ = bodies per
 sample (= `num_actors`).
 
-**Series budget.** Every run is **48 windows**, $W = 47$: eight pretrain windows (0–7) and forty RL
-windows (8–47). A window is
-$\lceil$`resample_interval * max_episode_length / horizon_length`$\rceil = \lceil 1000/16 \rceil = 63$
-epochs, so the budget is **3024 epochs** — derived, not rounded. Rounding to 3000 would close only 47
-windows and leave the 48th unlogged, since every window's metrics are written by the resample that
+**Series budget.** Every run is **48 windows**, $W = 47$: seven pretrain windows (0–6) and
+forty-one RL windows (7–47). A window is
+$\lceil$`resample_interval * max_episode_length / horizon_length`$\rceil = \lceil 1000/32 \rceil = 32$
+epochs, so the budget is **1536 epochs** — derived, not rounded. Rounding to 1500 would close only 46
+windows and leave the last two unlogged, since every window's metrics are written by the resample that
 closes it. The budget is fixed in **windows**, not frames, because the x-axis is the window index and
-conditions must land on the same one. Roughly double the tuner's trial budget, so metric 4's
-cumulative curves have a readable slope — 16 RL windows is enough for a trend, not for a plateau.
+conditions must land on the same one. Note that under the tuned `horizon_length: 32` a run's 1536
+epochs is no longer roughly double a tuner trial's 1500 — the two horizons now nearly coincide, so
+48 windows buys metric 4's cumulative curves a readable slope over the same span tuning explored
+rather than beyond it. 41 RL windows is enough for a trend, not for a plateau.
 
 **Window boundaries are exact.** The resample fires when accumulated horizon steps reach
 `resample_interval * max_episode_length` and then resets the counter to zero, so the per-window

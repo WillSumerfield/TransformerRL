@@ -10,7 +10,7 @@ Shared across **1–4**: **8 seeds** (42–49) per condition, artifacts gitignor
 the study's noise floor per [ADR-0018](../adr/0018-noise-floor-first-tuning.md), and runs going out on
 the 8 MIG slots in **mixed waves** — every wave carries a spread of conditions, so no condition is
 confounded with time or machine state over a multi-hour session. Experiments 1–3 additionally share
-the budget **48 windows** (8 pretrain, 40 RL) — 3024 epochs at the shipped 63 epochs/window, derived
+the budget **48 windows** (7 pretrain, 41 RL) — 1536 epochs at the tuned 32 epochs/window, derived
 rather than rounded, so no window is left unclosed and unlogged; experiment 4 runs 3000 epochs with
 no windows at all, and experiment 5 is budgeted in environment frames per
 [ADR-0022](../adr/0022-cross-method-comparison-protocol.md).

@@ -103,7 +103,7 @@ are already installed. `save_frequency` is set to one window so every save is on
 *following* window, one generator update short of its own label.
 _Avoid_: warm-starting from one without overriding the epoch budget. `set_full_state_weights` restores
 `epoch_num`, and training stops at `epoch_num >= max_epochs`, so a 250-epoch fine-tune off a
-3024-epoch checkpoint exits after one epoch. Also avoid assuming `resample_interval: 0` keeps the
+1536-epoch checkpoint exits after one epoch. Also avoid assuming `resample_interval: 0` keeps the
 restored run on the committed body — restoring **re-installs the checkpoint's sampled population**
 (`codesign_agent.py:993-996`), which is not the committed body and must be replaced explicitly.
 

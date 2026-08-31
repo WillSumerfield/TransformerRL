@@ -71,7 +71,7 @@ stated as such.
 ## Process
 
 Four mixed waves of 8 seeds, 48 windows (~12 h); per-window population dumps; checkpoints at
-w=8/28/47; then ladder and specialization passes at every checkpoint for all four arms.
+w=7/27/47; then ladder and specialization passes at every checkpoint for all four arms.
 
 **Ordering.** This experiment runs *before* experiment 1's real waves. It needs no Phase5 port, and
 its outcome determines how experiment 1's `single` arm is configured — if `none` matches or beats
@@ -95,7 +95,7 @@ A metric-5 null with a metric-1 gap is the *predicted* outcome, not a disappoint
 result. Committing to metric 1 in advance is what makes that reading honest rather than post-hoc.
 
 **Mechanism diagnostic — the boundary-recovery trace.** `control/r_step` — the mean raw reward per
-env-step over an epoch — is folded on the ~63-epoch window boundaries and averaged over the 40 RL
+env-step over an epoch — is folded on the 32-epoch window boundaries and averaged over the 41 RL
 windows, giving the dip depth and recovery time per arm. Metric 1 is one point per window and cannot
 see this at all.
 

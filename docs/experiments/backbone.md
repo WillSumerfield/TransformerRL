@@ -49,13 +49,13 @@ exactly one rung — correctly, since trunk-sharing is what creates the interfer
 
 ## Held fixed
 
-Task (`ant_codesign`, `simple` module library), seed body, budget (48 windows = 3024 epochs,
-`n_pretrain: 8`), `num_actors: 4096`, `horizon_length: 16`, seeds 42–49, and every shared
+Task (`ant_codesign`, `simple` module library), seed body, budget (48 windows = 1536 epochs,
+`n_pretrain: 7`), `num_actors: 4096`, `horizon_length: 32`, seeds 42–49, and every shared
 hyperparameter — `learning_rate`, `entropy_coef`, `gencrit_coef`, `grad_norm`, `e_clip`,
 `critic_coef`, `weight_decay`, `lr_warmup`/`warmup_epochs`, the `generator` warmup block, and
-`fd`/`fk` both enabled at `coef: 1.0`.
+`fd`/`fk` both enabled at the tuned coefficients (`fd.coef 0.0074`, `fk.coef 0.0034`).
 
-Each arm's config is `extends: ppo_ant_codesign_single.yaml` plus `algo.name` plus its arm-unique
+Each arm's config is `extends: ppo_ant_codesign_focus_base.yaml` plus `algo.name` plus its arm-unique
 block only, so an arm cannot silently drift off-topology. Optimizer steps per window are already at
 parity (~368 in the generator update for all three), so the epoch budget is a fair budget.
 

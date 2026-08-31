@@ -82,8 +82,13 @@ class Study:
     epochs: int | None = None          # only for a study with no windows (experiment 4)
 
 
+# The TUNED config, not the shipped one: every arm is a `--set` delta off the focus study's centre,
+# so an ablation measures the component against a well-set algorithm rather than against defaults the
+# 127-trial focus run superseded. It is flat (no `extends:`) by design -- the tuner exports a complete
+# parameter set, which is what makes a tuned run hermetic against later edits to the parent config.
+# Key-for-key identical to ppo_ant_codesign_single.yaml; only values differ.
 _SINGLE = dict(script="scripts/train_codesign_single.py",
-               config="configs/ppo_ant_codesign_single.yaml",
+               config="configs/ppo_ant_codesign_focus_base.yaml",
                experiment="codesign_single_transformer")
 
 # Stripping the codesign scaffolding for a no-generator run takes THREE overrides, not one: FD and FK

@@ -36,7 +36,7 @@ Two arms, both on the `single` shared-trunk config, differing only by `--set`.
 | arm | `fd.enabled` | `fk.enabled` | note |
 |---|---|---|---|
 | `none` | false | false | `get_aux_loss` returns `None` — bit-identical to the phase-1 baseline |
-| `aux` | true | true | the shipped config; `fd_variant: latent`, both `coef: 1.0` |
+| `aux` | true | true | the tuned config; `fd_variant: latent`, `fd.coef 0.0074` / `fk.coef 0.0034` |
 
 FD and FK are ablated **together**, not factorially. The accepted cost is that a null result cannot
 be attributed to one head — "prediction doesn't help" and "one helped, one hurt" are
@@ -47,9 +47,9 @@ of this one.
 
 ## Held fixed
 
-Everything in [backbone.md](backbone.md#held-fixed): task, seed body, 48 windows = 3024 epochs,
-`n_pretrain: 8`, 4096 actors, seeds 42–49, and every shared hyperparameter. Both arms run
-`train_codesign_single.py` on `ppo_ant_codesign_single.yaml`; the only difference is two `--set`
+Everything in [backbone.md](backbone.md#held-fixed): task, seed body, 48 windows = 1536 epochs,
+`n_pretrain: 7`, 4096 actors, seeds 42–49, and every shared hyperparameter. Both arms run
+`train_codesign_single.py` on `ppo_ant_codesign_focus_base.yaml`; the only difference is two `--set`
 flags, so drift is structurally impossible.
 
 The aux heads' **parameters exist in both arms** — they are allocated by the network builder and
@@ -60,7 +60,7 @@ architecture.
 ## Process
 
 Identical to experiment 1 minus the port. Two waves of 8 seeds, mixed, 48 windows (~6 h); per-window
-population dumps; checkpoints at w=8/28/47; then ladder and specialization passes at each checkpoint
+population dumps; checkpoints at w=7/27/47; then ladder and specialization passes at each checkpoint
 (6 specialization waves).
 
 ## Measurements and decision metric
