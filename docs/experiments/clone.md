@@ -33,18 +33,21 @@ is nothing to displace and nothing to clone. This experiment therefore has no cr
 
 ## Conditions
 
-Four arms, 2×2 over the two coefficients, all `train_codesign_single.py` on the shipped config.
+Four arms, 2×2 over the two coefficients, all `train_codesign_single.py` on the tuned config
+(`ppo_ant_codesign_tuned.yaml`). The on-values are the focus study's, not 1.0 — `lam` in particular
+landed at 0.399, and an arm defined as a delta off an untuned baseline would be ablating a
+coefficient set 15× off where tuning put it.
 
 | arm | `generator.beta` | `generator.lam` | preserves |
 |---|---|---|---|
-| `both` | 1.0 | 1.0 | actor and critic — the shipped config |
-| `kl_only` | 1.0 | 0 | actor only |
-| `mse_only` | 0 | 1.0 | critic only |
+| `both` | 0.119 | 0.399 | actor and critic — the tuned config, no overrides |
+| `kl_only` | 0.119 | 0 | actor only |
+| `mse_only` | 0 | 0.399 | critic only |
 | `none` | 0 | 0 | nothing |
 
 The two terms are separated because they fail differently. A displaced **actor** is a one-time policy
 jump that PPO walks back within a few epochs. A displaced **critic** poisons the advantages for all
-~992 control PPO steps of the following window, so its damage compounds rather than decays. That
+~1,536 control PPO steps of the following window, so its damage compounds rather than decays. That
 asymmetry is a prediction, and the two-arm version cannot test it.
 
 **The ablation is free and structurally clean.** `beta`/`lam` scale terms that are computed

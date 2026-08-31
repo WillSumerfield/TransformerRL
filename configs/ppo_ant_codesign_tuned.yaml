@@ -1,0 +1,89 @@
+# THE TUNED CONFIG -- the two-stage sweep's final answer, and what every paper ablation runs on.
+#
+# Provenance, exported by `scripts/tune.py --report`, NOT hand-written:
+#   screen  (configs/tune_codesign_ant_screen.yaml)  16 params, wide ranges
+#     -> its top-k centre, frozen as configs/ppo_ant_codesign_focus_base.yaml
+#   focus   (configs/tune_codesign_ant_focus.yaml)   127 trials over 7 params, the rest frozen
+#     -> logs/tune/codesign_ant_focus/best_params.yaml, copied here verbatim
+#
+# This is the top-19 CENTRE, not the single best trial: a raw argmax jumps between neighbouring
+# cells on seed noise, and the centre is what the screen->focus handoff already used. The argmax is
+# kept alongside the export as best_params_argmax.yaml if it is ever wanted.
+#
+# Flat on purpose -- no `extends:`. A tuned config is a complete parameter set, so it must not drift
+# when ppo_codesign_single.yaml is edited. Key-for-key identical to ppo_ant_codesign_single.yaml;
+# only values differ. Re-export rather than hand-editing: an edit here is a parameter nothing
+# measured.
+#
+# DO NOT confuse with ppo_ant_codesign_focus_base.yaml, which is the focus stage's INPUT (the screen
+# winner). The two differ in exactly the 7 parameters focus swept -- generator.lam by 15x.
+env:
+  base_morphology:
+    cap: bare
+    effectors:
+    - swing
+    - knee
+    slots:
+    - 0
+    - 3
+    - 5
+  module_library: simple
+  task: ant
+params:
+  algo:
+    name: codesign_continuous
+  config:
+    bounds_loss_coef: 0.0005
+    critic_coef: 3.726446671427601
+    e_clip: 0.24282113684827838
+    entropy_coef: 0.0005254001471279906
+    fd:
+      coef: 0.007353210683385534
+      enabled: true
+    fk:
+      coef: 0.00339595285983605
+      enabled: true
+    gamma: 0.9625947057175326
+    generator:
+      beta: 0.11908555056803598
+      clip: 0.2
+      copy_prob: 0.6
+      entropy_coef: 0.042151706722544986
+      epochs: 16
+      gencrit_coef: 0.06370107737512465
+      lam: 0.398595765426736
+      len_keep_prob: 0.6
+      minibatches: 4
+      n_pretrain: 7
+      prob_invalid: 0.1
+      teacher: parts
+      type_flip_prob: 0.1
+    grad_norm: 0.6237620383702018
+    horizon_length: 32
+    kl_threshold: 0.0032524044231187657
+    learning_rate: 0.002782623154355085
+    lr_warmup: true
+    max_epochs: 1500
+    mini_epochs: 6
+    minibatch_size: 16384
+    num_actors: 4096
+    resample_interval: 1
+    reward_shaper:
+      scale_value: 0.01
+    save_best_after: 200
+    save_frequency: 50
+    tau: 0.95
+    warmup_epochs: 64
+    weight_decay: 0.0655725213069593
+  network:
+    transformer:
+      codesign_tokens: true
+      d_model: 224
+      dropout: 0.1
+      fd_variant: latent
+      ffn: 896
+      n_heads: 8
+      n_layers: 1
+      reg_mode: none
+      use_rope: true
+  seed: 42

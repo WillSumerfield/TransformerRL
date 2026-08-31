@@ -49,7 +49,7 @@ of this one.
 
 Everything in [backbone.md](backbone.md#held-fixed): task, seed body, 48 windows = 1536 epochs,
 `n_pretrain: 7`, 4096 actors, seeds 42–49, and every shared hyperparameter. Both arms run
-`train_codesign_single.py` on `ppo_ant_codesign_focus_base.yaml`; the only difference is two `--set`
+`train_codesign_single.py` on `ppo_ant_codesign_tuned.yaml`; the only difference is two `--set`
 flags, so drift is structurally impossible.
 
 The aux heads' **parameters exist in both arms** — they are allocated by the network builder and

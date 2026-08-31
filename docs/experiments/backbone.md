@@ -55,7 +55,7 @@ hyperparameter — `learning_rate`, `entropy_coef`, `gencrit_coef`, `grad_norm`,
 `critic_coef`, `weight_decay`, `lr_warmup`/`warmup_epochs`, the `generator` warmup block, and
 `fd`/`fk` both enabled at the tuned coefficients (`fd.coef 0.0074`, `fk.coef 0.0034`).
 
-Each arm's config is `extends: ppo_ant_codesign_focus_base.yaml` plus `algo.name` plus its arm-unique
+Each arm's config is `extends: ppo_ant_codesign_tuned.yaml` plus `algo.name` plus its arm-unique
 block only, so an arm cannot silently drift off-topology. Optimizer steps per window are already at
 parity (~368 in the generator update for all three), so the epoch budget is a fair budget.
 
