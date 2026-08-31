@@ -22,10 +22,11 @@ from typing import List, Optional
 import yaml
 
 from codesigner.interfaces import Algorithm, ControlPolicy, MorphologyGenerator, Morphology
+from codesigner.metrics import DESIGN_QUALITY_PREDICTOR, SPREAD_CONTROL, provides
 
 from . import runtime
 from .artifacts import TransformerControlPolicy, TransformerMorphologyGenerator
-from .morphology import seed_body
+from .morphology import arrays_from_designs, designs_from_arrays, seed_body
 from .train_utils import (_adjust_minibatch, _compose_identity, _deep_merge, _load_config,
                           _resolve_task)
 
@@ -62,6 +63,11 @@ class CodesignAlgorithm(Algorithm):
         self._model = None
         self._policy = None
         self._generator = None
+        # Weights restored before the agent existed (the `refine_control` ordering), replayed onto
+        # the agent's model once `_start` has built one over the top of them.
+        self._pending_state = None
+        self._pending_gen_window = 0
+        self._evaluated = None          # the bodies the last run()'s returns were earned on
 
     # ---- configuration ---------------------------------------------------------------
 
@@ -197,9 +203,15 @@ class CodesignAlgorithm(Algorithm):
         self._set_checkpoint_cadence(ppo)
 
         task, seed = self.task, cfg["params"].get("seed")
+        # A fixed set is a WHITELIST, not a layout: it says what may be built and never how many
+        # groups each body gets, so it is tiled across the population already sized above. One fixed
+        # body therefore means every group runs it, rather than one group running and the rest idle.
+        bodies = ([base_morphology] * num_morphs if self.fixed_morphologies is None else
+                  [self.fixed_morphologies[i % len(self.fixed_morphologies)]
+                   for i in range(num_morphs)])
 
         def create_envs(n, **kw):
-            built = task.setup(library, n, num_morphs, [base_morphology] * num_morphs, seed=seed)
+            built = task.setup(library, n, num_morphs, bodies, seed=seed)
             assert built == n, f"Task built {built} envs, rl_games is sized for {n}"
             runtime.set_run(obs_layout=task.obs_layout())
             return NewToOldAPICompatilibity(task)
@@ -256,6 +268,17 @@ class CodesignAlgorithm(Algorithm):
 
         self._agent = captured["agent"]
         self._agent._on_iteration = self._on_iteration    # the driver attached before we existed
+        if self._pending_state is not None:
+            # `refine_control` restores the payload before any agent exists, and `run_train` has
+            # just built a fresh network over the top of it -- so the restore is replayed here or
+            # the refinement silently starts from random weights.
+            _load_state(self._agent.model, self._pending_state)
+            self._agent._gen_window = self._pending_gen_window
+            self._pending_state = None
+        self._agent._built_morphs = list(bodies)      # what `create_envs` just stood the sim up on
+        self._agent._carry_ep_returns = True          # the driver reads Episode return every tick
+        if self.fixed_morphologies is not None:
+            self._pin_bodies(bodies)
         self._iter = self._agent._train_iter()
         self._model = self._agent.model
         self._policy = TransformerControlPolicy(self._model)
@@ -309,11 +332,19 @@ class CodesignAlgorithm(Algorithm):
     def run(self):
         if self._agent is None:
             self._start()
+        window = self._agent._gen_window
         try:
             reward, _epoch = next(self._iter)
         except StopIteration:                    # the loop yields before returning, so only a
             self._agent._train_finished = True   # second call past the end lands here
             reward = self._agent.mean_rewards
+        # What the returns the driver is about to take were earned on. A run that ended AT a window
+        # boundary closed one -- the sim already holds the next window's bodies, so the set that ran
+        # is the previous one; a run that ended because training did (max_epochs) never swapped, so
+        # the set that ran is the one still standing. Read here rather than in
+        # `current_morphologies` because only `run` can tell the two apart.
+        a = self._agent
+        self._evaluated = a._ran_morphs if a._gen_window != window else a._built_morphs
         reward = float(reward)
         # rl_games spells "no episode has finished yet" as -1e9. Reported as -inf instead: it means
         # the same thing to the driver's best-so-far comparison, and reads as absent rather than as
@@ -338,14 +369,143 @@ class CodesignAlgorithm(Algorithm):
             self._build_inference_model()
         return self._generator
 
+    def _pin_bodies(self, bodies: List[Morphology]) -> None:
+        """Write `bodies` (one per morph group) into the agent's window state and stop it resampling.
+
+        The agent tracks its built bodies per ENV, not per group, and the Task lays groups out as
+        contiguous blocks of `envs_per_morph` -- the same layout it publishes as `design_layout` --
+        so the per-group list expands by `repeat_interleave` and not by tiling, which would pair
+        every env with the wrong body wherever a group holds more than one.
+        """
+        a = self._agent
+        counts, eff, cap = arrays_from_designs(self.modlib, bodies, a._max_len,
+                                               a._cur_counts.device)
+        per_group = a._cur_counts.shape[0] // len(bodies)
+        a._cur_counts = counts.repeat_interleave(per_group, dim=0)
+        a._cur_eff = eff.repeat_interleave(per_group, dim=0)
+        a._cur_cap = cap.repeat_interleave(per_group, dim=0)
+        a._fixed = True
+        # The authoritative record of what stands, kept beside the arrays because the arrays round
+        # an uncapped limb to a bare cap (see `arrays_from_designs`) and `current_morphologies` is a
+        # statement about what the returns were measured ON.
+        a._built_morphs = list(bodies)
+
+    def apply_fixed_morphologies(self, bodies: List[Morphology]) -> None:
+        """Enter the fixed-morphology phase: build only `bodies`, and start counting again.
+
+        Before `_start` this is only a record -- `_start` reads `fixed_morphologies` and stands the
+        Task up on it directly, which is both cheaper and the only order that works, since the first
+        build is what sizes rl_games' rollout buffers. After `_start` it rebuilds onto the set.
+
+        What actually holds the body still is `CodesignAgent._fixed`, set by `_pin_bodies`: the
+        window boundary keeps ticking (it is what bounds one `run()`) but the resample draws
+        nothing, updates nothing and rebuilds nothing. Control PPO is untouched and runs every
+        epoch, which is the whole point of the phase.
+
+        The generator is NOT frozen and is not claimed to be -- the two heads share a trunk, so
+        control updates move it. That is the drift the package's contract explicitly permits: this
+        run returns no generator, and the checkpoint it started from is not written to.
+        """
+        if self._agent is None:
+            return
+        a = self._agent
+        env = a._env()
+        tiled = [bodies[i % len(bodies)] for i in range(env.n_morphs)]
+        env.resample(tiled)
+        a.obs = a.env_reset()
+        self._pin_bodies(tiled)
+        # A new phase, not a continuation: `is_finished` is checked before the first `run()`, so an
+        # algorithm that just exhausted its codesign budget would otherwise refuse to refine at all.
+        a._train_finished = False
+        a.epoch_num = 0
+
     def current_morphologies(self) -> Optional[List[Morphology]]:
         """The window's built bodies -- what the returns just reported were actually measured on,
-        not a fresh draw from the generator."""
-        if self._agent is None or self._agent._cur_counts is None:
-            return None
-        from .morphology import designs_from_arrays
-        a = self._agent
-        return designs_from_arrays(self.modlib, a._cur_counts, a._cur_eff, a._cur_cap)
+        not a fresh draw from the generator.
+
+        One entry per DESIGN, matching the Task's `design_layout`, because that is what the driver
+        pairs its per-design returns against. Handed back as the list given to `setup`/`resample`
+        rather than decoded out of the agent's arrays: the arrays cannot express an uncapped limb,
+        and by the time a window closes they describe the NEXT window's design anyway.
+        """
+        return self._evaluated
+
+    # ---- capabilities ----------------------------------------------------------------
+
+    @property
+    def _reward_scale(self) -> float:
+        """The reward shaper's scale, read off the config rather than off the agent so the two
+        capabilities work on an inference-only build too (`evaluate`, and every protocol)."""
+        shaper = self._cfg["params"]["config"].get("reward_shaper") or {}
+        return float(shaper.get("scale_value", 1.0))
+
+    @provides(SPREAD_CONTROL)
+    def spread_at(self, spread: float, n: int) -> List[Morphology]:
+        """`n` bodies at a normalized spread, drawn on the generator's own frontier MDP.
+
+        The knob is an inverse temperature on the GenAct logits, `beta = (1 - spread) / spread`:
+        spread 1 is `beta = 0`, zero logits, a uniform draw over the grammar-valid token set at
+        every step, and it is monotone downwards from there because flattening a categorical only
+        widens it. Half-way is `beta = 1` -- the trained distribution -- which is a useful thing to
+        know when reading a ladder but is not what the axis is reported on.
+
+        Spread 0 is the one value NOT taken from the sampler. `beta = inf` is the argmax at every
+        step, but the MDP visits still-growable limbs in a RANDOM order, so n greedy draws are
+        near-identical rather than identical and level 0 would carry real design variance. The
+        contract asks for the deterministic draw of one, repeated, and `PerturbationLadder` reads
+        its noise floor off level 0 on exactly that basis -- every design being the same design is
+        what makes the spread of scores there pure episode noise. So it is drawn once and repeated.
+
+        One honest caveat about the top end. Uniform over the valid TOKENS is not identical to
+        `ModuleLibrary.random_morphology`, uniform over BODIES: walking the MDP with flat logits
+        induces its own chain-length distribution. It does not affect the ladder, whose top rung is
+        the library's draw regardless of the algorithm and whose rungs are reported by measured
+        Morphology distance, but a caller reading `spread_at(1.0, n)` as the library's uniform draw
+        would be reading it slightly wrong.
+        """
+        gen = self.morphology_generator()
+        if spread <= 0.0:
+            return gen.generate(1, deterministic=True) * n
+        trace = gen.net.sample(n, beta=(1.0 - spread) / spread)
+        return designs_from_arrays(gen.library, trace["counts"].long(),
+                                   trace["eff_sub"], trace["cap_sub"])
+
+    @provides(DESIGN_QUALITY_PREDICTOR)
+    def predict_design_quality(self, designs: List[Morphology]) -> List[float]:
+        """GenCrit at each finished body -- what the generator believes it is worth before it runs.
+
+        `v(full)` is the value head read at the COMPLETE design rather than at a prefix, which is
+        the only point on the frontier MDP where the prediction is about a body a Task could build.
+
+        In Episode-return units, as the capability demands. GenCrit regresses
+        `_window_Ri() * _r_scale`, so its output is in the control critic's shaped units and the
+        scale divides back out. That inversion is exact rather than approximate here: every config
+        in this project shapes reward by `scale_value` alone, with no shift and no clipping, so the
+        whole of the shaping is one multiplication.
+        """
+        import torch
+
+        net = self.morphology_generator().net
+        device = next(net.parameters()).device
+        counts, eff, cap = arrays_from_designs(self.modlib, designs, net.max_limb_length, device)
+        with torch.no_grad():
+            H = net._encode_design(counts, cap, eff)          # (M, n_tokens, d); CLS is token 0
+            v = net.gencrit_head(H[:, 0]).squeeze(-1)
+        return (v / self._reward_scale).tolist()
+
+    # ---- provenance ------------------------------------------------------------------
+
+    @property
+    def config(self) -> dict:
+        """What this run was configured with, resolved rather than as written.
+
+        The resolved dict, because that is what actually ran: a config that `extends` another is
+        two files and a merge order, and a reader months later has neither. The three fields beside
+        it are what the resolution cannot recover -- which file was named, what the caller layered
+        on top, and the seed, which is the commonest reason two otherwise identical records differ.
+        """
+        return {"config_path": str(self.config_path), "seed": self.seed,
+                "run_name": self._run_name, "overrides": self._overrides, "resolved": self._cfg}
 
     # ---- checkpoints -----------------------------------------------------------------
 
@@ -363,10 +523,25 @@ class CodesignAlgorithm(Algorithm):
     def load_checkpoint_payload(self, payload: dict) -> None:
         if self._model is None:
             self._build_inference_model()
-        # `_orig_mod.` is torch.compile's prefix. Stripped rather than matched, so a checkpoint
-        # written from a compiled run loads into an uncompiled model and vice versa -- the two
-        # differ only in the wrapper, and refusing the pair would be refusing over nothing.
-        state = {k.removeprefix("_orig_mod."): v for k, v in payload["model"].items()}
-        self._model.load_state_dict(state)
+        _load_state(self._model, payload["model"])
+        self._pending_gen_window = int(payload.get("gen_window", 0))
         if self._agent is not None:
-            self._agent._gen_window = int(payload.get("gen_window", 0))
+            self._agent._gen_window = self._pending_gen_window
+        else:
+            # No agent yet -- the `refine_control` / `optimize_control` ordering, where the payload
+            # is restored before anything is trained. Held so `_start` can replay it onto the model
+            # `run_train` is about to build.
+            self._pending_state = payload["model"]
+
+
+def _load_state(model, state: dict) -> None:
+    """Load weights into `model` regardless of which side torch.compile wrapped.
+
+    `_orig_mod.` is torch.compile's prefix. Normalized both ways rather than matched, so a
+    checkpoint written from a compiled run loads into an uncompiled model and vice versa -- the two
+    differ only in the wrapper, and refusing the pair would be refusing over nothing.
+    """
+    state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+    if any(k.startswith("_orig_mod.") for k in model.state_dict()):
+        state = {f"_orig_mod.{k}": v for k, v in state.items()}
+    model.load_state_dict(state)
