@@ -118,3 +118,41 @@ def body_from_counts(library, counts, cap=CANONICAL_CAP) -> Morphology:
     """
     return Morphology.from_names(
         library, {int(s): (canonical_chain(int(k)), cap) for s, k in counts.items() if int(k) > 0})
+
+
+def arrays_from_designs(library, designs, max_depth=None, device=None):
+    """The exact inverse of `designs_from_arrays`: bodies -> the generator's tensor grid.
+
+    Needed wherever a body arrives from OUTSIDE the generator and has to be spoken about in the
+    generator's own vocabulary -- a fixed-morphology phase pinning `_cur_*`, or GenCrit scoring a
+    design it did not draw. `max_depth` sizes the effector axis and must be at least the network's
+    `max_limb_length` for the arrays to drop straight into the agent's window state.
+      -> counts (M, n_slots), eff_sub (M, n_slots, max_depth), cap_sub (M, n_slots)
+    Empty slots read back as count 0 / cap -1, which is how the agent spells "no limb".
+
+    NOT a total inverse, for one representational reason: an UNCAPPED occupied slot cannot be
+    expressed. `cap_sub = -1` already means "still growable" in the frontier MDP, so the nearest
+    thing is the canonical bare cap and that is what an uncapped limb becomes. The grammar caps
+    every limb it finishes, so this is exact on any body the generator drew; it rounds only bodies
+    from elsewhere -- `ModuleLibrary.random_morphology` in particular, which leaves limbs open.
+    Fine where the arrays feed a PREDICTION about a body, wrong wherever they are read back as a
+    statement of what was BUILT, since a Task builds the uncapped limb it was handed.
+    """
+    max_depth = library.max_effectors if max_depth is None else max_depth
+    eff_id = {n: i for i, n in enumerate(library.names(ModuleType.EFFECTOR))}
+    cap_id = {n: i for i, n in enumerate(library.names(ModuleType.CAP))}
+    M, n = len(designs), library.n_slots
+    counts = torch.zeros(M, n, dtype=torch.long, device=device)
+    eff_sub = torch.full((M, n, max_depth), -1, dtype=torch.long, device=device)
+    cap_sub = torch.full((M, n), -1, dtype=torch.long, device=device)
+    for e, body in enumerate(designs):
+        for j in body.occupied_slots:
+            effectors = body.effectors(j)
+            assert len(effectors) <= max_depth, \
+                f"slot {j} has {len(effectors)} effectors, max_depth={max_depth}"
+            counts[e, j] = len(effectors)
+            for d, m in enumerate(effectors):
+                eff_sub[e, j, d] = eff_id[m.name]
+            cap = body.cap(j)
+            cap_sub[e, j] = cap_id[CANONICAL_CAP] if cap is None else cap_id[cap.name]
+    return counts, eff_sub, cap_sub
