@@ -40,7 +40,7 @@ coefficient set 15× off where tuning put it.
 
 | arm | `generator.beta` | `generator.lam` | preserves |
 |---|---|---|---|
-| `both` | 0.119 | 0.399 | actor and critic — the tuned config, no overrides |
+| `both` | 0.119 | 0.399 | actor and critic — the shared `baseline` study, not run again here |
 | `kl_only` | 0.119 | 0 | actor only |
 | `mse_only` | 0 | 0.399 | critic only |
 | `none` | 0 | 0 | nothing |
@@ -73,8 +73,9 @@ stated as such.
 
 ## Process
 
-Four mixed waves of 8 seeds, 48 windows (~12 h); per-window population dumps; checkpoints at
-w=7/27/47; then ladder and specialization passes at every checkpoint for all four arms.
+Three mixed waves of 8 seeds — the fourth cell is the shared `baseline` study — 48 windows (~9 h);
+per-window population dumps; checkpoints at w=7/27/47; then ladder and specialization passes at
+every checkpoint for all four cells, the baseline's coming from its own study's passes.
 
 **Ordering.** This experiment runs *before* experiment 1's real waves. It needs no Phase5 port, and
 its outcome determines how experiment 1's `single` arm is configured — if `none` matches or beats

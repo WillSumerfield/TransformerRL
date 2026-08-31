@@ -6,6 +6,11 @@ by switching one thing off and measuring the same five things — the protocol i
 [Metrics.md](../reference/Metrics.md), terms in [experiments/CONTEXT.md](../../experiments/CONTEXT.md).
 Experiments 4 and 5 have no generator to measure and carry their own measurements; see below.
 
+**The baseline runs once.** Experiments 1–3 are all `--set` deltas off the same tuned configuration,
+so that unmodified condition is its own study (`baseline`, 8 seeds) rather than an arm of each — it
+was otherwise trained once per experiment. Experiment 4 is excluded: stripping the generator makes
+`attention/full` a different configuration, so it keeps its own control arm.
+
 Shared across **1–4**: **8 seeds** (42–49) per condition, artifacts gitignored, curves read against
 the study's noise floor per [ADR-0018](../adr/0018-noise-floor-first-tuning.md), and runs going out on
 the 8 MIG slots in **mixed waves** — every wave carries a spread of conditions, so no condition is

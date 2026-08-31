@@ -98,15 +98,24 @@ _NO_GEN = ("params.config.resample_interval=0",
            "params.config.fd.enabled=false", "params.config.fk.enabled=false")
 
 STUDIES: dict[str, Study] = {
-    # Experiment 2 -- auxiliary prediction. The `aux` arm is the shipped config verbatim.
+    # THE BASELINE: the tuned algorithm with no overrides at all, run ONCE for the whole series.
+    # Every ablation below is a `--set` delta off exactly this, so its unmodified cell is this study
+    # rather than an arm of its own -- `aux/aux` and `clone/both` were byte-identical run sets, so
+    # launching both experiments trained the same 8 seeds twice. Scraped with the union of the
+    # ablations' extra tags (see scrape.EXTRA_TAGS), since it is the comparison point for all of them.
+    #
+    # NOT the baseline for experiment 4, which strips the generator entirely: `attention/full` is a
+    # different configuration, not this one, and keeps its own in-study control arm.
+    "baseline": Study(**_SINGLE, arms={"tuned": Arm()}),
+
+    # Experiment 2 -- auxiliary prediction. The unmodified arm is `baseline`.
     "aux": Study(**_SINGLE, arms={
-        "aux":  Arm(),
         "none": Arm(("params.config.fd.enabled=false", "params.config.fk.enabled=false")),
     }),
 
-    # Experiment 3 -- control clone. 2x2 on the two clone coefficients.
+    # Experiment 3 -- control clone. 2x2 on the two clone coefficients; the both-on cell is
+    # `baseline`, so only the three ablated cells run here.
     "clone": Study(**_SINGLE, arms={
-        "both":     Arm(),
         "kl_only":  Arm(("params.config.generator.lam=0",)),
         "mse_only": Arm(("params.config.generator.beta=0",)),
         "none":     Arm(("params.config.generator.beta=0", "params.config.generator.lam=0")),

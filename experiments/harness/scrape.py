@@ -82,6 +82,10 @@ WINDOW_TAGS = {                  # every study that has a generator
 EPOCH_TAGS = {"r_step": "control/r_step", "rew_epoch": "rewards/iter"}
 
 EXTRA_TAGS: dict[str, dict[str, dict[str, str]]] = {
+    # The baseline is every ablation's comparison point, so it is scraped with the UNION of what
+    # they read -- otherwise its npz lacks the very columns a panel plots the variant against.
+    "baseline": {"window": {"clone_kl": "clone/actor_kl", "clone_mse": "clone/critic_mse"},
+                 "epoch":  {"fd": "losses/fd", "fk": "losses/fk"}},
     # Experiment 3: the two clone terms are the treatment's own readout -- `none` is the
     # counterfactual, so both are scraped for every arm, not just the ones that optimise them.
     "clone": {"window": {"clone_kl": "clone/actor_kl", "clone_mse": "clone/critic_mse"}},

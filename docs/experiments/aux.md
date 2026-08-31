@@ -31,12 +31,14 @@ across bodies in a way one organised around *what scored well on this body* does
 
 ## Conditions
 
-Two arms, both on the `single` shared-trunk config, differing only by `--set`.
+Two conditions, both on the `single` shared-trunk config, differing only by `--set`. Only `none`
+is an arm of *this* study: the unmodified condition is the series' shared `baseline` study, trained
+once and compared against by every ablation that is a delta off it.
 
 | arm | `fd.enabled` | `fk.enabled` | note |
 |---|---|---|---|
 | `none` | false | false | `get_aux_loss` returns `None` — bit-identical to the phase-1 baseline |
-| `aux` | true | true | the tuned config; `fd_variant: latent`, `fd.coef 0.0074` / `fk.coef 0.0034` |
+| `aux` | true | true | the tuned config — the shared `baseline` study, not run again here |
 
 FD and FK are ablated **together**, not factorially. The accepted cost is that a null result cannot
 be attributed to one head — "prediction doesn't help" and "one helped, one hurt" are
@@ -59,7 +61,8 @@ architecture.
 
 ## Process
 
-Identical to experiment 1 minus the port. Two waves of 8 seeds, mixed, 48 windows (~6 h); per-window
+Identical to experiment 1 minus the port. One wave of 8 seeds against the shared baseline, 48
+windows (~3 h); per-window
 population dumps; checkpoints at w=7/27/47; then ladder and specialization passes at each checkpoint
 (6 specialization waves).
 
