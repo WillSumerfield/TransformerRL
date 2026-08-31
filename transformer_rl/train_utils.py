@@ -330,12 +330,14 @@ class _MouseInput:
         self._lock = threading.Lock()
         self._xfixes = False          # cursor hide/show available
         self._cursor_hidden = False
+        self.unavailable = None       # reason string when mouse orbit can't work
         try:
             from Xlib import display as xdisplay
             self._disp = xdisplay.Display()
             self._win = _find_xwindow(self._disp, window_titles)
         except Exception as e:
-            print(f"[camera] mouse disabled (no X display: {e})")
+            self.unavailable = f"no X display ({e})"
+            self._warn_unavailable()
             return
         try:
             from Xlib.ext import xfixes  # noqa: F401  (registers xfixes_* methods)
@@ -344,6 +346,17 @@ class _MouseInput:
         except Exception:
             pass                       # cursor stays visible; orbit still works
         threading.Thread(target=self._scroll_loop, daemon=True).start()
+
+    def _warn_unavailable(self):
+        """Mouse orbit/zoom is X11-only. Say so loudly: the old one-line notice was
+        missed often enough that operators assumed orbit was broken rather than
+        absent, and the keyboard fallback went unused."""
+        print("\n" + "=" * 72, file=sys.stderr)
+        print(f"[camera] MOUSE ORBIT/ZOOM UNAVAILABLE - {self.unavailable}", file=sys.stderr)
+        print("         The mouse is read out-of-band via X11; there is no such path", file=sys.stderr)
+        print("         off X11 (e.g. Windows), and the renderer exposes keys only.", file=sys.stderr)
+        print("         Use the KEYS instead:  I/K tilt   J/L turn   U/M zoom", file=sys.stderr)
+        print("=" * 72 + "\n", file=sys.stderr)
 
     # --- scroll: read-only global RECORD tap on a daemon thread ---
     def _scroll_loop(self):
@@ -355,15 +368,22 @@ class _MouseInput:
             return
         d = xdisplay.Display()
         if not d.has_extension("RECORD"):
-            print("[camera] RECORD ext missing — scroll-zoom disabled")
+            print("[camera] RECORD ext missing — scroll-zoom disabled, use U/M to zoom")
             return
-        ctx = d.record_create_context(0, [record.AllClients], [{
-            "core_requests": (0, 0), "core_replies": (0, 0),
-            "ext_requests": (0, 0, 0, 0), "ext_replies": (0, 0, 0, 0),
-            "delivered_events": (0, 0),
-            "device_events": (X.ButtonPress, X.ButtonPress),
-            "errors": (0, 0), "client_started": False, "client_died": False,
-        }])
+        # A global tap is exactly what hardened/remote X servers refuse; without
+        # these guards a refusal surfaces only as a stray traceback from a daemon
+        # thread, and scroll-zoom dies with no usable explanation.
+        try:
+            ctx = d.record_create_context(0, [record.AllClients], [{
+                "core_requests": (0, 0), "core_replies": (0, 0),
+                "ext_requests": (0, 0, 0, 0), "ext_replies": (0, 0, 0, 0),
+                "delivered_events": (0, 0),
+                "device_events": (X.ButtonPress, X.ButtonPress),
+                "errors": (0, 0), "client_started": False, "client_died": False,
+            }])
+        except Exception as e:
+            print(f"[camera] RECORD refused — scroll-zoom disabled, use U/M to zoom ({e})")
+            return
 
         def handler(reply):
             if reply.category != record.FromServer or not reply.data:
@@ -377,7 +397,10 @@ class _MouseInput:
                     elif ev.detail == 5:    # wheel down
                         self._add_scroll(-1)
 
-        d.record_enable_context(ctx, handler)  # blocks for the session
+        try:
+            d.record_enable_context(ctx, handler)  # blocks for the session
+        except Exception as e:
+            print(f"[camera] RECORD tap died — scroll-zoom disabled, use U/M to zoom ({e})")
 
     def _add_scroll(self, n):
         with self._lock:
@@ -440,7 +463,14 @@ class _MouseInput:
         try:
             geom = self._win.get_geometry()
             root = self._disp.screen().root
-            c = self._win.translate_coords(root, geom.width // 2, geom.height // 2)
+            # Window centre in ROOT coords. translate_coords() treats the window it
+            # is called on as the DESTINATION, so this must be called on the root
+            # with the render window as source. Called the other way round it
+            # returns (w/2 - x0, h/2 - y0), which only equals the centre when the
+            # window sits at the root origin -- otherwise the cursor is parked
+            # outside the window, where clicks/scroll land on whatever is behind it
+            # and steal focus, killing orbit and zoom.
+            c = root.translate_coords(self._win, geom.width // 2, geom.height // 2)
             p = root.query_pointer()
             root.warp_pointer(c.x, c.y)
             self._disp.sync()
@@ -478,16 +508,25 @@ class FollowCamera:
     built-in WASD/P/O (camera move / pause / single-step), which we can't poll:
       Q / E  prev / next group        Z / X  prev / next env
       F      toggle free-cam          C      back to auto-cycle
+    Held keys (continuous while down) drive the same viewpoint the mouse does:
+      I / K  tilt up / down           J / L  turn left / right
+      U / M  zoom in / out
+    These are the ONLY orbit/zoom path off X11 (Windows), where _MouseInput can't
+    work at all — so they are always live, not a fallback, and the renderer's key
+    API is cross-platform. Like mouse orbit they are inert in free-cam.
     The viewpoint in fixed states is a spherical offset (azimuth, elevation,
-    radius) around the focused robot; mouse/scroll mutate it and it persists as the
-    focus hops between robots. The GUI panel mirrors and also drives the discrete
-    state (bidirectional); keys win over a same-frame widget click.
+    radius) around the focused robot; mouse/scroll/keys mutate it and it persists
+    as the focus hops between robots. The GUI panel mirrors and also drives the
+    discrete state (bidirectional); keys win over a same-frame widget click.
     """
 
     MAX_FRAMES_PER_MORPH = 250
     _KEYS = ("q", "e", "z", "x", "f", "c", "r", "t")  # discrete (rising-edge), left-hand
                                                     # r/t = prev/next epoch (policy switch)
+    _HELD_KEYS = ("i", "k", "j", "l", "u", "m")     # continuous (held), viewpoint
     MOUSE_SENS_BASE = math.radians(0.15)            # radians per pixel at sens=1.0
+    KEY_ORBIT_RATE = math.radians(1.5)              # radians per frame at sens=1.0 (~90 deg/s)
+    KEY_ZOOM_RATE = 1.01                            # radius multiply per frame at sens=1.0
     SCROLL_ZOOM = 1.1                               # radius multiply per wheel tick
     ELEV_MIN = math.radians(0.0)                  # don't look up from below the robot
     ELEV_MAX = math.radians(85.0)                   # clamp near top to avoid pole flip
@@ -521,7 +560,9 @@ class FollowCamera:
 
         self._mouse = _MouseInput(_VSIM_WINDOW_TITLES)
         self._build_panel()
-        print("[camera] mouse orbit + scroll zoom (follow)  Q/E group  Z/X env  F free-cam  C auto-cycle")
+        mouse_bit = "mouse orbit + scroll zoom, " if self._mouse.unavailable is None else ""
+        print(f"[camera] {mouse_bit}I/K tilt  J/L turn  U/M zoom (follow)  "
+              f"Q/E group  Z/X env  F free-cam  C auto-cycle")
 
     def _offset_look(self):
         """Camera offset (focus->eye) and look direction from the spherical state."""
@@ -546,7 +587,11 @@ class FollowCamera:
         self.w_env = v.UserCombo("Env (Z/X)", [str(i) for i in range(self.epm)], self.ei)
         self.w_free = v.UserCheckbox("Free cam (F) - frees mouse for GUI", self.free)
         self.w_auto = v.UserCheckbox("Auto-cycle (C)", self.mode == "auto")
-        self.w_sens = v.UserSlider("Mouse sens - move=orbit, scroll=zoom", 0.05, 2.0, prev_sens)
+        # The legend lives in the labels (UserText doesn't render in this build).
+        sens_label = ("Sensitivity - IJKL orbit, U/M zoom (KEYS ONLY, no mouse here)"
+                      if self._mouse.unavailable is not None
+                      else "Sensitivity - mouse move/scroll, or IJKL orbit + U/M zoom")
+        self.w_sens = v.UserSlider(sens_label, 0.05, 2.0, prev_sens)
         for w in (self.w_group, self.w_env, self.w_free, self.w_auto, self.w_sens):
             r.register_menu_item(w)
         self._panel_render = r          # the gym_render these widgets are registered on
@@ -621,6 +666,9 @@ class FollowCamera:
         cur = {k: r.is_key_down(k) for k in self._KEYS}
         ev = {k: cur[k] and not self._prev_keys[k] for k in self._KEYS}
         self._prev_keys = cur
+        # Viewpoint keys are level-triggered, not edge-triggered: they express a
+        # rate while held, the way mouse motion does.
+        held = {k: r.is_key_down(k) for k in self._HELD_KEYS}
 
         # Widget user-changes since last sync (only meaningful if no key overrides).
         sg, se, sfree, sauto = self._synced
@@ -679,17 +727,25 @@ class FollowCamera:
                 self._epoch_syncedidx = new_epoch
                 s.request(base_run, new_epoch)
 
-        # Orbit/zoom: mouse-driven, inert in free-cam (built-in controls own it
-        # there). Cursor is pinned to window-centre while following; dx/dy are the
-        # pre-warp pixel deltas, scroll ticks zoom.
+        # Orbit/zoom: mouse (X11 only) plus the always-live IJKL/UM keys, both
+        # inert in free-cam (built-in controls own it there). Cursor is pinned to
+        # window-centre while following; dx/dy are the pre-warp pixel deltas,
+        # scroll ticks zoom. One sens slider scales both input paths.
         dx, dy, ticks = self._mouse.poll(not self.free)
         if not self.free:
-            sens = self.MOUSE_SENS_BASE * self.w_sens.get_value()
+            gain = self.w_sens.get_value()
+            sens = self.MOUSE_SENS_BASE * gain
+            krate = self.KEY_ORBIT_RATE * gain
             self.azimuth += dx * sens
             self.elevation -= dy * sens          # natural Y: mouse up -> over the top
+            self.azimuth += (held["l"] - held["j"]) * krate
+            self.elevation += (held["i"] - held["k"]) * krate
             self.elevation = max(self.ELEV_MIN, min(self.ELEV_MAX, self.elevation))
             if ticks:
                 self.radius *= self.SCROLL_ZOOM ** (-ticks)   # wheel up -> zoom in
+            kz = held["m"] - held["u"]                        # U in / M out
+            if kz:
+                self.radius *= (self.KEY_ZOOM_RATE ** gain) ** kz
             self.radius = max(self.RADIUS_MIN, min(self.RADIUS_MAX, self.radius))
 
         # Auto-cycle hops to a new robot when the followed episode ends or times out.
@@ -720,7 +776,16 @@ def _attach_render_callback(env, recorder=None, switch=None) -> None:
     if not hooks:
         return
 
+    # gym_render is recreated by _create_gym on every rebuild ("Called at setup and on rebuild"),
+    # so the capped_step set above is silently lost at the first codesign resample. Re-apply it
+    # whenever the renderer object changes -- one identity check per frame.
+    seen = [getattr(env, "gym_render", None)]
+
     def composite():
+        r = getattr(env, "gym_render", None)
+        if r is not None and r is not seen[0]:
+            r.capped_step = True
+            seen[0] = r
         for h in hooks:
             h()
 
