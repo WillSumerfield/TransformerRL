@@ -148,7 +148,7 @@ pruner:
 # p95, p5, p81, p65 across the six). Excluding it would be excluding a plausible optimum on noise.
 params:
   # ── control PPO ──
-  - {path: params.config.kl_threshold, type: float, low: 0.01, high: 0.03, log: true}
+  - {path: params.config.kl_threshold, type: float, low: 0.0025, high: 0.006, log: true}
     # top-k p10-p90 0.0154-0.0264, already at the screen's own upper bound.
   - {path: params.config.entropy_coef, type: float, low: 1.5e-4, high: 2.5e-3, log: true}
     # THE parameter this stage exists to resolve: 21-25% of screen variance (fANOVA, with and
@@ -156,7 +156,7 @@ params:
     # screen's 1e-4..3e-2 -- a 300x span the top-k occupies 1.9e-4..1.9e-3 of. Upper bound is the
     # argmax (1.87e-3) plus headroom, not p90 (1.2e-3), which would have excluded it.
   - {path: params.config.critic_coef, type: float, low: 2.0, high: 6.7, log: true}
-    # top-k p10-p90 2.95-4.46; argmax 6.59 sits at p95, hence the wide upper bound.
+  - {path: params.config.gamma, type: float, low: 0.95, high: 0.97}
 
   # ── generator ──
   - {path: params.config.generator.entropy_coef, type: float, low: 0.02, high: 0.16, log: true}

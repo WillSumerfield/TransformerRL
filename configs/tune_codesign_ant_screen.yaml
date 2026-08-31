@@ -30,7 +30,7 @@
 # DURATIONS are unaffected: a reward fix changes no shape and no step count.
 study:
   name: codesign_ant_screen
-  n_trials: 248                 # 8 calibration + 240 search. A wave runs as ordinary trials in this
+  n_trials: 128                 # 8 calibration + 240 search. A wave runs as ordinary trials in this
                                 # study and CONSUMES budget, so n_trials carries it (ADR-0018).
   output_dir: logs/tune/codesign_ant_screen
   script: scripts/train_codesign_single.py

@@ -1,0 +1,70 @@
+env:
+  base_morphology:
+    cap: bare
+    effectors:
+    - swing
+    - knee
+    slots:
+    - 0
+    - 3
+    - 5
+  module_library: simple
+  task: ant
+params:
+  algo:
+    name: codesign_continuous
+  config:
+    bounds_loss_coef: 0.0005
+    critic_coef: 1.8605970619496182
+    e_clip: 0.24282113684827838
+    entropy_coef: 0.00012214845953494955
+    fd:
+      coef: 0.007353210683385534
+      enabled: true
+    fk:
+      coef: 0.00339595285983605
+      enabled: true
+    gamma: 0.9626727057541953
+    generator:
+      beta: 0.12523422674247883
+      clip: 0.2
+      copy_prob: 0.6
+      entropy_coef: 0.026462637646356098
+      epochs: 16
+      gencrit_coef: 0.06370107737512465
+      lam: 6.182083733230194
+      len_keep_prob: 0.6
+      minibatches: 4
+      n_pretrain: 7
+      prob_invalid: 0.1
+      teacher: parts
+      type_flip_prob: 0.1
+    grad_norm: 0.6237620383702018
+    horizon_length: 32
+    kl_threshold: 0.00533015209152906
+    learning_rate: 0.002782623154355085
+    lr_warmup: true
+    max_epochs: 1500
+    mini_epochs: 6
+    minibatch_size: 16384
+    num_actors: 4096
+    resample_interval: 1
+    reward_shaper:
+      scale_value: 0.01
+    save_best_after: 200
+    save_frequency: 50
+    tau: 0.95
+    warmup_epochs: 64
+    weight_decay: 0.0655725213069593
+  network:
+    transformer:
+      codesign_tokens: true
+      d_model: 224
+      dropout: 0.1
+      fd_variant: latent
+      ffn: 896
+      n_heads: 8
+      n_layers: 1
+      reg_mode: none
+      use_rope: true
+  seed: 42
