@@ -202,6 +202,19 @@ class CodesignAgent(LoggingA2CAgent):
                 self._cur_counts > d, self._eff_swing if d == 0 else self._eff_knee, -1)
         self._cur_cap = torch.where(self._cur_counts > 0, self._cap_bare, -1)
         self._cur_trace = None                             # last sample() trace (RL update input)
+        self._fixed = False                                # fixed-morphology phase (see _maybe_resample)
+        # The bodies the sim currently HOLDS, and the ones the window that just closed was measured
+        # on -- exactly the lists handed to setup/resample, not a re-decode of _cur_*. `_cur_*` is
+        # the NEXT window's design by the time a window closes (the documented build/* half-step),
+        # so reading it as "what the returns were earned on" attributes every window's reward to the
+        # bodies that had not run yet. Set by the Algorithm at _start; swapped here.
+        self._built_morphs = None
+        self._ran_morphs = None
+        # Only the package driver reads (and clears) the Task's Episode return. Under the training
+        # SCRIPT nobody does, and carrying the accumulator across rebuilds there would freeze it at
+        # the first episode forever instead of letting each rebuild reset it. Armed by
+        # `CodesignAlgorithm._start`, so the script path stays exactly as it was.
+        self._carry_ep_returns = False
         self._base_draw = None                             # last base+-flip ramp draws (counts, pretrain)
         self._gen_window = 0
         self._gen_log = None
@@ -820,6 +833,20 @@ class CodesignAgent(LoggingA2CAgent):
         if self._steps_since_resample < interval * env.max_episode_length:
             return
 
+        if self._fixed:
+            # Fixed-morphology phase. The window boundary still TICKS -- it is what bounds one
+            # `Algorithm.run()`, so a fixed run that stopped counting windows would never return to
+            # the driver -- but nothing about the body may move: no draw, no joint update (it would
+            # fit the designer to a one-body population), and no rebuild, the set it would rebuild
+            # to being the set already standing. Episodes are deliberately left running; there is no
+            # scene change to reset for, and truncating them every window is noise in the fine-tune.
+            self._gen_window += 1
+            self._ran_morphs = self._built_morphs      # unchanged: the same set ran and still stands
+            self._win_ret_sum.zero_(); self._win_ret_cnt.zero_()
+            self._win_r_sum.zero_(); self._win_n_steps = 0
+            self._steps_since_resample = 0
+            return
+
         N = env.total_num_envs
         R = self._window_Ri() * self._r_scale               # true body return, scaled to control units
         W = self._win_r_sum * (self._r_scale / max(1, self._win_n_steps))   # per-step, R's scale
@@ -849,7 +876,19 @@ class CodesignAgent(LoggingA2CAgent):
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
               f"limbcount={(counts > 0).sum(1).float().mean().item():.2f} "
               f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
+        self._ran_morphs = self._built_morphs          # what R was just measured on
+        # The Task clears its Episode-return accumulator on rebuild, deliberately: a partial return
+        # carried across a resample would score a new body with the old body's reward. But the
+        # driver reads Episode return AFTER run() returns and our run boundary IS the rebuild, so
+        # the window's FINISHED episodes -- already earned, already attributable -- would be wiped
+        # one instant before the only place that reads them, leaving Training return unavailable on
+        # every codesign run. Carried across by hand; `drive` takes and clears them immediately.
+        carried = ((env._ep_return.clone(), env._ep_done.clone())
+                   if self._carry_ep_returns else None)
         env.resample(morphs)
+        if carried is not None:
+            env._ep_return, env._ep_done = carried
+        self._built_morphs = morphs
         self.obs = self.env_reset()
         self.current_rewards.zero_(); self.current_lengths.zero_()
         # reset the R_i / W_i accumulators for the new window
