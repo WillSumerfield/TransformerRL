@@ -8,7 +8,7 @@ dependencies = [
     "moviepy>=2.2.1",
     "numpy>=2.4.4",
     "optuna>=3.0.0",
-    "python-xlib>=0.33",
+    "python-xlib>=0.33; sys_platform == 'linux'", # viewer mouse orbit only; X11-only by nature
     "pyyaml>=6.0.3",
     "rich>=13.0.0",
     "scikit-learn>=1.4", # optuna's fANOVA importance evaluator (scripts/tune.py --report)
@@ -19,6 +19,7 @@ dependencies = [
     "tqdm>=4.67.3",
     "vlearn",
     "codesigner",
+    "opencv-python-headless>=4.10",
 ]
 
 [project.optional-dependencies]
