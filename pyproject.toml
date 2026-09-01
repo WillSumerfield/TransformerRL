@@ -20,6 +20,9 @@ dependencies = [
     "vlearn",
     "codesigner",
     "opencv-python-headless>=4.10",
+    "plotly>=7.0.0",
+    "ipykernel>=7.2.0",
+    "nbformat>=5.10.4",
 ]
 
 [project.optional-dependencies]
