@@ -595,6 +595,48 @@ class CodesignAgent(LoggingA2CAgent):
                 torch.where(use.view(N, 1, 1), eff_sub, b_eff),
                 torch.where(use.unsqueeze(1), cap_sub, b_cap))
 
+    # ---- the two window-boundary seams -----------------------------------------------
+    # What a window DOES with its returns, and where the next window's bodies come from. Split out
+    # so a baseline that has no generator can replace them without restating the boundary itself --
+    # the accumulator resets, the Episode-return carry and the rebuild are the same for every arm
+    # and belong in one place (experiments/CONTEXT.md, "Body source").
+
+    def _window_update(self, R, obses):
+        """Learn from the window that just ended. R: (N,) body returns, obses: (H,N,obs)."""
+        self._resample_update(R, obses)
+
+    @torch.no_grad()
+    def _quality_log(self, R, W):
+        """The `quality/*` and `build/type/*` half of `_gen_log` -- what the window MEASURED, as
+        opposed to what it learnt.
+
+        Separated because every arm measures and only some learn: `_resample_update` fills this in
+        passing on its way to the generator's losses, while the fixed-body and random-design phases
+        have no losses and would otherwise report nothing. `W` is the per-step window reward, in
+        R's units -- diagnostic only, and never a learning target.
+
+        Returned rather than assigned, so the generator path can merge it into the losses it has
+        already collected instead of having them overwritten.
+        """
+        return {'R_var': R.var(unbiased=False).item(),
+                'R_mean': R.mean().item(), 'R_std': R.std().item(),
+                'W_mean': W.mean().item(), 'W_std': W.std().item(),
+                'by_limbcount': self._by_limbcount(R, self._cur_counts),
+                'types': self._type_usage()}
+
+    def _next_population(self, N):
+        """The next window's `N` bodies: `(trace, counts, eff_sub, cap_sub, morphologies)`.
+
+        `trace` is the generator's sampling record and is what the per-window population dump and
+        the intent-side `build/*` metrics are written from; a body source with no generator behind
+        it returns `None` and those are legitimately absent rather than fabricated.
+        """
+        trace = self._net().sample(N)
+        counts, eff_sub, cap_sub = self._apply_ramp(
+            trace['counts'].long(), trace['eff_sub'], trace['cap_sub'])
+        return (trace, counts, eff_sub, cap_sub,
+                designs_from_arrays(self._ml, counts, eff_sub, cap_sub))
+
     # ---- the resample-boundary joint update (one optimizer) -------------------------
     def _resample_update(self, R, obses):
         """R: (N,) body returns. obses: (H,N,obs) the window's last rollout (rollout-state sample).
@@ -842,6 +884,12 @@ class CodesignAgent(LoggingA2CAgent):
             # scene change to reset for, and truncating them every window is noise in the fine-tune.
             self._gen_window += 1
             self._ran_morphs = self._built_morphs      # unchanged: the same set ran and still stands
+            # The body did not move, but it still earned a return, and quality/* is the tag every
+            # other arm is read on -- a fixed-body baseline that logged nothing there would be the
+            # one condition in the comparison with no curve on the axis it is the reference for.
+            self._gen_log = self._quality_log(
+                self._window_Ri() * self._r_scale,
+                self._win_r_sum * (self._r_scale / max(1, self._win_n_steps)))
             self._win_ret_sum.zero_(); self._win_ret_cnt.zero_()
             self._win_r_sum.zero_(); self._win_n_steps = 0
             self._steps_since_resample = 0
@@ -852,7 +900,7 @@ class CodesignAgent(LoggingA2CAgent):
         W = self._win_r_sum * (self._r_scale / max(1, self._win_n_steps))   # per-step, R's scale
         obses = self.experience_buffer.tensor_dict['obses']  # (H,N,obs) rollout-state sample
         phase = 'pretrain' if self._in_pretrain() else 'rl'  # regime of the update just performed
-        self._resample_update(R, obses)
+        self._window_update(R, obses)
         # Diagnostic only -- deliberately NOT fed to GenCrit or the advantage. R is the training
         # target because the value heads regress a per-episode quantity; W is scored, not learned.
         self._gen_log['W_mean'] = W.mean().item()
@@ -882,13 +930,15 @@ class CodesignAgent(LoggingA2CAgent):
                 R=R.detach().cpu().numpy().astype(np.float32),
                 v_full=tr['v_states'][:, -1].detach().cpu().numpy().astype(np.float32))
 
-        trace = self._net().sample(N)
-        counts, eff_sub, cap_sub = self._apply_ramp(
-            trace['counts'].long(), trace['eff_sub'], trace['cap_sub'])
+        trace, counts, eff_sub, cap_sub, morphs = self._next_population(N)
         self._cur_trace = trace
         self._cur_counts, self._cur_eff, self._cur_cap = counts, eff_sub, cap_sub
-        morphs = designs_from_arrays(self._ml, counts, eff_sub, cap_sub)
-        print(f"[resample #{self._gen_window} | {phase} | next_gen_frac={self._gen_fraction():.2f} | "
+        # The phase and the ramp fraction are statements about a GENERATOR's schedule; a body
+        # source with no generator has neither, and printing them would put a pretrain/RL phase on
+        # a run that has no such phases.
+        sched = (f"{phase} | next_gen_frac={self._gen_fraction():.2f} | "
+                 if trace is not None else "")
+        print(f"[resample #{self._gen_window} | {sched}"
               f"epoch {self.epoch_num}] R_mean={R.mean().item():.3f} "
               f"limbcount={(counts > 0).sum(1).float().mean().item():.2f} "
               f"modules={counts.sum(1).float().mean().item():.2f}", flush=True)
@@ -984,24 +1034,29 @@ class CodesignAgent(LoggingA2CAgent):
             w.add_scalar(f'build/type/{k}', val, frame)
 
         # --- gen/: GenAct (generator actor) learning ---
-        w.add_scalar('gen/actor_loss', g['gen_pg'], frame)
-        w.add_scalar('gen/entropy', g['ent'], frame)
-        w.add_scalar('gen/grad_norm', g['gn'], frame)
-        w.add_scalar('gen/fraction', self._gen_fraction(), frame)
-        if 'marg' in g:                                    # per-limb marginal value (RL phase only)
-            for i in range(self._n_limbs):
-                m = g['marg'][i].item()
-                if m == m:                                 # skip NaN slots (no `on` this window)
-                    w.add_scalar(f'gen/marg/{_LIMB_CODE[i]}', m, frame)
+        # Guarded on the update having happened at all. A body source with no generator (the
+        # random-design baseline) closes windows and earns R like any other run, but has no actor
+        # loss, no GenCrit fit and no clone -- and logging zeros for them would put three flat
+        # curves in TensorBoard that read as a trained generator sitting at zero.
+        if 'gen_pg' in g:
+            w.add_scalar('gen/actor_loss', g['gen_pg'], frame)
+            w.add_scalar('gen/entropy', g['ent'], frame)
+            w.add_scalar('gen/grad_norm', g['gn'], frame)
+            w.add_scalar('gen/fraction', self._gen_fraction(), frame)
+            if 'marg' in g:                                    # per-limb marginal value (RL phase only)
+                for i in range(self._n_limbs):
+                    m = g['marg'][i].item()
+                    if m == m:                                 # skip NaN slots (no `on` this window)
+                        w.add_scalar(f'gen/marg/{_LIMB_CODE[i]}', m, frame)
 
-        # --- gencrit/: GenCrit/V1.0 value-head fit (scale-free: MSE / Var(R)) ---
-        rvar = max(g['R_var'], 1e-8)
-        w.add_scalar('gencrit/loss_prefix', g['v_prefix'] / rvar, frame)
-        w.add_scalar('gencrit/loss_rollout', g['v_roll'] / rvar, frame)
-        for key, tag in (('value_rank_corr', 'gencrit/value_rank_corr'),
-                         ('value_ev', 'gencrit/value_ev')):
-            if key in g and g[key] == g[key]:              # skip NaN (rank needs >=5 bodies)
-                w.add_scalar(tag, g[key], frame)
+            # --- gencrit/: GenCrit/V1.0 value-head fit (scale-free: MSE / Var(R)) ---
+            rvar = max(g['R_var'], 1e-8)
+            w.add_scalar('gencrit/loss_prefix', g['v_prefix'] / rvar, frame)
+            w.add_scalar('gencrit/loss_rollout', g['v_roll'] / rvar, frame)
+            for key, tag in (('value_rank_corr', 'gencrit/value_rank_corr'),
+                             ('value_ev', 'gencrit/value_ev')):
+                if key in g and g[key] == g[key]:              # skip NaN (rank needs >=5 bodies)
+                    w.add_scalar(tag, g[key], frame)
 
         # --- quality/: body-quality outcome (the optimization target) ---
         w.add_scalar('quality/R_mean', g['R_mean'], frame)
@@ -1015,9 +1070,10 @@ class CodesignAgent(LoggingA2CAgent):
             w.add_scalar(f'quality/by_limbcount/{k}', v, frame)
 
         # --- clone/: control preservation at resample ---
-        w.add_scalar('clone/actor_kl', g['kl'], frame)
-        w.add_scalar('clone/critic_mse', g['crit'], frame)
-        w.add_scalar('clone/repr_anchor', g['anchor'], frame)
+        if 'kl' in g:
+            w.add_scalar('clone/actor_kl', g['kl'], frame)
+            w.add_scalar('clone/critic_mse', g['crit'], frame)
+            w.add_scalar('clone/repr_anchor', g['anchor'], frame)
 
         self._gen_log = None
 

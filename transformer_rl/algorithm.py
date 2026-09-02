@@ -178,6 +178,24 @@ class CodesignAlgorithm(Algorithm):
     def _num_morphs(self, num_actors: int) -> int:
         return self._cfg.get("env", {}).get("num_morphs") or num_actors
 
+    # ---- what a subclass swaps out ---------------------------------------------------
+    # A baseline that shares this run's network, config, Task and rl_games stack but not its body
+    # source differs in exactly three things: which agent closes the window, what the FIRST window
+    # is built on, and which artifact answers "draw me a body". Named here so such an arm is a
+    # subclass with three short overrides rather than a second copy of `_start`.
+
+    def _agent_class(self):
+        from .codesign_agent import CodesignAgent
+        return CodesignAgent
+
+    def _initial_bodies(self, base_morphology: Morphology, num_morphs: int) -> List[Morphology]:
+        """Window 0's population, when no fixed set was imposed. The seed body, everywhere: the
+        generator has learnt nothing yet, so window 0 is the teacher's."""
+        return [base_morphology] * num_morphs
+
+    def _make_generator(self, net, library) -> MorphologyGenerator:
+        return TransformerMorphologyGenerator(net, library)
+
     def _start(self) -> None:
         """Size the Task, build the rl_games stack, and stop just short of training."""
         import torch
@@ -187,7 +205,6 @@ class CodesignAlgorithm(Algorithm):
         from rl_games.torch_runner import Runner
         from vlearn.torch_utils.wrappers import NewToOldAPICompatilibity
 
-        from .codesign_agent import CodesignAgent
         from .models import (MultiMorphLimbTransformerBuilder, MultiMorphValueBuilder,
                              TransformerMaskedNorm, TransformerMaskedValue)
 
@@ -218,7 +235,8 @@ class CodesignAlgorithm(Algorithm):
         # A fixed set is a WHITELIST, not a layout: it says what may be built and never how many
         # groups each body gets, so it is tiled across the population already sized above. One fixed
         # body therefore means every group runs it, rather than one group running and the rest idle.
-        bodies = ([base_morphology] * num_morphs if self.fixed_morphologies is None else
+        bodies = (self._initial_bodies(base_morphology, num_morphs)
+                  if self.fixed_morphologies is None else
                   [self.fixed_morphologies[i % len(self.fixed_morphologies)]
                    for i in range(num_morphs)])
 
@@ -262,9 +280,10 @@ class CodesignAlgorithm(Algorithm):
         mb_module.register_model('transformer_masked_value', TransformerMaskedValue)
 
         captured = {}
+        agent_class = self._agent_class()
 
         def build_agent(**kwargs):
-            agent = CodesignAgent(**kwargs)
+            agent = agent_class(**kwargs)
             # Deferred: run_train() constructs, restores and compiles the agent, then calls train().
             # We want everything but the last step, because this Algorithm drives the loop itself --
             # one window per run(). Replicating run_train's restore/compile handling instead would
@@ -295,7 +314,7 @@ class CodesignAlgorithm(Algorithm):
         self._iter = self._agent._train_iter()
         self._model = self._agent.model
         self._policy = TransformerControlPolicy(self._model)
-        self._generator = TransformerMorphologyGenerator(self._agent._net(), library)
+        self._generator = self._make_generator(self._agent._net(), library)
         torch.cuda.empty_cache()
 
     def _build_inference_model(self) -> None:
@@ -337,7 +356,7 @@ class CodesignAlgorithm(Algorithm):
         })
         self._model = model.to(torch.device("cuda:0"))
         self._policy = TransformerControlPolicy(self._model)
-        self._generator = TransformerMorphologyGenerator(self._model.a2c_network.net, self.modlib)
+        self._generator = self._make_generator(self._model.a2c_network.net, self.modlib)
         torch.cuda.empty_cache()
 
     # ---- the driver contract ---------------------------------------------------------
