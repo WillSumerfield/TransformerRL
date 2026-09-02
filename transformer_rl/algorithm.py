@@ -48,11 +48,18 @@ class CodesignAlgorithm(Algorithm):
 
     def __init__(self, config: str | Path, run_name: Optional[str] = None,
                  overrides: Optional[dict] = None, seed: Optional[int] = None,
-                 name: str = "shared_trunk_codesign"):
+                 name: str = "shared_trunk_codesign", experiment: str = _EXPERIMENT):
         super().__init__(name, "PPG codesign: control and generator heads over one transformer "
                                "trunk, updated jointly at every rebuild boundary.")
         self.config_path = Path(config)
         self.seed = seed
+        # Which experiment directory this run belongs to, i.e. `runs/<task>_codesign/<experiment>`.
+        # A parameter and not the module constant because it is a property of the RUN, not of the
+        # algorithm class: experiment 5's baselines are this algorithm constrained from outside and
+        # must not land in the codesign study's directory. The launcher derives its own
+        # done-detection and resume from that path, so the two disagreeing is silent -- every run
+        # reads "fresh" forever while writing somewhere else entirely.
+        self._experiment = experiment
         self._overrides = overrides or {}
         self._run_name = run_name
         self._explicit_save_freq = "save_frequency" in (
@@ -88,7 +95,7 @@ class CodesignAlgorithm(Algorithm):
             cfg["params"]["seed"] = self.seed
 
         self._task_key, self._task_class = _resolve_task(cfg)
-        identity = _compose_identity(self._task_key, _FAMILY, _EXPERIMENT)
+        identity = _compose_identity(self._task_key, _FAMILY, self._experiment)
 
         params = cfg["params"]
         params["config"]["env_name"] = identity["env_name"]
