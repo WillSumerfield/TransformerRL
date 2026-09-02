@@ -9,7 +9,7 @@ body is slots 0/3/5 here.
 """
 import torch
 
-from codesigner.interfaces import ModuleType, Morphology
+from codesigner.interfaces import Module, ModuleType, Morphology
 
 # The canonical ant: three limbs, each a swing hip then a knee, left uncapped. Reproduces the
 # pre-migration `AntCodesignEnv._BASE_MORPHOLOGY` (limbs 1, 4, 6 at count 2) slot for slot.
@@ -156,3 +156,121 @@ def arrays_from_designs(library, designs, max_depth=None, device=None):
             cap = body.cap(j)
             cap_sub[e, j] = cap_id[CANONICAL_CAP] if cap is None else cap_id[cap.name]
     return counts, eff_sub, cap_sub
+
+
+# The cross-method reference ant: four limbs at the compass points, each a swing hip then a knee.
+# NOT `CANONICAL_SLOTS` -- the seed body's three limbs at 0/3/5 are what a codesign run *starts*
+# from and are deliberately weak, whereas the reference is the fixed-body baseline's whole answer
+# and every other method's normalizer, so it is the body a person would have designed by hand.
+REFERENCE_SLOTS = (0, 2, 4, 6)
+
+
+def reference_body(library, slots=REFERENCE_SLOTS, effectors=CANONICAL_EFFECTORS,
+                   cap=CANONICAL_CAP) -> Morphology:
+    """The fixed-body baseline's body, and the normalization reference for every other method."""
+    return seed_body(library, slots=slots, effectors=effectors, cap=cap)
+
+
+def _module(library, name, rng):
+    """One module at a uniformly drawn orientation.
+
+    Every module in every library this project ships declares exactly one orientation, so the draw
+    is a formality today; it is written out because the vocabulary work is where that stops being
+    true, and a sampler that silently took `orientations[0]` would then be sampling a strict subset
+    of the grammar while still calling itself uniform.
+    """
+    definition = library.modules[name]
+    return Module(definition, definition.orientations[rng.randrange(len(definition.orientations))])
+
+
+def sampled_cap_names(library) -> tuple:
+    """The caps a random draw may CHOOSE, which is every cap but `bare`.
+
+    `bare` is not a decision: it is how this codebase spells a limb that was never capped (the seed
+    body passes it and calls itself uncapped, and `arrays_from_designs` rounds a capless limb to
+    it). Leaving it in the draw would put a third of a library's cap mass on "no cap" and make the
+    uncapped rate an artifact of how many real caps the library happens to define. Libraries that
+    define no other cap -- `basic` -- fall back to the full set, since an empty draw is worse than a
+    degenerate one.
+    """
+    caps = tuple(n for n in library.names(ModuleType.CAP) if n != CANONICAL_CAP)
+    return caps or tuple(library.names(ModuleType.CAP))
+
+
+def uniform_size_body(library, rng) -> Morphology:
+    """One body from the **uniform-size draw**: module count first, then a topology holding it.
+
+    The random-design baseline's distribution, and deliberately not
+    `ModuleLibrary.random_morphology`. That draw is uniform over the grammar's *choices*, which
+    induces a body-size distribution nobody chose -- per-slot geometric decay, so its mass sits on
+    small bodies and it can only be compared against a learned generator on the axis it is
+    accidentally biased along. This one fixes the thing being compared, total module count, and is
+    uniform given it:
+
+      1. `M ~ U{2 .. n_slots * max_depth}` -- total modules, **caps included**. The top is every
+         slot filled to the grammar's ceiling.
+      2. `L ~ U{ceil(M / max_depth) .. min(n_slots, M)}` limbs, then `L` slots uniformly without
+         replacement. All `M` modules go into those slots and no others, so `L` IS the body's limb
+         count -- a module is only ever placed on a limb that has none while `M` is down to the
+         number still empty, which is what reserves each drawn slot a limb. The lower bound on `L`
+         is feasibility, not taste: `M` modules do not fit in fewer than `M / max_depth` limbs.
+      3. One module at a time: a limb uniformly among those that can take one, then a move
+         uniformly over that limb's legal set, pooled across effectors and caps rather than picking
+         a kind first (which would put half the mass on caps wherever both are legal).
+
+    **Caps become legal, never mandatory.** A cap may be drawn once `M` remaining is down to the
+    number of started-and-uncapped limbs -- late enough that capping cannot starve a limb that is
+    still growing. Effectors stay legal at that point, so a body may finish with limbs uncapped;
+    those take the canonical `bare`, which is what the generator's own draw does with an unfinished
+    limb and what keeps the built body and the network's view of it the same object.
+
+    `rng` is a `random.Random`, the same convention `ModuleLibrary.random_morphology` takes.
+    """
+    n_slots, max_depth, max_eff = library.n_slots, library.max_depth, library.max_effectors
+    eff_names = library.names(ModuleType.EFFECTOR)
+    cap_names = sampled_cap_names(library)
+
+    remaining = rng.randint(2, n_slots * max_depth)
+    lo = -(-remaining // max_depth)                       # ceil: M modules need this many limbs
+    n_limbs = rng.randint(lo, min(n_slots, remaining))
+    slots = rng.sample(range(n_slots), n_limbs)
+
+    effs = [[] for _ in range(n_limbs)]                   # effector names, proximal -> distal
+    caps = [None] * n_limbs                               # a set cap CLOSES the limb
+    unstarted = n_limbs
+    started_open = 0
+    while remaining:
+        # A started limb may only take a module while there are spare ones -- every still-empty
+        # limb is owed one, and spending its module elsewhere is what would silently make the body
+        # narrower than the `L` that was drawn.
+        spare = remaining > unstarted
+        cappable = remaining <= started_open
+        pool = [i for i in range(n_limbs)
+                if caps[i] is None and (not effs[i]
+                                        or (spare and (len(effs[i]) < max_eff or cappable)))]
+        i = pool[rng.randrange(len(pool))]
+        moves = [(False, n) for n in eff_names] if len(effs[i]) < max_eff else []
+        if effs[i] and cappable:                          # a cap alone is not a limb
+            moves += [(True, n) for n in cap_names]
+        is_cap, name = moves[rng.randrange(len(moves))]
+        if is_cap:
+            caps[i] = name
+            started_open -= 1
+        else:
+            if not effs[i]:
+                unstarted -= 1
+                started_open += 1
+            effs[i].append(name)
+        remaining -= 1
+
+    chains = [[] for _ in range(n_slots)]
+    for slot, names, cap in zip(slots, effs, caps):
+        chains[slot] = [_module(library, n, rng) for n in names]
+        chains[slot].append(_module(library, CANONICAL_CAP if cap is None else cap, rng))
+    return Morphology(chains)
+
+
+def uniform_size_bodies(library, num: int, rng) -> list:
+    """`num` bodies from the uniform-size draw. Batched for the reason `generate` is: a window's
+    whole population is drawn at once."""
+    return [uniform_size_body(library, rng) for _ in range(num)]
