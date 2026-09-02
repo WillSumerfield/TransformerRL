@@ -67,6 +67,11 @@ class CodesignAlgorithm(Algorithm):
         # the agent's model once `_start` has built one over the top of them.
         self._pending_state = None
         self._pending_gen_window = 0
+        # How far the run being continued had got. A resume rebuilds the agent from scratch and
+        # rl_games counts epochs on the agent, so without this a crashed run would restart its
+        # epoch counter at zero and spend a SECOND full `max_epochs` -- doubling the frame budget
+        # the cross-method comparison asserts, and doing it silently.
+        self._pending_epoch = 0
         self._evaluated = None          # the bodies the last run()'s returns were earned on
 
     # ---- configuration ---------------------------------------------------------------
@@ -275,6 +280,7 @@ class CodesignAlgorithm(Algorithm):
             _load_state(self._agent.model, self._pending_state)
             self._agent._gen_window = self._pending_gen_window
             self._pending_state = None
+        self._agent.epoch_num = self._pending_epoch
         self._agent._built_morphs = list(bodies)      # what `create_envs` just stood the sim up on
         self._agent._carry_ep_returns = True          # the driver reads Episode return every tick
         if self.fixed_morphologies is not None:
@@ -352,7 +358,12 @@ class CodesignAlgorithm(Algorithm):
         return (float("-inf") if reward <= -1e9 else reward), self._policy, self._generator
 
     def is_finished(self) -> bool:
-        return self._agent is not None and self._agent._train_finished
+        """Whether this run is over -- answerable BEFORE the agent exists, which is when a resume
+        asks. `_resume_from` checks this to refuse continuing a finished run, and an algorithm that
+        always said "no" there would answer by running the whole budget again."""
+        if self._agent is None:
+            return self._pending_epoch >= self._cfg["params"]["config"]["max_epochs"]
+        return self._agent._train_finished
 
     def attach_progress(self, callback) -> None:
         super().attach_progress(callback)
@@ -407,6 +418,11 @@ class CodesignAlgorithm(Algorithm):
         run returns no generator, and the checkpoint it started from is not written to.
         """
         if self._agent is None:
+            # Before `_start`, entering the phase is only a record -- but it is still a new phase,
+            # so a restored epoch count belongs to the run this one starts FROM and must not carry.
+            # This is what keeps `refine_control` at a clean 0..max_epochs on a checkpoint whose
+            # training run had already spent its budget.
+            self._pending_epoch = 0
             return
         a = self._agent
         env = a._env()
@@ -525,8 +541,10 @@ class CodesignAlgorithm(Algorithm):
             self._build_inference_model()
         _load_state(self._model, payload["model"])
         self._pending_gen_window = int(payload.get("gen_window", 0))
+        self._pending_epoch = int(payload.get("epoch", 0))
         if self._agent is not None:
             self._agent._gen_window = self._pending_gen_window
+            self._agent.epoch_num = self._pending_epoch
         else:
             # No agent yet -- the `refine_control` / `optimize_control` ordering, where the payload
             # is restored before anything is trained. Held so `_start` can replay it onto the model
