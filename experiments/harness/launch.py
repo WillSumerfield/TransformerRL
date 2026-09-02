@@ -53,10 +53,16 @@ import yaml
 _ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_ROOT))
 
+from codesigner.metrics.record import RECORD     # noqa: E402  the package's run-dir names,
+from codesigner.rundir import LATEST             # noqa: E402  imported so they cannot drift
+
 from experiments.harness.slots import (          # noqa: E402
     _Slot, _classify_exit, _kill, _launch, _make_slots, _newest_ckpt, _ckpt_epoch, parse_slot_spec,
 )
 from transformer_rl.train_utils import _load_config, _resolve_task   # noqa: E402  ONE extends: resolver
+# The experiment dir experiment 5 writes to, taken from the module that CONSTRUCTS those
+# algorithms rather than restated here -- see EXPERIMENT there for why a second copy is a bug.
+from experiments.harness.baselines import EXPERIMENT as _BASELINES_EXPERIMENT  # noqa: E402
 
 SEEDS = tuple(range(42, 50))            # 42-49, series-wide (ADR-0021)
 WINDOWS = 48                            # 8 pretrain + 40 RL (ADR-0021); epochs are DERIVED from it
@@ -75,6 +81,8 @@ class Arm:
     script: str | None = None
     config: str | None = None
     experiment: str | None = None      # run dir leaf: runs/<task>_<family>/<experiment>/<run>
+    args: tuple[str, ...] = ()         # positional args, before the flags -- the arm's own name,
+                                       # where one script serves several arms
 
 
 @dataclass(frozen=True)
@@ -88,6 +96,12 @@ class Study:
     seeds: tuple[int, ...] = SEEDS
     windows: int = WINDOWS             # budget in resample windows; epochs are derived from it
     epochs: int | None = None          # only for a study with no windows (experiment 4)
+    # Which loop owns the run, which decides where its checkpoints are and what a resume means.
+    # "rlgames": the trainer writes nn/*.pth and a resume is this launcher handing the newest one
+    # back on the command line. "codesigner": `codesigner.optimize` writes a RunDirectory and
+    # `resume=True` means *run or continue*, so the resume is internal and re-issuing the identical
+    # command is the whole of it. Done-detection differs with it -- see `_classify_pending`.
+    driver: str = "rlgames"
 
 
 # The TUNED config -- the FOCUS study's exported winner, so every arm is a `--set` delta off a
@@ -150,6 +164,23 @@ STUDIES: dict[str, Study] = {
                          config="configs/ppo_ant_codesign_decoupled.yaml",
                          experiment="codesign_decoupled_transformer"),
     }),
+
+    # Experiment 5 -- cross-method baselines, the two conditions with no learned generator. One
+    # entry point, one config, one budget; the arm name is the only thing that differs, because
+    # that is the only thing that differs. `fixed_body` is also the series NORMALIZER, so it is run
+    # on the same 8 seeds as everything else rather than once.
+    #
+    # No `_NO_GEN` here, and that is the point. Experiment 4 strips the codesign scaffolding to
+    # measure attention; these arms KEEP it -- FD and FK are control-side and belong to the control
+    # stack under comparison, and `resample_interval` stays at 1 because the window is what bounds
+    # one `Algorithm.run()`. What each arm removes is the generator's UPDATE, and neither a config
+    # key nor an override expresses that: it is which body source the algorithm was built with.
+    "baselines": Study(script="scripts/optimize_baselines.py",
+                       config="configs/ppo_ant_codesign_tuned.yaml",
+                       experiment=_BASELINES_EXPERIMENT, driver="codesigner", arms={
+        "fixed_body":       Arm(args=("fixed_body",)),
+        "random_generator": Arm(args=("random_generator",)),
+    }),
 }
 
 
@@ -165,6 +196,8 @@ class Run:
     config: str
     train_dir: str
     sets: tuple[str, ...] = ()
+    args: tuple[str, ...] = ()          # positional args, ahead of the flags
+    driver: str = "rlgames"             # see Study.driver
     checkpoint: str | None = None
     target_epoch: int = 0               # for done-detection; 0 disables it
     # Whether a run dir with no checkpoint may be relaunched. False for training runs, where the only
@@ -183,7 +216,16 @@ class Run:
         return self.run_dir / "nn"
 
     def cmd(self, checkpoint: str | None) -> list[str]:
-        cmd = [sys.executable, str(_ROOT / self.script)]
+        cmd = [sys.executable, str(_ROOT / self.script), *self.args]
+        if self.driver == "codesigner":
+            # No checkpoint on the command line, ever: `resume=True` continues the run in the run
+            # directory from the inside, so re-issuing this exact command IS the resume. A path
+            # here would be a WARM START -- a different thing, and not what a crash wants.
+            assert checkpoint is None, "the codesigner driver resumes from its own run dir"
+            cmd += ["--config", str(_ROOT / self.config), "--name", self.name]
+            for s in self.sets:
+                cmd += ["--set", s]
+            return cmd
         if checkpoint:
             cmd += ["train", str(checkpoint)]
         cmd += ["--config", str(_ROOT / self.config)]
@@ -270,6 +312,8 @@ def study_runs(name: str, arms: list[str] | None = None, seeds: tuple[int, ...] 
                 config=arm.config or study.config,
                 train_dir=_train_dir(study, arm, config, sets),
                 sets=(*sets, *budget, f"params.seed={seed}"),
+                args=arm.args,
+                driver=study.driver,
                 target_epoch=int(budget[0].split("=")[1]),
                 meta={"study": name, "arm": arm_name, "seed": seed},
             ))
@@ -337,10 +381,38 @@ class _Job:
         return log_dir / f"{self.run.name}.attempt{self.attempt}.log"
 
 
+def _classify_codesigner(run: Run) -> tuple[str, Path | None, str]:
+    """`_classify_pending` for a run the package owns, which knows the same three states by
+    different files.
+
+    `latest.ckpt` is what `rundir.holds_run` keys off, so its presence is exactly "this directory
+    can be continued" -- and its ABSENCE in a non-empty directory is the same refusal this launcher
+    already makes, raised by `RunDirectory` itself, so blocking here only saves the slot.
+
+    Done is read from `metrics.json`, whose provenance gains a `finished` stamp when the record is
+    closed out -- a text file rather than the position inside `latest.ckpt`, so classifying a queue
+    of 16 runs does not load 16 torch checkpoints. It has to be detected at all because resuming a
+    finished run is a hard error in the package, which the pool would otherwise burn three attempts
+    discovering.
+    """
+    if not run.run_dir.exists() or not any(run.run_dir.iterdir()):
+        return "fresh", None, ""
+    if not (run.run_dir / LATEST).exists():
+        return "blocked", None, f"run dir exists with no {LATEST}: {run.run_dir}"
+    record = run.run_dir / RECORD
+    if record.exists():
+        finished = json.loads(record.read_text()).get("provenance", {}).get("finished")
+        if finished:
+            return "done", None, f"{RECORD} finished at {finished}"
+    return "resume", None, f"continuing the run in {run.run_dir.name}"
+
+
 def _classify_pending(run: Run) -> tuple[str, Path | None, str]:
     """(state, checkpoint, note) for a run before it is scheduled. `blocked` is deliberate: a run dir
     with no checkpoint cannot be resumed AND must not be relaunched into, because rl_games would open
     a second event file in the same summaries dir and the two partial runs would scrape as one."""
+    if run.driver == "codesigner":
+        return _classify_codesigner(run)
     if not run.run_dir.exists():
         return "fresh", None, ""
     ckpt = _newest_ckpt(run.nn_dir)
@@ -456,9 +528,15 @@ def run_pool(runs: list[Run], slots: list[_Slot], log_dir: Path, *, poll: float 
                 if job.attempt + 1 >= max_attempts:
                     _retire(job, "failed", f"exit {ret} ({cause}), {max_attempts} attempts spent")
                     continue
-                ckpt = _newest_ckpt(job.run.nn_dir)
+                # rl_games' nn/ exists under a codesigner run too (its save_frequency is still
+                # set), so the checkpoint has to be suppressed by DRIVER rather than by absence --
+                # handing that path back would turn an internal resume into a warm start the entry
+                # point does not even take an argument for.
+                ckpt = None if job.run.driver == "codesigner" else _newest_ckpt(job.run.nn_dir)
                 _release(job, f"exit {ret} ({cause}) -> "
-                              f"{'resume from ' + ckpt.name if ckpt else 'no checkpoint, retrying'}")
+                              + (f"resume from {ckpt.name}" if ckpt else
+                                 "relaunching" if job.run.driver == "codesigner" else
+                                 "no checkpoint, retrying"))
                 job.attempt += 1
                 _record(job.run, "retry", attempt=job.attempt, cause=cause,
                         ckpt=ckpt.name if ckpt else None)
