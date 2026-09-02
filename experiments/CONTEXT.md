@@ -7,9 +7,10 @@ The paper's experiments and the shared measurement layer they run on. Owns `expe
 The five measurements nearly every experiment reports. Each is a *comparison* between conditions,
 never a single run's number.
 
-All five presuppose a **generator**. Experiments 4 and 5 do not have one — experiment 4 by design
-(`resample_interval: 0`, one fixed body), experiment 5 because its baselines lack one — so both define
-their own measurements in their own docs and none of the terms below apply to them.
+All five presuppose a **learned generator**. Experiment 4 has none by design
+(`resample_interval: 0`, one fixed body); experiment 5's [cross-method baselines](#cross-method-baselines)
+have a [body source](#body-source) but nothing that learns one. Both define their own measurements in
+their own docs and none of the terms below apply to them.
 _Avoid_: putting a no-resample return on shared axes with a resampling one. They run on different LR
 schedules (warmup is gated on a nonzero interval) and over different body distributions.
 
@@ -114,6 +115,68 @@ measured and merely unoptimized — the ablation reports its own counterfactual 
 makes an experiment-3 null attributable: small drift means there was nothing to preserve (the clone is
 dead weight), large drift with no return gap means control absorbs it unaided.
 _Avoid_: skipping these scalars for zero-coefficient arms — they are the arms where they mean the most.
+
+## Cross-method baselines
+
+Experiment 5's conditions, where "the thing that emits bodies" is no longer necessarily something that
+learns. Terms here are about *what a method commits to* and *what it is measured against*; the five
+[paper metrics](#paper-metrics) above do not apply.
+
+**Body source**:
+Whatever supplies a window's bodies — a trained generator, a search, a sampler, or a constant. The axis
+experiment 5 varies, and the *only* thing that varies across its conditions: task, module library,
+reward, observation layout, environment count, control stack and frame budget are all held fixed, so a
+column difference is attributable to the body source alone.
+_Avoid_: generator (reserved for a body source that is *learned*, which most of experiment 5's are not).
+
+**Committed body**:
+The single body a method hands over at the end of a run — what [specialized return](#specialized-return)
+is measured on, and the only output every method in the grid produces. For a learned generator it is the
+modal greedy design; for a search it is the selected candidate; for a control-only condition it is the
+body it was given. Every condition must be able to name one, and must record it durably rather than
+recompute it, since a sampler's choice does not survive the process that made it.
+_Avoid_: "best body" (a method may commit to something it never scored highest), or reading it off a
+return curve.
+
+**Reference morphology**:
+The task's published, human-designed body — the ant's four legs, Adroit's Shadow Hand. One per task,
+stated per task, and the identity that sets every ratio in experiment 5's table.
+_Avoid_: conflating it with the **seed body**, which is where *our* codesign runs start and is a
+project artifact, not anyone's design. The two differ on `ant`.
+
+**Fixed-body baseline**:
+The condition that searches no bodies: the [reference morphology](#reference-morphology), our controller,
+nothing else changed. Simultaneously a condition and the **normalizer** — every other cell is reported as
+a ratio to it, so at 1.0 the paper's claim disappears in the same column as everything else. Deliberately
+strong: it is "the reference body, controlled as well as we can control it", not "the published baseline
+for this task".
+_Avoid_: reading it as experiment 4's no-generator arm. That one strips the auxiliary heads and runs a
+different LR schedule; this one keeps the full control stack.
+
+**Random-design baseline**:
+The condition that searches bodies but learns nothing about them: bodies drawn fresh from the
+[uniform-size body draw](#uniform-size-body-draw) every window, control trained on them exactly as ours
+is, and the [committed body](#committed-body) selected by return. The opponent that decides whether
+*learning* the design distribution beats *sampling* it.
+_Avoid_: calling it an ablation of our generator — it carries no generator head, no return predictor and
+no clone, so it is a rival column and not a `--set` delta.
+
+**Uniform-size body draw**:
+The random-design baseline's distribution: total module count drawn uniformly, then limb count drawn
+uniformly, then modules distributed among those limbs, with caps admissible only once the remaining
+budget can close every open limb. Size and shape are independently uniform, which is what separates it
+from a draw uniform over the *grammar's choices* — that one concentrates on many-short-limbed bodies
+and on the corner nearest the seed ant.
+_Avoid_: treating it as the [spread ladder](#spread-ladder)'s top rung. The ladder's top is the module
+library's own uniform-over-choices draw, and the two are different distributions.
+
+**Selection noise**:
+The gap between "the body that scored best" and "the best body", when each candidate is scored on few
+episodes. Sharp wherever a population is large and thinly evaluated: the maximum over many noisy scores
+tracks luck rather than quality, so a committed body chosen by raw argmax is the friendliest initial
+conditions, not the best design. Answered by re-evaluating a shortlist, never by trusting the argmax.
+_Avoid_: comparing two methods' committed bodies without checking how many episodes each selection rested
+on — the method with the larger population is penalised by this, not helped.
 
 ## Diversity
 

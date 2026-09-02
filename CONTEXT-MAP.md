@@ -27,11 +27,12 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── CONTEXT.md
 │   ├── architectures.py              (LimbTransformer, MultiMorphLimbTransformer)
 │   ├── tokenize.py                   (obs → root/module tokens, off the Task's published layout)
-│   ├── morphology.py                 (seed body, generator designs → Morphology, body sampling)
+│   ├── morphology.py                 (seed + reference bodies, designs ↔ Morphology, body sampling)
 │   ├── runtime.py                    (the run's one ModuleLibrary + seed body + obs layout)
 │   ├── models.py                     (rl_games model/network builders)
 │   ├── algorithm.py                  (CodesignAlgorithm: the agent as a package Algorithm)
 │   ├── artifacts.py                  (the trunk's two heads as ControlPolicy/MorphologyGenerator)
+│   ├── random_body.py                (experiment 5's random-design baseline: no generator at all)
 │   ├── rollout.py                    (test-mode rollout engine; ADR-0007)
 │   ├── logging_agent.py
 │   └── train_utils.py
@@ -39,6 +40,7 @@ Research repo for **codesign**: jointly optimizing a robot's *morphology* (curre
 │   ├── CONTEXT.md
 │   ├── train_*.py
 │   ├── optimize_codesign.py          (the same run, driven by codesigner.optimize)
+│   ├── optimize_baselines.py         (experiment 5's two no-generator arms)
 │   ├── evaluate_codesign.py          (score a checkpoint on named bodies)
 │   └── tune.py                       (Optuna sweep)
 ├── configs/                          ← Training context (rl_games yaml)
@@ -76,6 +78,10 @@ The **CoDesigner** package ([`../SoftwarePackage`](../SoftwarePackage/CONTEXT.md
 A run names its library once, in the config's `env:` block — `module_library: simple` (3 effectors, 4 caps) or `basic` (the original ant's `swing`/`knee`/`bare` and nothing else, for runs that want no subtype choice to make). `run_training` constructs exactly one and hands it to the Task at `setup()` and to the network through `transformer_rl/runtime.py`, which exists because rl_games builds the network from a config dict and gives it no env to ask. The network reads both per-type vocabulary sizes off the library and never assumes either fills `subtype_width`.
 
 **Two entry points, one agent.** `scripts/train_codesign_single.py` runs the agent directly under rl_games' `Runner` — the day-to-day path, with play, video and the follow camera. `scripts/optimize_codesign.py` runs the same agent under `codesigner.optimize`, which calls `CodesignAlgorithm.run()` once per **resample window** and fires a progress tick and a checkpoint after each. Both drive `LoggingA2CAgent._train_iter`, a single copy of rl_games' `train()` reshaped as a generator, so the two paths cannot drift. `scripts/evaluate_codesign.py` scores a checkpoint on bodies you name, rebuilding the library from the checkpoint's own provenance.
+
+**A third entry point, for the arms with no generator.** `scripts/optimize_baselines.py` runs experiment 5's two **body sources** — `fixed_body` (the reference morphology, through the package's `optimize_control`) and `random_generator` (bodies redrawn every window, `transformer_rl/random_body.py`). Same network, config, Task, control stack and budget as the codesign runs; the body source is the only thing that differs, which is what makes the comparison attributable. It is the first path to use the package's `RunDirectory` checkpoints and `resume=True` rather than rl_games' `nn/*.pth`, so `experiments/harness/launch.py` carries a `driver` field to tell the two resume protocols apart.
+
+**The random-design arm's answer is made after the run, not during it.** It trains on a body per env per episode, so the best body it *saw* is the argmax of ~200k one-episode returns — noise, in the direction that flatters the baseline. The run therefore carries a top-32 `Shortlist` in its checkpoint and `experiments/harness/rerank.py` re-scores those 32 through `codesigner.evaluate` at 128 envs each (about one window's frames), writing `data/paper/rerank_<study>.npz`. That winner is the **committed body**, and it is what the specialization pass fine-tunes; `fixed_body` needs none of this, its committed body having been its input. `experiments/harness/baselines.py` holds the one constructor both the training script and the later passes build these algorithms through, and owns the experiment-dir name the launcher and the algorithm must agree on.
 
 ## Upstream — vlearn / VSim
 
