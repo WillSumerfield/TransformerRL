@@ -6,7 +6,8 @@
 Reads three sources and reconciles them onto one (arm, seed, window) grid: TensorBoard scalars from
 each run's `summaries/`, the per-window generator populations in `<run>/gen_pop/`, and the sidecar
 npz files the GPU passes leave behind (`spec_<study>.npz` from `specialize.py`, `ladder_<study>.npz`
-from `ladder.py`). Nothing here launches or measures anything -- it is the read half of the harness,
+from `ladder.py`, `attn_<study>.npz` from `attnmap.py`). Nothing here launches or measures anything
+-- it is the read half of the harness,
 and the only place where a scalar's TB step becomes a window index.
 
 Four properties the metrics depend on:
@@ -100,6 +101,11 @@ EXTRA_TAGS: dict[str, dict[str, dict[str, str]]] = {
 SIDECARS = {                     # file stem -> the keys merged from it, reindexed by label
     "spec":   ("spec", "spec_sd", "fall_rate", "src_epoch"),
     "ladder": ("G", "G_sd", "T", "skel_share", "pred"),
+    # Experiment 4's measurement E. Written for the `full` arm only by default, so the ablated arms'
+    # cells stay NaN -- which is the right reading: there is no map to interpret where the mask
+    # already fixed it. Merged by label like the rest, so running it on an ablated arm to verify the
+    # mask lands in that arm's cell rather than shifting anyone else's.
+    "attn":   ("attn_map", "attn_offdiag", "attn_epochs"),
 }
 
 

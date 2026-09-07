@@ -23,9 +23,12 @@ the torso's, the transformer is machinery in place of an MLP, and the paper shou
 ## Conditions
 
 Three arms, distinguished **only** by the attention mask on the control encoder. Token layout is
-`[CLS] [start × 4] [module × 16]`, `_content_start = 5` (`architectures.py:242`); CLS carries the
-torso observation (`embed_root`, `:419`) and the start tokens are batch-independent learned compass
-anchors carrying no state at all (`:420-421`).
+`[CLS] [start × n_slots] [module × n_slots·max_depth]` — `n_tokens = 1 + n + n·max_len` and
+`_content_start = 1 + n` (`architectures.py:265`). For the ant's `simple` library that is
+**n_slots = 8, max_depth = 4**, so `[CLS] [start × 8] [module × 32]` = **41 tokens** with
+`_content_start = 9`. CLS carries the torso observation (`embed_root`) and the start tokens are
+batch-independent learned compass anchors carrying no state at all. The figure derives the layout
+from the run's own library rather than restating it, since a library change moves both numbers.
 
 | arm | a module token may attend to | what it has |
 |---|---|---|
@@ -85,7 +88,7 @@ experiment's measurements:
 | B | **Asymptotic return** — mean over the final 200 epochs | derived from A |
 | C | **Sample efficiency** — epochs to first reach a fixed return threshold, set from `self_cls`'s asymptote | derived from A |
 | D | **Gait diagnostics** — `episode_lengths/iter` (falling over), `control/sigma_mean` (entropy collapse), `control/adv_std` | TB |
-| E | **Attention structure** — the learned attention map over the 20 tokens, state-averaged, at each checkpoint. `full` arm only | eval-time diagnostic |
+| E | **Attention structure** — attention mass from module queries split into self / CLS / start-anchors / other-modules, traced across checkpoints, with the state-averaged `n_tokens × n_tokens` map as supporting evidence. `full` arm only | eval-time diagnostic |
 
 **Decision metric: B, asymptotic return**, mean over 8 seeds with 95% CI against the study's noise
 floor per [ADR-0018](../adr/0018-noise-floor-first-tuning.md).
@@ -99,6 +102,12 @@ advance.
 actually attend across limbs; a near-diagonal learned map paired with a return gap means the gap came
 from something other than cross-token information and the result is not yet explained. It needs an
 eval-time-only manual softmax path, since `F.scaled_dot_product_attention` does not return weights.
+
+**The reported number is the mass split, not the map.** Attention mass is linear in the weights, so
+cross-limb mass survives the state-averaging exactly (mean-of-mass = mass-of-mean). The map's
+*pattern* does not: a limb attending to its contralateral partner at one gait phase and a different
+limb at another averages into diffuse mass over both, and the pairing is gone. So the fraction is the
+robust reading and the map is the evidence behind it.
 
 ## Expected results and falsifier
 
