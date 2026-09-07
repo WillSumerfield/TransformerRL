@@ -1,9 +1,13 @@
 """Metric 5 (specialized return): strip the scaffolding, fine-tune control on the committed body
 alone, and measure what that body is worth.
 
-    python -m experiments.harness.specialize clone prepare   # committed bodies -> warm-start ckpts
-    python -m experiments.harness.specialize clone launch    # the 250-epoch fine-tunes
-    python -m experiments.harness.specialize clone measure   # mu rollout -> data/paper/spec_clone.npz
+    python experiments/harness/specialize.py clone prepare   # committed bodies -> warm-start ckpts
+    python experiments/harness/specialize.py clone launch    # the 250-epoch fine-tunes
+    python experiments/harness/specialize.py clone measure   # mu rollout -> data/paper/spec_clone.npz
+
+Several studies may be named at once. `prepare` and `measure` then just loop, but `launch` queues
+them as ONE interleaved pool -- see `spec_queue` for why that is not the same as running them back
+to back.
 
 Three phases because the middle one is a training run and the outer two are not. The reason `prepare`
 exists at all is that "warm-start on the committed body" is **not** expressible in overrides:
@@ -206,6 +210,22 @@ def spec_runs(study: str, windows=None, epochs: int = FINETUNE_EPOCHS) -> list[R
     return runs
 
 
+def spec_queue(studies: list[str], windows=None, epochs: int = FINETUNE_EPOCHS) -> list[Run]:
+    """Several studies as ONE queue, round-robined so every wave spreads across all of them.
+
+    Concatenating them instead would run each study to completion in turn, which is the same
+    confound `queue_runs` exists to avoid (launch.py:324) just at study granularity: 120 fine-tunes
+    is most of a day, and anything that drifts over that -- thermals, a driver change, another
+    tenant on the box -- would land as a per-study shift in exactly the quantity the studies are
+    compared on. Each study's own list stays window-major inside the merge.
+    """
+    lists = [spec_runs(st, windows, epochs) for st in studies]
+    out = []
+    for i in range(max((len(l) for l in lists), default=0)):
+        out += [l[i] for l in lists if i < len(l)]
+    return out
+
+
 # ---- phase 3: measure --------------------------------------------------------------
 
 def measure(study: str, *, envs: int, episodes: int, windows=None,
@@ -267,7 +287,8 @@ def measure(study: str, *, envs: int, episodes: int, windows=None,
 
 def main():
     ap = argparse.ArgumentParser(description="Metric 5: specialize control onto the committed body")
-    ap.add_argument("study", choices=sorted(STUDIES))
+    ap.add_argument("studies", nargs="+", choices=sorted(STUDIES), metavar="STUDY",
+                    help="one or more; prepare/measure loop, launch queues them as one pool")
     ap.add_argument("phase", choices=["prepare", "launch", "measure"])
     ap.add_argument("--windows", default=None,
                     help="ladder points to specialize at; default derives them from the study's "
@@ -281,34 +302,40 @@ def main():
     ap.add_argument("--allow-busy", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
-    windows = (tuple(int(w) for w in args.windows.split(","))
-               if args.windows else ckpt_windows(args.study))
+    # None means "derive per study": the ladder points come from each study's own n_pretrain, so a
+    # single tuple computed here would silently mislabel any study whose boundary differs.
+    windows = (tuple(int(w) for w in args.windows.split(",")) if args.windows else None)
 
     if args.phase == "prepare":
-        if args.dry_run:
-            for run, w, epoch, ckpt in _targets(args.study, windows):
-                print(f"  w{w:<3} epoch {epoch:<5} {run.name:28} "
-                      f"{ckpt.name if ckpt else 'MISSING'}")
-            return
-        prepare(args.study, population=args.population, windows=windows)
+        for study in args.studies:
+            ws = windows or ckpt_windows(study)
+            if args.dry_run:
+                for run, w, epoch, ckpt in _targets(study, ws):
+                    print(f"  w{w:<3} epoch {epoch:<5} {run.name:28} "
+                          f"{ckpt.name if ckpt else 'MISSING'}")
+                continue
+            prepare(study, population=args.population, windows=ws)
         return
 
     if args.phase == "measure":
-        measure(args.study, envs=args.envs, episodes=args.episodes, windows=windows)
+        for study in args.studies:
+            measure(study, envs=args.envs, episodes=args.episodes,
+                    windows=windows or ckpt_windows(study))
         return
 
-    runs = spec_runs(args.study, windows, args.epochs)
+    runs = spec_queue(args.studies, windows, args.epochs)
     if not runs:
-        raise SystemExit(f"[spec] no warm-start checkpoints for '{args.study}' — run `prepare` first")
+        raise SystemExit(f"[spec] no warm-start checkpoints for "
+                         f"{', '.join(args.studies)} — run `prepare` first")
     if args.dry_run:
-        print(f"[dry-run] {len(runs)} fine-tune(s), window-major\n")
+        print(f"[dry-run] {len(runs)} fine-tune(s), window-major within each study\n")
         for run in runs:
             print(f"  {run.name:34} -> epoch {run.target_epoch}  (from {Path(run.checkpoint).name})")
         print(f"\n  command for {runs[0].name}:\n    " + " ".join(runs[0].cmd(runs[0].checkpoint)))
         return
     slots = _make_slots(parse_slot_spec(args.slots), allow_busy=args.allow_busy)
     try:
-        run_pool(runs, slots, _ROOT / "logs" / "paper" / f"spec_{args.study}")
+        run_pool(runs, slots, _ROOT / "logs" / "paper" / f"spec_{'+'.join(args.studies)}")
     except KeyboardInterrupt:
         sys.exit(130)
 
