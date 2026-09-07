@@ -85,11 +85,17 @@ EPOCH_TAGS = {"r_step": "control/r_step", "rew_epoch": "rewards/iter"}
 EXTRA_TAGS: dict[str, dict[str, dict[str, str]]] = {
     # The baseline is every ablation's comparison point, so it is scraped with the UNION of what
     # they read -- otherwise its npz lacks the very columns a panel plots the variant against.
+    # `info/kl` is rl_games' own per-epoch policy KL, and it is here as a YARDSTICK rather than as a
+    # measurement: `clone/actor_kl` of 0.02 nats is unreadable on its own, and against a median
+    # `info/kl` of ~0.010 it says the resample displaces control more than a full epoch of learning
+    # does. Experiment 3's falsifier turns on calling that drift "large" or "small", so the
+    # reference travels with the arms it judges.
     "baseline": {"window": {"clone_kl": "clone/actor_kl", "clone_mse": "clone/critic_mse"},
-                 "epoch":  {"fd": "losses/fd", "fk": "losses/fk"}},
+                 "epoch":  {"fd": "losses/fd", "fk": "losses/fk", "ppo_kl": "info/kl"}},
     # Experiment 3: the two clone terms are the treatment's own readout -- `none` is the
     # counterfactual, so both are scraped for every arm, not just the ones that optimise them.
-    "clone": {"window": {"clone_kl": "clone/actor_kl", "clone_mse": "clone/critic_mse"}},
+    "clone": {"window": {"clone_kl": "clone/actor_kl", "clone_mse": "clone/critic_mse"},
+              "epoch":  {"ppo_kl": "info/kl"}},
     # Experiment 2: the hazard check. A flat `losses/fk` means the head never did any work, which
     # makes a null uninterpretable rather than informative. NaN for the `none` arm by construction.
     "aux": {"epoch": {"fd": "losses/fd", "fk": "losses/fk"}},
