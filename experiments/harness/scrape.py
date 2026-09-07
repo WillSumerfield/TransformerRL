@@ -1,7 +1,7 @@
 """Run dirs -> one per-experiment rollup npz, the single file every paper notebook loads.
 
-    python -m experiments.harness.scrape clone           # -> data/paper/clone.npz
-    python -m experiments.harness.scrape attention --dry-run
+    python experiments/harness/scrape.py clone           # -> data/paper/clone.npz
+    python experiments/harness/scrape.py attention --dry-run
 
 Reads three sources and reconciles them onto one (arm, seed, window) grid: TensorBoard scalars from
 each run's `summaries/`, the per-window generator populations in `<run>/gen_pop/`, and the sidecar

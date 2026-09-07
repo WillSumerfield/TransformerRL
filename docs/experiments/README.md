@@ -48,8 +48,8 @@ Queue the studies that share the baseline as **one pool**, so the mixed-wave rul
 and not just inside each:
 
 ```
-python -m experiments.harness.launch baseline aux clone --slots auto   # 40 runs
-python -m experiments.harness.launch attention --slots auto            # 24, its own baseline
+python experiments/harness/launch.py baseline aux clone --slots auto   # 40 runs
+python experiments/harness/launch.py attention --slots auto            # 24, its own baseline
 ```
 
 Running them as separate sessions would put the shared baseline on the far side of the drift mixed

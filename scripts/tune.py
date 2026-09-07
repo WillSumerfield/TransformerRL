@@ -1224,7 +1224,7 @@ def main():
         if (want := sc.get("expect_slots")) and args.slots is None and len(slots) != want:
             raise RuntimeError(
                 f"expect_slots: {want} but discovered {len(slots)}. On the tuning box run "
-                f"`sudo python -m experiments.harness.mig --gpus 0,1 --profile 67 --count 4`; "
+                f"`sudo python experiments/harness/mig.py --gpus 0,1 --profile 67 --count 4`; "
                 f"elsewhere override with --slots or drop expect_slots from the config.")
 
     param_names = [p["path"] for p in tune_cfg["params"]]

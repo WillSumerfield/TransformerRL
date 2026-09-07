@@ -1,8 +1,8 @@
 """Turn the random-design arm's shortlist into a committed body, by scoring it properly.
 
-    python -m experiments.harness.rerank baselines
-    python -m experiments.harness.rerank baselines --seeds 42,43 --envs-per-body 128
-    python -m experiments.harness.rerank baselines --dry-run
+    python experiments/harness/rerank.py baselines
+    python experiments/harness/rerank.py baselines --seeds 42,43 --envs-per-body 128
+    python experiments/harness/rerank.py baselines --dry-run
 
 A learned generator is *asked* for its best body. A coin has no opinion, so the random-design
 baseline's answer can only be the best body it happened to see -- and the run is in no position to

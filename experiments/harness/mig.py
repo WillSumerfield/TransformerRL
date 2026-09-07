@@ -11,10 +11,10 @@ otherwise, so nothing downstream needs to know this ran. Not running it is the o
 workstation `slots: auto` finds the one card and `--slots 1 --allow-busy` covers the desktop
 session.
 
-    python -m experiments.harness.mig --status
-    python -m experiments.harness.mig --list-profiles
-    python -m experiments.harness.mig --gpus 0,1 --profile 67 --count 4
-    python -m experiments.harness.mig --gpus 0,1 --reset
+    python experiments/harness/mig.py --status
+    python experiments/harness/mig.py --list-profiles
+    python experiments/harness/mig.py --gpus 0,1 --profile 67 --count 4
+    python experiments/harness/mig.py --gpus 0,1 --reset
 
 Profile ids are per-GPU-model and NOT portable: 67 is this box's ~24GB slice. `--list-profiles`
 prints what the installed cards actually offer; there is no sane default to guess.
@@ -26,8 +26,14 @@ The commands are simply run, and a permission failure is reported as one.
 import argparse
 import subprocess
 import sys
+from pathlib import Path
 
-from .slots import _discover_devices, _smi
+_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_ROOT))            # so `python experiments/harness/mig.py` works
+
+# Absolute, not `from .slots import ...`: a relative import has no parent package when the file is
+# run as a script, so the module-vs-script distinction would decide whether this file imports at all.
+from experiments.harness.slots import _discover_devices, _smi   # noqa: E402
 
 # nvidia-smi's wording for "you are not allowed to do this", across driver versions.
 _PERM = ("insufficient permission", "permission denied", "not permitted", "requires root",

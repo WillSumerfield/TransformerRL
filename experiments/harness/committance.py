@@ -20,11 +20,16 @@ strings -> bias-corrected plug-in is fine. H(B) lives over ~1e20 bodies, where A
 hard-capped at ln(M) = 8.3 nats for M=4096 -- the rail that pinned build/n_distinct at 4096/4096.
 So H(B) must come from rao_blackwell_h_body, never from counting the population.
 """
+import sys
 from collections import Counter
+from pathlib import Path
 
 import numpy as np
 
-from experiments.harness.diversity import TAU_MODE, _dedup, _hill, d_struct  # noqa: F401  (d_struct: self-test)
+_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_ROOT))            # so `python experiments/harness/committance.py` works
+
+from experiments.harness.diversity import TAU_MODE, _dedup, _hill, d_struct  # noqa: E402,F401  (d_struct: self-test)
 
 EFF_NAMES = ("swing", "knee", "twist")             # vocab.py effector subtype order
 CAP_NAMES = ("bare", "foot", "pad", "ball")        # vocab.py cap subtype order; 0 == bare

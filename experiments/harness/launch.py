@@ -1,9 +1,9 @@
 """Wave scheduler for the paper experiments: a fixed queue of runs onto a fixed pool of slots.
 
-    python -m experiments.harness.launch aux                      # one study
-    python -m experiments.harness.launch baseline aux clone       # several, as ONE mixed pool
-    python -m experiments.harness.launch clone --dry-run          # print the plan, launch nothing
-    python -m experiments.harness.launch attention --slots 4 --arms full,self_cls
+    python experiments/harness/launch.py aux                      # one study
+    python experiments/harness/launch.py baseline aux clone       # several, as ONE mixed pool
+    python experiments/harness/launch.py clone --dry-run          # print the plan, launch nothing
+    python experiments/harness/launch.py attention --slots 4 --arms full,self_cls
 
 The tuner (`scripts/tune.py`) schedules an *open* set of trials it invents as it goes and scores
 them; this schedules a *closed* set someone already wrote down in a build plan, and scores nothing --
