@@ -100,7 +100,8 @@ EXTRA_TAGS: dict[str, dict[str, dict[str, str]]] = {
 
 SIDECARS = {                     # file stem -> the keys merged from it, reindexed by label
     "spec":   ("spec", "spec_sd", "fall_rate", "src_epoch"),
-    "ladder": ("G", "G_sd", "T", "skel_share", "pred"),
+    "ladder": ("G", "G_sd", "T", "skel_share", "pred", "pred_sd", "dist", "k_max",
+               "modal_share"),
     # Experiment 4's measurement E. Written for the `full` arm only by default, so the ablated arms'
     # cells stay NaN -- which is the right reading: there is no map to interpret where the mask
     # already fixed it. Merged by label like the rest, so running it on an ablated arm to verify the
