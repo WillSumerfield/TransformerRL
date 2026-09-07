@@ -97,7 +97,7 @@ ground-truth regression. Its job is to force the encoder to represent where a bo
 are, which design mode then reads as tokens. Fused into the PPO loss.
 _Avoid_: reading FK as evidence about transfer without checking it had signal to give — at a **rest
 pose** the target is nearly a deterministic function of the morphology, which design mode already
-sees, so a flat `gen/fk` makes an ablation uninterpretable.
+sees, so a flat `losses/fk` makes an ablation uninterpretable.
 
 **Masked-token JEPA** (`config.jepa`):
 The literal I-JEPA: mask a random subset of tokens (CLS + present modules), swap in a learned

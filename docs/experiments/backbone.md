@@ -72,8 +72,9 @@ disjoint arm wins does capacity become a live alternative explanation, and then 
 1. Port the six `Phase5` commits onto the paper branch and re-smoke all three arms.
 2. Launch three waves of 8 seeds — `single`, `split`, `decoupled` — 48 windows each, ~3 h/run.
 3. Each run dumps its per-window generator population (48 npz) and saves a checkpoint at every
-   window boundary, which is what puts one at each of the three ladder points: pretrain→RL boundary
-   (w=8, epoch 504), mid-RL (w=28, epoch 1764), final (w=47, epoch 2961).
+   window boundary, which is what puts one at each of the three ladder points. Those points are
+   **derived, not written down** — `specialize.ckpt_windows` reads `generator.n_pretrain`, which
+   tuning moved 8 → 7, giving **w=7 / 27 / 47** (epochs 224 / 864 / 1536 at 32 epochs/window).
 4. Run the spread ladder at each checkpoint of each run → metrics 3 and 4.
 5. Run the specialization pass at each checkpoint of each run → metric 2. Committed body on all
    4096 envs, `resample_interval: 0`, aux off, 250 epochs.
@@ -83,7 +84,8 @@ Roughly 9 h of training waves plus 9 waves of specialization and the ladder pass
 
 ## Measurements and decision metric
 
-All five of ADR-0021, on the shared window axis with the pretrain→RL boundary ruled at w=8.
+All five of ADR-0021, on the shared window axis with the pretrain→RL boundary ruled at
+`generator.n_pretrain` — **w=7** at the tuned config.
 
 **Decision metric: specialized return at the final checkpoint** — mean over 8 seeds with a 95% CI,
 read against the noise floor. This and not the return curve, because metric 1 is a joint
@@ -121,7 +123,8 @@ representation and the distillation channel are all decoration.
 - `decoupled` losing on the strength of its FK signal. Its own design note records this: FK at a
   rest pose is close to a deterministic function of the morphology, which design mode already reads
   as tokens, so a `decoupled` null cannot separate "transfer doesn't help" from "FK had nothing to
-  transfer". Watch `gen/fk` against `build/*` diversity before reading that arm.
+  transfer". Read `losses/fk` against `build/div_struct` before reading that arm — see
+  [aux.md](aux.md)'s version of this hazard for why the loss alone does not settle it.
 
 ## Where it lands
 

@@ -99,8 +99,11 @@ result — if positive — has to be explained by something other than a learned
 
 - **FK may have had nothing to teach.** Its own design note records this: at a rest pose the
   torso-frame target is nearly a deterministic function of the morphology, which design mode already
-  reads as tokens. Watch `gen/fk` against `build/*` diversity — a flat FK loss means the head was
-  never doing work, which is a different finding from "kinematic grounding doesn't help".
+  reads as tokens. Read `losses/fk` **against `build/div_struct`**, not on its own: a flat FK loss
+  means the head was never doing work, but so does one that crashes to the floor and stays there
+  while the population spreads — a target the morphology tokens already determine is learned once
+  and then free. Either signature is a different finding from "kinematic grounding doesn't help".
+  (The tag is `losses/fk`; there is no `gen/fk`.)
 - **Aux may help control while doing nothing for the generator.** FD and FK are computed on rollout
   states and shape the trunk that design mode reads, but only indirectly. If metric 3 improves while
   metric 4's excess bias is unchanged, the representation transferred to control and not to

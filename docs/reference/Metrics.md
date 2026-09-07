@@ -336,8 +336,11 @@ rather than beyond it. 41 RL windows is enough for a trend, not for a plateau.
 **Window boundaries are exact.** The resample fires when accumulated horizon steps reach
 `resample_interval * max_episode_length` and then resets the counter to zero, so the per-window
 overshoot (1008 steps against 1000) never accumulates: window $w$ closes at the end of epoch
-$63(w+1)$. Window-cadence scalars are indexed by **frame**, and the frame counter lags one epoch, so
-window $w$ appears at frame $(63(w+1) - 1) \cdot$ `num_actors` $\cdot$ `horizon_length`.
+$E(w+1)$, where $E$ = `epochs_per_window` (**32** at the tuned `horizon_length: 32`; it was 63 at the
+hz-16 settings these numbers were first measured on). Window-cadence scalars are indexed by **frame**,
+and the frame counter lags one epoch, so window $w$ appears at frame
+$(E(w+1) - 1) \cdot$ `num_actors` $\cdot$ `horizon_length`. Never write $E$ down — `_window_epochs`
+derives it from the run's own config, and a stale literal silently shifts every window index.
 
 **Symbol clash:** $\tau$ is the mode-cluster radius (1 module) throughout this document, so the
 ladder's temperature is written $T$.

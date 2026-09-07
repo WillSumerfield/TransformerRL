@@ -21,14 +21,20 @@ body×control score — a run that collapses onto one easy body can beat one tha
 That is the intended headline ("which method ends up better"); the other metrics are what
 decompose it.
 _Avoid_: reading it as a control-quality curve.
+_Avoid_: reading it in the same units as the series' other return numbers. It is logged **shaped**
+(raw return x `reward_shaper.scale_value`, 0.01 in the tuned config), while
+[specialized return](#specialized-return), the [control-generalization curve](#control-generalization-curve)
+and GenCrit's predictions are all raw. Any figure carrying two of them divides by the run's own
+stamped scale first.
 
 **Specialized return**:
 Best-case performance of the body a run committed to: control fine-tuned on that **one** body alone,
 with the codesign scaffolding stripped (no resampling, no generator, no aux heads). Deliberately
 collapses control from generalist to specialist, so every method is given the same chance to
 specialize and **generalization stops reading as weak performance** in the
-[return curve](#return-curve). Reported as markers on that curve, at the
-[spread ladder](#spread-ladder)'s checkpoints.
+[return curve](#return-curve). Reported at the [spread ladder](#spread-ladder)'s checkpoints, in its
+own panel **sharing the return curve's y-axis** but not its x-axis: the fine-tune never resamples, so
+the two are the same units and the same reader's glance, and deliberately not the same series.
 _Avoid_: reading it as a control measure — it is a **body-quality** measure. Enough fine-tuning
 drives every method's control to the same single-body policy by construction, so a null here means
 the designs were comparable and says nothing about the policies that found them.
@@ -91,7 +97,8 @@ _Avoid_: reading the dip as interference. It mixes two causes — *the bodies ar
 moved under control* — and only [uncorrected clone drift](#uncorrected-clone-drift) isolates the
 second. Also avoid deriving the fold origin from a `clone/*` scalar's step index without converting
 it: those steps are **frames**, and the frame counter lags by one epoch (window *k* closes at the end
-of epoch `63k` but is logged at frame `(63k−1)·num_actors·horizon_length`). The epoch spacing itself
+of epoch `E·k` and is logged at frame `(E·k−1)·num_actors·horizon_length`, for `E = epochs_per_window`
+— 32 at the tuned settings, 63 at the hz-16 ones these notes were written on). The epoch spacing itself
 is exact — `_steps_since_resample` resets to 0 at the boundary instead of subtracting, so the 8-step
 overshoot per window never accumulates.
 
@@ -361,8 +368,18 @@ training agent itself:
   that exact rollout, and it is the rollout that defines what "return" means for every metric.
 - `specialize.py` — the [specialized return](#specialized-return): doctor a boundary checkpoint onto
   the [committed body](#committed-body), fine-tune 250 epochs with the scaffolding stripped, roll out.
+- `ladder.py` — the [spread ladder](#spread-ladder) and the two curves on it: bisect the generator's
+  spread knob for each integer [perturbation distance](#spread-ladder), roll each level out at μ, and
+  read GenCrit on the same bodies.
+- `travel.py` — [energy distance](#energy-distance), its split-half null, and [mode
+  coverage](#mode-coverage), from the per-window population dumps.
+- `attnmap.py` — experiment 4's attention map: the weights `F.scaled_dot_product_attention` does not
+  return, recomputed eval-time-only off a captured layer input.
 - `scrape.py` — run dirs → one per-experiment rollup npz. The only place a scalar's TensorBoard step
   becomes a window index, and the only reader of a resumed run's two overlapping event files.
+- `stats.py` — the error bars: across-seed t-intervals, the seed-**paired** arm difference every
+  verdict is made on, [ADR-0018](../docs/adr/0018-noise-floor-first-tuning.md)'s noise floor as a
+  spread rather than a CI, and the two curve summaries (asymptote, threshold crossing).
 
 [Joint optimization](#joint-optimization) is **not** part of the harness — it is a self-contained toy
 with no dependency on the repo's tasks, checkpoints or metrics.

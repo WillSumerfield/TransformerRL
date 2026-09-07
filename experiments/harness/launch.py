@@ -272,7 +272,8 @@ def _window_epochs(config: Path, sets: tuple[str, ...] = ()) -> int:
     to size its LR warmup (codesign_agent.py:163) and `CodesignAlgorithm` uses to set checkpoint
     cadence (D24). `max_episode_length` has a Task-owned default a config need not restate, so it is
     read from the Task class rather than assumed; verified empirically against a live run, whose
-    window boundaries land every 63 epochs with no drift (`_steps_since_resample` resets to 0 at the
+    window boundaries land every `epochs_per_window` with no drift -- verified at the hz-16 settings,
+    where that was 63 (`_steps_since_resample` resets to 0 at the
     boundary rather than subtracting, so the +8-step overshoot does not accumulate).
     """
     _, task_class, cfg = _effective(config, sets)
@@ -346,7 +347,8 @@ def _budget(study: Study, config: Path, sets: tuple[str, ...],
     w=46 while ADR-0021 promises 48. `windows * epochs_per_window` is what the ADR actually means.
 
     **save_frequency is one window, not the config's 50.** The ladder and specialization passes read
-    checkpoints AT boundaries (w=8/28/47); at 50 epochs against 63 the nearest save is 4-14 epochs
+    checkpoints AT boundaries (w=7/27/47, derived from `n_pretrain`); at 50 epochs against a window
+    that is not a multiple of it, the nearest save is several epochs
     into the *following* window, one generator update short of its own label. A window-aligned
     cadence also caps what the gym-rebuild crash can cost at one window, which is D24's reason for
     the same rule on the `codesigner` path. Costs ~620 MB/run in checkpoints.
