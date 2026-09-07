@@ -128,10 +128,13 @@ class _CustomEncoder(nn.Module):
             [_CustomEncoderLayer(d_model, nhead, dim_feedforward, attn_dropout, block_dropout)
              for _ in range(n_layers)])
 
-    def forward(self, x, src_key_padding_mask=None):
-        attn_mask = None
+    def forward(self, x, src_key_padding_mask=None, attn_mask=None):
+        """`attn_mask` is an explicit (…,T,T) bool, SDPA polarity (True = allowed), and is ANDed with
+        whatever the padding mask implies — the two express different things (which tokens exist vs
+        which a query may look at) and a call site may need both."""
         if src_key_padding_mask is not None:
-            attn_mask = ~src_key_padding_mask[:, None, None, :]        # (B,1,1,T) True=allowed
+            pad = ~src_key_padding_mask[:, None, None, :]              # (B,1,1,T) True=allowed
+            attn_mask = pad if attn_mask is None else (attn_mask & pad)
         for layer in self.layers:
             x = layer(x, self.cos, self.sin, attn_mask=attn_mask)
         return x
@@ -154,12 +157,29 @@ class LimbTransformer(nn.Module):
         use_rope: bool = False,
         reg_mode: str = 'none',
         dropout: float = 0.1,
+        attn_scope: str = 'full',
     ):
         super().__init__()
         if use_rope and not codesign_tokens:
             raise ValueError("use_rope needs codesign_tokens (depth-only rotary needs limb-chain depth)")
         if reg_mode not in ('none', 'dropout', 'attention_drop'):
             raise ValueError(f"reg_mode must be 'none'|'dropout'|'attention_drop', got {reg_mode!r}")
+        # Experiment 4's whole treatment: which tokens a token may look at on the LIVE control pass.
+        # Rejected rather than defaulted, because a typo silently falling through to 'full' is an
+        # ablation that reports the shipped network under the ablated arm's name.
+        if attn_scope not in ('full', 'self_cls', 'self'):
+            raise ValueError(f"attn_scope must be 'full'|'self_cls'|'self', got {attn_scope!r}")
+        if attn_scope != 'full':
+            if not codesign_tokens:
+                raise ValueError("attn_scope needs codesign_tokens: the mask is over the module-token "
+                                 "layout, and the legacy tokenization is a different substrate")
+            if not (use_rope or reg_mode != 'none'):
+                # The stock nn.TransformerEncoder takes a bool mask with the OPPOSITE polarity to
+                # SDPA's (True = *not* allowed), so wiring this through it would invert the ablation
+                # while still running. Refused rather than translated -- experiment 4 runs on the
+                # RoPE encoder the rest of the series uses, and the second path is untested here.
+                raise ValueError("attn_scope needs the custom encoder (use_rope or reg_mode != none)")
+        self.attn_scope = attn_scope
         # The run's ONE library (D14) -- the same instance the Task was set up with, not a second
         # one built from a name here. Slot count and chain depth are its facts, so they are read off
         # it rather than configured: a config that could disagree with the library is a config that
@@ -276,6 +296,19 @@ class LimbTransformer(nn.Module):
             )
             self.encoder = nn.TransformerEncoder(layer, num_layers=n_layers,
                                                  enable_nested_tensor=False)
+
+        # (1,1,T,T) bool, SDPA polarity (True = allowed), broadcast over batch and heads. Every token
+        # keeps itself; `self_cls` additionally opens column 0, the CLS token carrying the torso
+        # observation. `None` for `full`, and None rather than an all-True tensor on purpose: an
+        # explicit mask changes which SDPA kernel runs, so the unablated arm must not carry one if it
+        # is to stay numerically identical to the shipped network.
+        scope_mask = None
+        if attn_scope != 'full':
+            scope_mask = torch.eye(self.n_tokens, dtype=torch.bool)
+            if attn_scope == 'self_cls':
+                scope_mask[:, 0] = True
+            scope_mask = scope_mask.view(1, 1, self.n_tokens, self.n_tokens)
+        self.register_buffer("attn_scope_mask", scope_mask, persistent=False)
 
         if policy_head:
             self.joint_head = nn.Linear(d_model, 1)
@@ -428,7 +461,13 @@ class LimbTransformer(nn.Module):
         x = x + self.pos_emb(self.pos_ids)                             # limb slot: always additive
         if not self.use_rope:
             x = x + self._depth_add()                                 # depth: additive unless RoPE
-        return self.encoder(x)                                         # all tokens real -> no padding
+        # All tokens real -> no padding mask. `attn_scope` is applied HERE and only here: this is the
+        # live control pass, the substrate experiment 4 is about. `_encode_design` must never see it
+        # -- the generator is autoregressive over its own prefix and restricting its attention breaks
+        # generation outright -- and `_encode_legacy` is a different tokenization.
+        if self.attn_scope_mask is None:
+            return self.encoder(x)
+        return self.encoder(x, attn_mask=self.attn_scope_mask)
 
     def codesign_forward(self, obs: torch.Tensor, return_hidden: bool = False):
         """Live pass returning ContAct mu, ContCrit V0.98, and GenCrit/V1.0 in ONE trunk encode
