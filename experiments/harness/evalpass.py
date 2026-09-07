@@ -14,6 +14,7 @@ import torch
 from tqdm import tqdm
 
 from experiments.harness.policy import _load_policy
+from transformer_rl import runtime
 from transformer_rl.models import _raw_tail
 from transformer_rl.morphology import designs_from_arrays, seed_body
 from transformer_rl.train_utils import _resolve_task
@@ -41,7 +42,13 @@ def open_task(cfg: dict, n_envs: int, *, device, seed: int = EVAL_SEED):
     _, task_class = _resolve_task(cfg, default="ant")
     env = task_class(device=device, rendering=False, raise_exception=False, with_window=False,
                      enable_scene_query=False, rootOffset=(v.Vec3(0, 0, 0), v.Quat(0, 0, 0, 1)))
-    n_envs = env.setup(library, n_envs, n_envs, [seed_body(library)] * n_envs, seed=seed)
+    base = seed_body(library)
+    n_envs = env.setup(library, n_envs, n_envs, [base] * n_envs, seed=seed)
+    # The network reads all three back out of `runtime` (it is built from a config dict and handed no
+    # env), and only the trainer normally parks them -- so an analysis process that opens a task and
+    # then loads a policy has to do the trainer's half of that handshake here. Without it `load_net`
+    # asserts on the first `LimbTransformer`, which is every caller of this module.
+    runtime.set_run(library=library, base_morphology=base, obs_layout=env.obs_layout())
     return env, library, env.obs_layout()
 
 
