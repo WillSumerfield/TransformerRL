@@ -9,3 +9,22 @@ env:
     slots: [0, 3, 5]
     effectors: [swing, knee]
     cap: bare
+
+params:
+  config:
+    generator:
+      return_target: train # train | post
+      response_probe:
+        enabled: false       # detached capture; offline fit via scripts/probe_static_response.py
+        max_bodies: 256
+        samples: 8
+      spatial_credit:
+        enabled: false
+        loss_coef: 0.1
+        tree_lambda: 0.5
+        pair_supervision: false
+        pair_loss_coef: 0.1
+        pair_batch_size: 512
+        use_for_genact: false
+        genact_credit_mode: none
+        genact_beta: 0.5

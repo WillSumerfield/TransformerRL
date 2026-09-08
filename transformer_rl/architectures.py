@@ -14,6 +14,7 @@ from .vocab import (CAT_ROOT, CAT_START, CAT_EFFECTOR, CAT_CAP, N_CAT,
 from codesigner.interfaces import ModuleType
 
 from . import runtime
+from .spatial_credit import SpatialCreditHead, SpatialGlobalHead, compute_spatial_value
 
 _TOKENIZE = {4: tokenize_4, 8: tokenize_8}
 
@@ -383,6 +384,10 @@ class LimbTransformer(nn.Module):
             # fuses the launch-bound elementwise+reduction kernels; dynamic=False -> one static graph.
             self._fd_loss_c = torch.compile(self._fd_loss_impl, dynamic=False)
             self._fk_loss_c = torch.compile(self._fk_loss_impl, dynamic=False)
+            # Contextual Spatial Credit Head: per-live-module credit c_i = f(h_i)
+            # and scalar root/global head on CLS v_global = g(h_CLS)
+            self.spatial_credit_head = SpatialCreditHead(d_model)
+            self.spatial_global_head = SpatialGlobalHead(d_model)
         self._xavier_init()
 
     def _xavier_init(self) -> None:
@@ -497,6 +502,46 @@ class LimbTransformer(nn.Module):
         if self.n_root_axes:
             mu = torch.cat([mu, torch.tanh(self.root_axis_head(H[:, 0]))], dim=-1)
         return mu
+
+    def spatial_forward(self, obs: torch.Tensor):
+        """Computes contextual spatial credits and additive spatial value decomposition:
+            V^{spatial}(s) = v_{global}(h_{CLS}) + sum_i m_i c_i
+        from model-normalized obs.
+
+        Returns:
+            v_spatial: (B,) scalar total spatial value
+            v_global: (B,) root/global scalar value
+            c: (B, M) masked module credits
+            present: (B, M) active physical module mask
+            H: (B, n_tokens, d) full post-trunk hidden states
+        """
+        root, module_tok, active_mask, cap_mask, sub_oh = self._tokenize_modules(obs)
+        H = self._encode_codesign(root, module_tok, active_mask, cap_mask, sub_oh, obs.shape[0])
+        present = ((active_mask + cap_mask) > 0).float()
+        v_spatial, v_global, c = compute_spatial_value(
+            self.spatial_credit_head,
+            self.spatial_global_head,
+            H,
+            present,
+            content_start=self._content_start,
+        )
+        return v_spatial, v_global, c, present, H
+
+    def spatial_from_hidden(self, H: torch.Tensor, obs: torch.Tensor):
+        """Computes v_spatial, v_global, c, present directly from precomputed H and obs."""
+        d = self.tdims
+        mask_off, cap_off, n_dof = d["mask_off"], d["cap_off"], d["n_dof"]
+        raw_mask = obs[:, mask_off:mask_off + n_dof]
+        cap_mask = obs[:, cap_off:cap_off + n_dof]
+        present = ((raw_mask > 0) | (cap_mask > 0)).float()
+        v_spatial, v_global, c = compute_spatial_value(
+            self.spatial_credit_head,
+            self.spatial_global_head,
+            H,
+            present,
+            content_start=self._content_start,
+        )
+        return v_spatial, v_global, c, present
 
     def _sample_jepa_mask(self, present_mask: torch.Tensor, mask_prob: float) -> torch.Tensor:
         """(B, n_tokens) bool JEPA mask. Maskable = CLS + PRESENT modules (effectors AND caps; never

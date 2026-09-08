@@ -34,6 +34,26 @@ from . import runtime
 from .morphology import designs_from_arrays
 from .vocab import GEN_EFF, GEN_CAP
 from .logging_agent import LoggingA2CAgent, _LIMB_CODE
+from .generator_credit import (
+    build_action_module_mapping,
+    compute_credit_diagnostics,
+    save_credit_artifact,
+)
+from .post_adaptation_eval import (
+    run_post_adaptation_eval,
+    compute_adaptation_gap_diagnostics,
+    save_post_eval_artifact,
+)
+from .spatial_credit import (
+    propagate_tree_credit,
+    compute_spatial_credit_diagnostics,
+)
+from .counterfactual_pairs import (
+    encode_canonical_morphology,
+    find_exact_matched_pairs,
+    compute_pair_difference_loss,
+    compute_pair_diagnostics,
+)
 # perplexity diversity estimators for build/* logging (M1); pure-numpy, no transformer_rl dep
 from experiments.harness.committance import (population_to_repr, redundancy, rao_blackwell_h_body,
                                       modes_and_spread)
@@ -219,6 +239,62 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_window = 0
         self._gen_log = None
         self._last_R = None
+        self._post_eval_enabled = bool(cd.get('post_eval_enabled', True))
+        self._post_eval_steps = int(cd.get('post_eval_steps', 0))   # 0 => full max_episode_length
+        self._return_target = str(cd.get('return_target', 'train')).lower()
+        assert self._return_target in ('train', 'post'), f"Unknown return_target: {self._return_target}"
+        self._post_eval_action_mode = str(cd.get('post_eval_action_mode', 'deterministic')).lower()
+        self._post_eval_log = None
+        self._freeze_generator = bool(cd.get('freeze_generator', False))
+
+        # Optional pre-specified initial morphologies (e.g. for common-controller evaluation)
+        init_morphs_path = cd.get('initial_morphologies_npz', None)
+        if init_morphs_path and os.path.exists(init_morphs_path):
+            d_init = np.load(init_morphs_path, allow_pickle=True)
+            self._cur_counts = torch.as_tensor(d_init['counts'], dtype=torch.long, device=dev)
+            self._cur_eff = torch.as_tensor(d_init['eff_sub'], dtype=torch.long, device=dev)
+            self._cur_cap = torch.as_tensor(d_init['cap_sub'], dtype=torch.long, device=dev)
+            env = self._env()
+            if env is not None:
+                env.set_next(self._cur_counts, self._cur_eff, self._cur_cap)
+                env.resample()
+                print(f"[CodesignAgent] Loaded initial morphology set from {init_morphs_path}: "
+                      f"{self._cur_counts.shape[0]} bodies active across envs!", flush=True)
+
+        # Spatial credit head (additive contextual module credit)
+        sc = cd.get('spatial_credit', {})
+        self._spatial_credit_enabled = bool(sc.get('enabled', False))
+        self._spatial_loss_coef = float(sc.get('loss_coef', 0.1))
+        self._spatial_tree_lambda = float(sc.get('tree_lambda', 0.5))
+        self._pair_supervision_enabled = bool(sc.get('pair_supervision', False))
+        self._pair_loss_coef = float(sc.get('pair_loss_coef', 0.1))
+        self._pair_batch_size = int(sc.get('pair_batch_size', 512))
+
+        # Credit mode: none | aligned | shuffled | centered_aligned | centered_within_body_shuffled
+        #              | body_mean | mean_plus_aligned_residual | mean_plus_shuffled_residual
+        #              | direct_body_rpost
+        raw_mode = str(sc.get('genact_credit_mode', '')).lower()
+        if raw_mode:
+            allowed_modes = (
+                'none', 'aligned', 'shuffled', 'centered_aligned', 'centered_within_body_shuffled',
+                'body_mean', 'mean_plus_aligned_residual', 'mean_plus_shuffled_residual',
+                'direct_body_rpost'
+            )
+            assert raw_mode in allowed_modes, f"Unknown genact_credit_mode: {raw_mode}. Allowed: {allowed_modes}"
+            self._genact_credit_mode = raw_mode
+            self._use_for_genact = (raw_mode != 'none')
+        else:
+            self._use_for_genact = bool(sc.get('use_for_genact', False))
+            self._genact_credit_mode = 'aligned' if self._use_for_genact else 'none'
+
+        self._genact_beta = float(sc.get('genact_beta', 0.5))
+        if self._use_for_genact and self._genact_credit_mode != 'direct_body_rpost':
+            self._spatial_credit_enabled = True
+        self._spatial_credit_log = None
+        self._pair_credit_log = None
+        self._oos_pair_credit_log = None
+        self._genact_adv_log = None
+        self._cur_R_post = None
 
         # JEPA aux (Phase 2): same-step masked-latent prediction on the shared control trunk.
         # Disabled -> zero extra forwards, behaviour == phase-1 baseline (A/B control).
@@ -673,11 +749,40 @@ class CodesignAgent(LoggingA2CAgent):
                     *_, H = net.codesign_forward(self.model.norm_obs(obs_flat[idx]), return_hidden=True)
                     H_old[s:s + self.minibatch_size] = H.to(torch.bfloat16)
 
+        # Pre-update frozen spatial credit forward pass & exact matched counterfactual pairs
+        c_spat_pre, pres_pre, C_tree_pre = None, None, None
+        matched_pairs = None
+        if self._spatial_credit_enabled:
+            try:
+                with torch.no_grad():
+                    ob_eval = self.model.norm_obs(obses[-1])
+                    chunk_sz = 1024
+                    cs_l, pr_l = [], []
+                    for c_i in range(0, N, chunk_sz):
+                        ob_c = ob_eval[c_i:c_i + chunk_sz]
+                        _, _, cs_c, pr_c, _ = net.spatial_forward(ob_c)
+                        cs_l.append(cs_c)
+                        pr_l.append(pr_c)
+                    c_spat_pre = torch.cat(cs_l, dim=0)
+                    pres_pre = torch.cat(pr_l, dim=0)
+                    C_tree_pre = propagate_tree_credit(
+                        c_spat_pre, pres_pre, n_limbs=_N_LIMBS, max_len=self._max_len,
+                        tree_lambda=self._spatial_tree_lambda,
+                    )
+                if self._pair_supervision_enabled:
+                    morphs = encode_canonical_morphology(
+                        self._cur_counts, self._cur_eff, self._cur_cap,
+                        max_len=self._max_len, n_limbs=_N_LIMBS
+                    )
+                    matched_pairs = find_exact_matched_pairs(morphs, R, device=dev)
+            except Exception as e_pre:
+                print(f"[warning] pre-update spatial forward / pair discovery failed: {e_pre}", flush=True)
+
         pretrain = self._in_pretrain()
         # NOTE: (slots, actions) here is always the BUILT body -- GenCrit's prefix fit must stay on it
         # because R was measured on the body that actually ran. In pretrain, GenAct's BC target is a
         # separate, freshly-drawn TEACHER body (see the epoch loop).
-        if pretrain:
+        if pretrain or self._cur_trace is None:
             slots, cat_a, sub_a, valid, *_ = self._frontier_rollout(
                 self._cur_counts, 0.0, eff_types=self._cur_eff, cap_types=self._cur_cap)
             old_logp, adv, raw_adv = None, None, None
@@ -689,11 +794,312 @@ class CodesignAgent(LoggingA2CAgent):
             raw_adv = tr['v_states'][:, 1:] - tr['v_states'][:, :-1]      # telescoping (Shapley)
             sel = raw_adv[valid]
             adv = torch.zeros_like(raw_adv)
-            adv[valid] = (sel - sel.mean()) / (sel.std() + 1e-8)
+            adv_pref_norm = (sel - sel.mean()) / (sel.std() + 1e-8)
+            adv[valid] = adv_pref_norm
+
+            if self._use_for_genact:
+                if self._genact_credit_mode == 'direct_body_rpost':
+                    R_source = getattr(self, '_cur_R_post', None)
+                    if R_source is None:
+                        R_source = R
+                    assert R_source is not None, "direct_body_rpost requires R_post"
+
+                    r_raw_mean = float(R_source.mean().item())
+                    r_raw_std = float(R_source.std().item())
+
+                    # 1. Standardize body signal across population once:
+                    A_body = (R_source - R_source.mean()) / (R_source.std() + 1e-8)
+                    assert A_body.shape[0] == tr['slots'].shape[0], f"A_body shape {A_body.shape} != N bodies {tr['slots'].shape[0]}"
+
+                    # 2. Broadcast to valid generator actions of body b:
+                    A_body_broadcast = A_body.unsqueeze(1).expand_as(adv)
+
+                    # Every valid generator construction action receives beta * A_b^body
+                    adv[valid] = adv[valid] + self._genact_beta * A_body_broadcast[valid]
+
+                    # Diagnostics
+                    if hasattr(self, '_cur_counts') and self._cur_counts is not None:
+                        counts_tensor = torch.as_tensor(self._cur_counts, device=dev)
+                        mod_count = counts_tensor.sum(dim=1).float()
+                    else:
+                        mod_count = valid.sum(dim=1).float()
+
+                    actions_per_body = valid.sum(dim=1).float()
+                    body_mass_abs = actions_per_body * (self._genact_beta * A_body.abs())
+
+                    corr_mod_mass = 0.0
+                    if mod_count.std() > 1e-8 and body_mass_abs.std() > 1e-8:
+                        corr_mod_mass = float(torch.corrcoef(torch.stack([mod_count, body_mass_abs]))[0, 1].item())
+
+                    corr_mod_actions = 0.0
+                    if mod_count.std() > 1e-8 and actions_per_body.std() > 1e-8:
+                        corr_mod_actions = float(torch.corrcoef(torch.stack([mod_count, actions_per_body]))[0, 1].item())
+
+                    adv_body_corr = float(torch.corrcoef(torch.stack([A_body_broadcast[valid], adv[valid]]))[0, 1].item())
+
+                    self._genact_adv_log = {
+                        'raw_r_post_mean': r_raw_mean,
+                        'raw_r_post_std': r_raw_std,
+                        'body_adv_mean': float(A_body.mean().item()),
+                        'body_adv_std': float(A_body.std().item()),
+                        'corr_modcount_body_mass': corr_mod_mass,
+                        'corr_modcount_actions': corr_mod_actions,
+                        'adv_prefix_mean': adv_pref_norm.mean().item(),
+                        'adv_prefix_std': adv_pref_norm.std().item(),
+                        'adv_combined_mean': adv[valid].mean().item(),
+                        'adv_combined_std': adv[valid].std().item(),
+                        'adv_valid_corr': adv_body_corr,
+                        'genact_beta': float(self._genact_beta),
+                        'tree_valid_fraction': 1.0,
+                    }
+                    print(f"[resample #{self._gen_window} | GenAct Adv (direct_body_rpost)] "
+                          f"R_post raw: mean={r_raw_mean:.4f}, std={r_raw_std:.4f} | "
+                          f"A_body: mean={A_body.mean().item():.4f}, std={A_body.std().item():.4f} | "
+                          f"Corr(N_mod, body_mass)={corr_mod_mass:+.4f}, Corr(N_mod, actions)={corr_mod_actions:+.4f} | "
+                          f"Adv combined std={self._genact_adv_log['adv_combined_std']:.4f}, "
+                          f"Adv-Body corr={adv_body_corr:+.4f}",
+                          flush=True)
+                elif C_tree_pre is not None:
+                    mapping_data = build_action_module_mapping(tr)
+                    depth_hist = torch.as_tensor(mapping_data['depth_hist'], device=slots.device, dtype=torch.long)
+                    tok_slot = depth_hist * _N_LIMBS + slots
+                    is_eff = (cat_a == GEN_EFF) & valid
+                    act_pres = pres_pre.gather(1, tok_slot.clamp(0, 31))
+                    valid_tree = is_eff & (act_pres > 0)
+
+                    action_tree = C_tree_pre.gather(1, tok_slot.clamp(0, 31)).detach()
+                    assert action_tree.requires_grad is False
+                    if valid_tree.any():
+                        mode = self._genact_credit_mode
+                        is_decomp = mode in ('body_mean', 'mean_plus_aligned_residual', 'mean_plus_shuffled_residual')
+                        is_centered = mode in ('centered_aligned', 'centered_within_body_shuffled')
+                        is_within_body_shuffled = (mode == 'centered_within_body_shuffled')
+                        is_global_shuffled = (mode == 'shuffled')
+
+                        N_bodies, L_steps = valid_tree.shape
+                        tree_vals = action_tree[valid_tree]
+
+                        # Per-body tracking
+                        body_raw_means = []
+                        body_centered_means = []
+                        body_centered_stds = []
+                        body_residuals_all = []
+
+                        if is_decomp:
+                            # Exact decomposition: C_i^tree = mu_b + delta_i
+                            S_action_tree = torch.zeros_like(action_tree)
+                            base_seed = int(getattr(self, 'seed', 42)) + int(self._gen_window) * 10007
+                            aligned_residuals = []
+                            shuffled_residuals = []
+
+                            for b in range(N_bodies):
+                                b_mask = valid_tree[b]
+                                n_b = b_mask.sum().item()
+                                if n_b > 0:
+                                    b_vals = action_tree[b, b_mask]
+                                    mu_b = b_vals.mean()
+                                    delta_b = b_vals - mu_b
+
+                                    body_raw_means.append(mu_b.item())
+                                    body_centered_means.append(delta_b.mean().item())
+                                    body_centered_stds.append(delta_b.std().item() if n_b > 1 else 0.0)
+
+                                    if mode == 'body_mean':
+                                        S_action_tree[b, b_mask] = mu_b
+                                    elif mode == 'mean_plus_aligned_residual':
+                                        S_action_tree[b, b_mask] = mu_b + delta_b
+                                    elif mode == 'mean_plus_shuffled_residual':
+                                        if n_b > 1:
+                                            rng_b = torch.Generator(device=dev)
+                                            rng_b.manual_seed(base_seed + b * 31)
+                                            perm_b = torch.randperm(n_b, generator=rng_b, device=dev)
+                                            delta_shuf = delta_b[perm_b]
+                                            S_action_tree[b, b_mask] = mu_b + delta_shuf
+
+                                            aligned_residuals.append(delta_b)
+                                            shuffled_residuals.append(delta_shuf)
+
+                                            # Invariance check for residual within body
+                                            assert torch.allclose(delta_shuf.mean(), delta_b.mean(), atol=1e-4)
+                                            assert torch.allclose(delta_shuf.std(), delta_b.std(), atol=1e-4)
+                                            assert torch.allclose(delta_shuf.min(), delta_b.min(), atol=1e-4)
+                                            assert torch.allclose(delta_shuf.max(), delta_b.max(), atol=1e-4)
+                                        else:
+                                            S_action_tree[b, b_mask] = mu_b + delta_b
+
+                            S_vals = S_action_tree[valid_tree]
+                            # Verify sum_i delta_i approx 0 for every body
+                            for b_mean in body_centered_means:
+                                assert abs(b_mean) < 1e-4, f"Body residual mean not zero: {b_mean}"
+
+                            if mode == 'mean_plus_aligned_residual':
+                                # Numerically reproduces uncentred aligned implementation
+                                assert torch.allclose(S_vals, tree_vals, atol=1e-5)
+                                shuffle_corr = 1.0
+                            elif mode == 'mean_plus_shuffled_residual' and aligned_residuals:
+                                all_al = torch.cat(aligned_residuals)
+                                all_sh = torch.cat(shuffled_residuals)
+                                shuffle_corr = float(torch.corrcoef(torch.stack([all_al, all_sh]))[0, 1].item())
+                            else:
+                                shuffle_corr = 1.0
+
+                            # Global standardization over valid generator actions
+                            tree_norm = (S_vals - S_vals.mean()) / (S_vals.std() + 1e-8)
+                            tree_signal = tree_norm
+
+                        elif is_centered:
+                            # Compute body-level mean mu_b over valid credited actions only
+                            centered_action_tree = torch.zeros_like(action_tree)
+                            shuffled_action_tree = torch.zeros_like(action_tree)
+                            base_seed = int(getattr(self, 'seed', 42)) + int(self._gen_window) * 10007
+
+                            for b in range(N_bodies):
+                                b_mask = valid_tree[b]
+                                n_b = b_mask.sum().item()
+                                if n_b > 0:
+                                    b_vals = action_tree[b, b_mask]
+                                    mu_b = b_vals.mean()
+                                    c_b = b_vals - mu_b
+                                    centered_action_tree[b, b_mask] = c_b
+                                    body_raw_means.append(mu_b.item())
+                                    body_centered_means.append(c_b.mean().item())
+                                    body_centered_stds.append(c_b.std().item() if n_b > 1 else 0.0)
+
+                                    if is_within_body_shuffled:
+                                        if n_b > 1:
+                                            rng_b = torch.Generator(device=dev)
+                                            rng_b.manual_seed(base_seed + b * 31)
+                                            perm_b = torch.randperm(n_b, generator=rng_b, device=dev)
+                                            s_b = c_b[perm_b]
+                                            shuffled_action_tree[b, b_mask] = s_b
+
+                                            # Invariance check within body
+                                            assert torch.allclose(s_b.mean(), c_b.mean(), atol=1e-4)
+                                            assert torch.allclose(s_b.std(), c_b.std(), atol=1e-4)
+                                            assert torch.allclose(s_b.min(), c_b.min(), atol=1e-4)
+                                            assert torch.allclose(s_b.max(), c_b.max(), atol=1e-4)
+                                        else:
+                                            shuffled_action_tree[b, b_mask] = c_b
+
+                            base_credit_vals = centered_action_tree[valid_tree]
+                            for b_mean in body_centered_means:
+                                assert abs(b_mean) < 1e-4, f"Body centered mean not zero: {b_mean}"
+
+                            if is_within_body_shuffled:
+                                target_credit_vals = shuffled_action_tree[valid_tree]
+                                assert torch.allclose(target_credit_vals.mean(), base_credit_vals.mean(), atol=1e-4)
+                                assert torch.allclose(target_credit_vals.std(), base_credit_vals.std(), atol=1e-4)
+                                assert torch.allclose(target_credit_vals.min(), base_credit_vals.min(), atol=1e-4)
+                                assert torch.allclose(target_credit_vals.max(), base_credit_vals.max(), atol=1e-4)
+                                assert target_credit_vals.numel() == base_credit_vals.numel()
+                                shuffle_corr = float(torch.corrcoef(torch.stack([base_credit_vals, target_credit_vals]))[0, 1].item())
+                            else:
+                                target_credit_vals = base_credit_vals
+                                shuffle_corr = 1.0
+
+                            # Global standardization over valid generator actions
+                            tree_norm = (target_credit_vals - target_credit_vals.mean()) / (target_credit_vals.std() + 1e-8)
+                            tree_signal = tree_norm
+
+                        elif is_global_shuffled:
+                            # Global uncentered shuffle
+                            tree_norm = (tree_vals - tree_vals.mean()) / (tree_vals.std() + 1e-8)
+                            perm_seed = int(getattr(self, 'seed', 42)) + int(self._gen_window) * 10007
+                            rng = torch.Generator(device=dev)
+                            rng.manual_seed(perm_seed)
+                            perm = torch.randperm(tree_norm.numel(), generator=rng, device=dev)
+                            tree_signal = tree_norm[perm]
+
+                            assert torch.allclose(tree_signal.mean(), tree_norm.mean(), atol=1e-4)
+                            assert torch.allclose(tree_signal.std(), tree_norm.std(), atol=1e-4)
+                            assert torch.allclose(tree_signal.min(), tree_norm.min(), atol=1e-4)
+                            assert torch.allclose(tree_signal.max(), tree_norm.max(), atol=1e-4)
+                            assert tree_signal.numel() == tree_norm.numel()
+                            shuffle_corr = float(torch.corrcoef(torch.stack([tree_norm, tree_signal]))[0, 1].item())
+                        else:
+                            # Existing uncentered aligned
+                            tree_norm = (tree_vals - tree_vals.mean()) / (tree_vals.std() + 1e-8)
+                            tree_signal = tree_norm
+                            shuffle_corr = 1.0
+
+                        adv[valid_tree] = adv[valid_tree] + self._genact_beta * tree_signal
+
+                        std_prefix = sel.std().item()
+                        std_tree_raw = tree_vals.std().item()
+                        raw_std_ratio = (self._genact_beta * std_tree_raw) / max(1e-8, std_prefix)
+
+                        adv_valid_corr = float(torch.corrcoef(torch.stack([tree_signal, adv[valid_tree]]))[0, 1].item())
+
+                        raw_mean_val = float(np.mean(body_raw_means)) if body_raw_means else tree_vals.mean().item()
+                        cent_mean_val = float(np.mean(body_centered_means)) if body_centered_means else 0.0
+                        cent_std_val = float(np.mean(body_centered_stds)) if body_centered_stds else 0.0
+                        raw_std_val = float(np.std(body_raw_means)) if body_raw_means else 0.0
+                        rel_ratio_val = raw_std_val / (cent_std_val + 1e-8)
+
+                        self._genact_adv_log = {
+                            'adv_prefix_mean': adv_pref_norm.mean().item(),
+                            'adv_prefix_std': adv_pref_norm.std().item(),
+                            'adv_tree_raw_mean': tree_vals.mean().item(),
+                            'adv_tree_raw_std': std_tree_raw,
+                            'adv_tree_norm_mean': tree_signal.mean().item(),
+                            'adv_tree_norm_std': tree_signal.std().item(),
+                            'adv_combined_mean': adv[valid].mean().item(),
+                            'adv_combined_std': adv[valid].std().item(),
+                            'tree_to_prefix_std_ratio_raw': raw_std_ratio,
+                            'tree_to_prefix_std_ratio_norm': float(self._genact_beta),
+                            'tree_valid_fraction': (valid_tree.sum().float() / valid.sum().clamp(min=1).float()).item(),
+                            'shuffle_corr': shuffle_corr,
+                            'adv_valid_corr': adv_valid_corr,
+                            'mode_is_shuffled': 1.0 if ('shuffled' in self._genact_credit_mode) else 0.0,
+                            'mode_is_centered': 1.0 if is_centered else 0.0,
+                            'body_raw_mean': raw_mean_val,
+                            'body_raw_std': raw_std_val,
+                            'body_centered_mean': cent_mean_val,
+                            'body_centered_std': cent_std_val,
+                            'body_mu_to_delta_ratio': rel_ratio_val,
+                        }
+                        print(f"[resample #{self._gen_window} | GenAct Adv ({self._genact_credit_mode})] "
+                              f"Prefix std={std_prefix:.4f}, Tree std={std_tree_raw:.4f}, "
+                              f"Raw ratio={raw_std_ratio:.4f}, Valid frac={self._genact_adv_log['tree_valid_fraction']:.3f}, "
+                              f"Shuffle corr={shuffle_corr:+.4f}, Adv-Tree corr={adv_valid_corr:+.4f}"
+                              + (f", mu_b={raw_mean_val:.4f} (std={raw_std_val:.4f}), delta std={cent_std_val:.4f}, ratio={rel_ratio_val:.2f}" if (is_decomp or is_centered) else ""),
+                              flush=True)
+
+        # Out-of-sample pair evaluation (evaluated on new pairs before training on them)
+        if (self._spatial_credit_enabled and matched_pairs is not None
+                and matched_pairs['idx_A'].shape[0] > 0 and c_spat_pre is not None):
+            try:
+                pref_grid = None
+                if not pretrain and self._cur_trace is not None:
+                    raw_adv_eval = self._cur_trace['v_states'][:, 1:] - self._cur_trace['v_states'][:, :-1]
+                    val_eval = self._cur_trace['active_step']
+                    tr_slots = self._cur_trace['slots']
+                    mapping_eval = build_action_module_mapping(self._cur_trace)
+                    d_hist = torch.as_tensor(mapping_eval['depth_hist'], device=tr_slots.device, dtype=torch.long)
+                    t_slot = d_hist * _N_LIMBS + tr_slots
+                    pref_grid = torch.zeros_like(c_spat_pre)
+                    pref_grid.scatter_(1, t_slot.clamp(0, 31), torch.where(val_eval, raw_adv_eval, torch.zeros_like(raw_adv_eval)))
+
+                oos_diags = compute_pair_diagnostics(
+                    c_spat_pre, C_tree_pre, matched_pairs, prefix_delta=pref_grid
+                )
+                self._oos_pair_credit_log = oos_diags
+                t_r = oos_diags.get('tree_diff_pearson', 0.0)
+                t_rho = oos_diags.get('tree_diff_spearman', 0.0)
+                t_ev = oos_diags.get('tree_diff_ev', 0.0)
+                p_r = oos_diags.get('prefix_diff_pearson', float('nan'))
+                p_rho = oos_diags.get('prefix_diff_spearman', float('nan'))
+                p_cnt = matched_pairs['idx_A'].shape[0]
+                print(f"[resample #{self._gen_window} | OOS Pair Eval] "
+                      f"Tree r={t_r:+.4f}, rho={t_rho:+.4f}, EV={t_ev:+.4f} | "
+                      f"Prefix r={p_r:+.4f}, rho={p_rho:+.4f} | Pairs={p_cnt}", flush=True)
+            except Exception as e_oos:
+                print(f"[warning] out-of-sample pair evaluation failed: {e_oos}", flush=True)
 
         L1 = self._n_dof + 1                               # (L+1) prefixes gen_replay stacks per env
         mb_size = max(1, min(N // self._gen_minibatches, self._gen_max_prefixes // L1))
-        logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn', 'anchor')}
+        logs = {k: [] for k in ('gen_pg', 'ent', 'v_prefix', 'v_roll', 'kl', 'crit', 'gn', 'anchor', 'v_spatial', 'pair_loss')}
+
         for _ in range(self._gen_epochs):
             if pretrain:
                 # GenAct's BC target: a FRESH teacher draw (+ fresh random tip ordering) each epoch.
@@ -735,21 +1141,56 @@ class CodesignAgent(LoggingA2CAgent):
                 # --- control clone + GenCrit rollout-state fit (sampled rollout minibatch) ---
                 # Anchor on: sample from the snapshot SUBSET so H_full_new reuses this single forward
                 # (no extra pass); the clone is a soft regularizer, so a subset sample is fine.
-                if anchor_on:
-                    j = torch.randint(0, S, (N,), device=dev)
-                    ridx = sub[j]
+                N_ctrl = min(1024, N)
+                if anchor_on or self._spatial_credit_enabled:
+                    j = torch.randint(0, S, (N_ctrl,), device=dev) if anchor_on else torch.randint(0, HN, (N_ctrl,), device=dev)
+                    ridx = sub[j] if anchor_on else j
                     ob = obs_flat[ridx]
                     mu_n, v098_n, v1_n, H_new = net.codesign_forward(self.model.norm_obs(ob),
                                                                      return_hidden=True)
-                    anchor = (1 - F.cosine_similarity(H_new, H_old[j].float(), dim=-1)).mean()
+                    anchor = (1 - F.cosine_similarity(H_new, H_old[j].float(), dim=-1)).mean() if anchor_on else ob.new_zeros(())
                 else:
-                    ridx = torch.randint(0, HN, (N,), device=dev)
+                    ridx = torch.randint(0, HN, (N_ctrl,), device=dev)
                     ob = obs_flat[ridx]
                     mu_n, v098_n, v1_n = net.codesign_forward(self.model.norm_obs(ob))
                     anchor = ob.new_zeros(())
+                    H_new = None
                 kl = _gauss_kl(mu_old[ridx], ls_old[ridx], mu_n, self._log_std(ob))
                 crit = (v098_n - v098_old[ridx]).pow(2).mean()
                 v_roll = (v1_n.squeeze(-1) - R_roll[ridx]).pow(2).mean()
+
+                if self._spatial_credit_enabled and H_new is not None:
+                    v_spat, v_glob, c_spat, pres = net.spatial_from_hidden(H_new, ob)
+                    v_spatial_loss = (v_spat - R_roll[ridx]).pow(2).mean()
+                else:
+                    v_spatial_loss = ob.new_zeros(())
+
+                # Matched structural counterfactual supervision
+                if (self._spatial_credit_enabled and self._pair_supervision_enabled
+                        and matched_pairs is not None and matched_pairs['idx_A'].shape[0] > 0):
+                    n_p = matched_pairs['idx_A'].shape[0]
+                    p_sub = torch.randint(0, n_p, (min(self._pair_batch_size, n_p),), device=dev)
+                    mb_p_A = matched_pairs['idx_A'][p_sub]
+                    mb_p_B = matched_pairs['idx_B'][p_sub]
+                    u_envs = torch.unique(torch.cat([mb_p_A, mb_p_B]))
+                    ob_u = self.model.norm_obs(obses[-1, u_envs])
+                    _, _, c_u, pres_u, _ = net.spatial_forward(ob_u)
+                    C_tree_u = propagate_tree_credit(
+                        c_u, pres_u, n_limbs=_N_LIMBS, max_len=self._max_len,
+                        tree_lambda=self._spatial_tree_lambda,
+                    )
+                    lookup = torch.full((N,), -1, dtype=torch.long, device=dev)
+                    lookup[u_envs] = torch.arange(len(u_envs), device=dev)
+                    pair_batch_mapped = {
+                        'idx_A': lookup[mb_p_A],
+                        'idx_B': lookup[mb_p_B],
+                        'slot': matched_pairs['slot'][p_sub],
+                        'is_subtree': matched_pairs['is_subtree'][p_sub],
+                        'delta_R': matched_pairs['delta_R'][p_sub],
+                    }
+                    pair_loss, _ = compute_pair_difference_loss(c_u, C_tree_u, pair_batch_mapped)
+                else:
+                    pair_loss = ob.new_zeros(())
 
                 # entropy is an RL-only term: pretrain is supervised (gen_pg is plain NLL) and the
                 # TEACHER is the entropy source, so a bonus here only fights the fit -- at 0.1 it
@@ -759,13 +1200,15 @@ class CodesignAgent(LoggingA2CAgent):
                 loss = (gen_pg - ent_coef * ent
                         + self._gencrit_coef * (v_prefix + v_roll)
                         + self._beta * kl + self._lam * crit
-                        + self._jepa_anchor_coef * anchor)
+                        + self._jepa_anchor_coef * anchor
+                        + self._spatial_loss_coef * (v_spatial_loss + self._pair_loss_coef * pair_loss))
                 self.optimizer.zero_grad()
                 loss.backward()
                 logs['gn'].append(clip_grad_norm_(self.model.parameters(), self.grad_norm))
                 self.optimizer.step()
                 for k, val in (('gen_pg', gen_pg), ('ent', ent), ('v_prefix', v_prefix),
-                               ('v_roll', v_roll), ('kl', kl), ('crit', crit), ('anchor', anchor)):
+                               ('v_roll', v_roll), ('kl', kl), ('crit', crit), ('anchor', anchor),
+                               ('v_spatial', v_spatial_loss), ('pair_loss', pair_loss)):
                     logs[k].append(val.detach())
 
         self._gen_log = {k: torch.stack(v).mean().item() for k, v in logs.items()}
@@ -774,6 +1217,44 @@ class CodesignAgent(LoggingA2CAgent):
         self._gen_log['R_var'] = R.var(unbiased=False).item()    # scale for the GenCrit vloss norm
         self._gen_log['R_mean'] = R.mean().item()
         self._gen_log['R_std'] = R.std().item()
+        R_sorted = torch.sort(R)[0]
+        n_top10 = max(1, int(0.1 * len(R)))
+        self._gen_log['R_max'] = R_sorted[-1].item()
+        self._gen_log['R_top10_mean'] = R_sorted[-n_top10:].mean().item()
+        if self._cur_trace is not None and 'cat_actions' in self._cur_trace:
+            tr_cat = self._cur_trace['cat_actions']
+            tr_val = self._cur_trace['active_step']
+            val_cnt = tr_val.sum().clamp(min=1).float()
+            self._gen_log['action_eff_prob'] = (((tr_cat == GEN_EFF) & tr_val).sum().float() / val_cnt).item()
+            self._gen_log['action_cap_prob'] = (((tr_cat == GEN_CAP) & tr_val).sum().float() / val_cnt).item()
+
+        # Complexity collapse diagnostics
+        cur_mod_counts = self._cur_counts.sum(1)          # (N,)
+        cur_limb_counts = (self._cur_counts > 0).sum(1)    # (N,)
+        cur_mean_depth = cur_mod_counts.float() / cur_limb_counts.clamp(min=1).float()
+        present_limbs = (self._cur_counts > 0)
+        frac_limbs_max_depth = ((self._cur_counts == self._max_len) & present_limbs).sum().float() / present_limbs.sum().clamp(min=1).float()
+        max_possible_modules = _N_LIMBS * self._max_len   # 32
+        frac_bodies_max_mod = (cur_mod_counts == max_possible_modules).float().mean()
+        frac_bodies_top10_mod = (cur_mod_counts >= int(0.9 * max_possible_modules)).float().mean()
+
+        self._gen_log['mean_depth'] = cur_mean_depth.mean().item()
+        self._gen_log['frac_limbs_max_depth'] = frac_limbs_max_depth.item()
+        self._gen_log['frac_bodies_max_modules'] = frac_bodies_max_mod.item()
+        self._gen_log['frac_bodies_top10_complexity'] = frac_bodies_top10_mod.item()
+
+        # E[R | N_modules] and E[R | depth]
+        R_by_mod = {}
+        for mc in cur_mod_counts.unique():
+            R_by_mod[int(mc.item())] = R[cur_mod_counts == mc].mean().item()
+        self._gen_log['by_modcount'] = R_by_mod
+
+        R_by_dep = {}
+        rounded_depth = torch.round(cur_mean_depth).long().clamp(0, self._max_len)
+        for dp in rounded_depth.unique():
+            R_by_dep[int(dp.item())] = R[rounded_depth == dp].mean().item()
+        self._gen_log['by_depth'] = R_by_dep
+
         self._gen_log['by_limbcount'] = self._by_limbcount(R, self._cur_counts)
         self._gen_log['types'] = self._type_usage()
         if not pretrain:                                   # RL: built body == generated (ramp off)
@@ -785,6 +1266,79 @@ class CodesignAgent(LoggingA2CAgent):
             self._gen_log['value_rank_corr'] = rank       # denoised Spearman (NaN if <5 bodies)
             self._gen_log['value_ev'] = ev                # denoised per-body explained variance
             self._gen_log['n_distinct_bodies'] = float(K)
+
+        if self._cur_trace is not None:
+            try:
+                mapping_data = build_action_module_mapping(self._cur_trace)
+                credit_scalars, flat_records = compute_credit_diagnostics(
+                    mapping_data, self._cur_trace, R, adv=adv, raw_adv=raw_adv
+                )
+
+                if self._spatial_credit_enabled:
+                    try:
+                        with torch.no_grad():
+                            ob_eval = self.model.norm_obs(obses[-1])
+                            chunk_sz = 1024
+                            vs_l, vg_l, cs_l, pr_l = [], [], [], []
+                            for c_i in range(0, ob_eval.shape[0], chunk_sz):
+                                ob_c = ob_eval[c_i:c_i + chunk_sz]
+                                vs_c, vg_c, cs_c, pr_c, _ = net.spatial_forward(ob_c)
+                                vs_l.append(vs_c)
+                                vg_l.append(vg_c)
+                                cs_l.append(cs_c)
+                                pr_l.append(pr_c)
+                            v_spat = torch.cat(vs_l, dim=0)
+                            v_glob = torch.cat(vg_l, dim=0)
+                            c_spat = torch.cat(cs_l, dim=0)
+                            pres = torch.cat(pr_l, dim=0)
+                            C_tree = propagate_tree_credit(
+                                c_spat, pres, n_limbs=_N_LIMBS, max_len=self._max_len,
+                                tree_lambda=self._spatial_tree_lambda,
+                            )
+                            deltas = raw_adv[valid] if raw_adv is not None else None
+                            spat_scalars, spat_records = compute_spatial_credit_diagnostics(
+                                c_spat, C_tree, v_glob, v_spat, R, pres,
+                                records=mapping_data['records'], delta=deltas,
+                            )
+                            self._spatial_credit_log = spat_scalars
+                            if 'action_spatial_credit' in spat_records:
+                                flat_records['spatial_credit'] = spat_records['action_spatial_credit']
+                            if 'action_tree_credit' in spat_records:
+                                flat_records['tree_credit'] = spat_records['action_tree_credit']
+
+                            if self._pair_supervision_enabled and matched_pairs is not None:
+                                pair_scalars = compute_pair_diagnostics(
+                                    c_spat, C_tree, matched_pairs
+                                )
+                                self._pair_credit_log = pair_scalars
+                                p_lim = min(8192, matched_pairs['idx_A'].shape[0])
+                                flat_records['pair_idx_A'] = matched_pairs['idx_A'][:p_lim].cpu().numpy()
+                                flat_records['pair_idx_B'] = matched_pairs['idx_B'][:p_lim].cpu().numpy()
+                                flat_records['pair_slot'] = matched_pairs['slot'][:p_lim].cpu().numpy()
+                                flat_records['pair_depth'] = matched_pairs['depth'][:p_lim].cpu().numpy()
+                                flat_records['pair_limb'] = matched_pairs['limb'][:p_lim].cpu().numpy()
+                                flat_records['pair_is_subtree'] = matched_pairs['is_subtree'][:p_lim].cpu().numpy()
+                                flat_records['pair_delta_R'] = matched_pairs['delta_R'][:p_lim].cpu().numpy()
+                    except Exception as e_spat:
+                        print(f"[warning] spatial credit diagnostics failed: {e_spat}", flush=True)
+
+                self._gen_log['credit_scalars'] = credit_scalars
+                credit_dir = os.path.join(self.experiment_dir, 'credit')
+                artifact_path = os.path.join(credit_dir, f'credit_window_{self._gen_window:04d}.npz')
+                save_credit_artifact(
+                    artifact_path,
+                    flat_records,
+                    mapping_data['controller_module_to_action'],
+                    metadata={
+                        'gen_window': self._gen_window,
+                        'epoch': self.epoch_num,
+                        'pretrain': pretrain,
+                        'spatial_credit_enabled': self._spatial_credit_enabled,
+                        'pair_supervision_enabled': self._pair_supervision_enabled,
+                    },
+                )
+            except Exception as e:
+                print(f"[warning] generator credit logging failed: {e}", flush=True)
 
     @torch.no_grad()
     def _slot_marginal(self, raw_adv, slots, cat_a, valid):
@@ -896,8 +1450,57 @@ class CodesignAgent(LoggingA2CAgent):
             return
 
         N = env.total_num_envs
-        R = self._window_Ri() * self._r_scale               # true body return, scaled to control units
+        R_train = self._window_Ri() * self._r_scale               # true body return, scaled to control units
         W = self._win_r_sum * (self._r_scale / max(1, self._win_n_steps))   # per-step, R's scale
+        # Optional detached capture of the last training rollout, before evaluation/reset.
+        probe_cfg = self.config.get('generator', {}).get('response_probe', {})
+        if probe_cfg.get('enabled', False):
+            from .response_probe import capture_response_probe
+            capture_response_probe(
+                self, os.path.join(self.experiment_dir, 'response_probe'),
+                max_bodies=int(probe_cfg.get('max_bodies', 256)),
+                samples=int(probe_cfg.get('samples', 8)))
+        R = R_train
+        R_post_det = None
+        R_post_stoch = None
+        R_post_primary = None
+
+        # --- Diagnostic Post-Adaptation Evaluation ---
+        if self._post_eval_enabled and self._cur_counts is not None:
+            try:
+                R_post_det, R_post_stoch = run_post_adaptation_eval(
+                    self, eval_steps=self._post_eval_steps, eval_stochastic=True
+                )
+                R_post_primary = R_post_stoch if self._post_eval_action_mode == 'stochastic' else R_post_det
+                self._cur_R_post = R_post_primary
+                eval_scalars, eval_records = compute_adaptation_gap_diagnostics(
+                    R_train, R_post_primary, self._cur_counts, self._cur_eff, self._cur_cap,
+                    R_post_stoch=R_post_stoch
+                )
+                self._post_eval_log = eval_scalars
+                eval_dir = os.path.join(self.experiment_dir, 'post_eval')
+                artifact_path = os.path.join(eval_dir, f'post_eval_window_{self._gen_window:04d}.npz')
+                save_post_eval_artifact(
+                    artifact_path,
+                    eval_records,
+                    eval_scalars,
+                    metadata={
+                        'gen_window': self._gen_window,
+                        'epoch': self.epoch_num,
+                        'pretrain': self._in_pretrain(),
+                        'return_target': self._return_target,
+                        'action_mode': self._post_eval_action_mode,
+                    },
+                )
+            except Exception as e:
+                print(f"[warning] post-adaptation evaluation failed: {e}", flush=True)
+
+        # Configurable GenCrit target: train | post
+        if self._return_target == 'post' and R_post_primary is not None:
+            R = R_post_primary
+        if self._freeze_generator:
+            print(f"[CodesignAgent] Generator is frozen (evaluation mode). Post-adaptation eval complete at epoch {self.epoch_num}.", flush=True)
+            return
         obses = self.experience_buffer.tensor_dict['obses']  # (H,N,obs) rollout-state sample
         phase = 'pretrain' if self._in_pretrain() else 'rl'  # regime of the update just performed
         self._window_update(R, obses)
@@ -1066,8 +1669,68 @@ class CodesignAgent(LoggingA2CAgent):
         # length in its units. Invariant to horizon_length, which is what makes it legal to sweep.
         w.add_scalar('quality/Window_Rew_Mean', g['W_mean'], frame)
         w.add_scalar('quality/Window_Rew_Std', g['W_std'], frame)
+        if 'R_max' in g:
+            w.add_scalar('quality/R_max', g['R_max'], frame)
+        if 'R_top10_mean' in g:
+            w.add_scalar('quality/R_top10_mean', g['R_top10_mean'], frame)
+        if 'action_eff_prob' in g:
+            w.add_scalar('gen/action_prob/eff', g['action_eff_prob'], frame)
+            w.add_scalar('gen/action_prob/cap', g['action_cap_prob'], frame)
         for k, v in g['by_limbcount'].items():             # does more limbs earn more R?
             w.add_scalar(f'quality/by_limbcount/{k}', v, frame)
+        if 'by_modcount' in g:
+            for k, v in g['by_modcount'].items():
+                w.add_scalar(f'quality/by_modcount/{k}', v, frame)
+        if 'by_depth' in g:
+            for k, v in g['by_depth'].items():
+                w.add_scalar(f'quality/by_depth/{k}', v, frame)
+        if 'mean_depth' in g:
+            w.add_scalar('build/complexity/mean_depth', g['mean_depth'], frame)
+            w.add_scalar('build/complexity/frac_limbs_max_depth', g['frac_limbs_max_depth'], frame)
+            w.add_scalar('build/complexity/frac_bodies_max_modules', g['frac_bodies_max_modules'], frame)
+            w.add_scalar('build/complexity/frac_bodies_top10_complexity', g['frac_bodies_top10_complexity'], frame)
+
+        # --- codesign/genact/: combined advantage diagnostics ---
+        if self._genact_adv_log:
+            for k, val in self._genact_adv_log.items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(f'codesign/genact/{k}', val, frame)
+            self._genact_adv_log = None
+
+        # --- codesign/credit/: generator credit and advantage diagnostics ---
+        if 'credit_scalars' in g:
+            for k, val in g['credit_scalars'].items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(k, val, frame)
+
+        # --- codesign/adaptation/: post-adaptation evaluation diagnostics ---
+        if self._post_eval_log:
+            for k, val in self._post_eval_log.items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(k, val, frame)
+            self._post_eval_log = None
+
+        # --- codesign/spatial/: spatial credit diagnostics ---
+        if self._spatial_credit_log:
+            for k, val in self._spatial_credit_log.items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(k, val, frame)
+            self._spatial_credit_log = None
+
+        if self._pair_credit_log:
+            for k, val in self._pair_credit_log.items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(f'codesign/spatial/pair/{k}', val, frame)
+            self._pair_credit_log = None
+
+        # --- codesign/spatial/pair/oos_*: out-of-sample pair evaluation diagnostics ---
+        if self._oos_pair_credit_log:
+            for k, val in self._oos_pair_credit_log.items():
+                if val == val and not np.isinf(val):       # skip NaN / inf
+                    w.add_scalar(f'codesign/spatial/pair/oos_{k}', val, frame)
+            self._oos_pair_credit_log = None
+
+        w.add_scalar('codesign/return_target_is_post', 1.0 if self._return_target == 'post' else 0.0, frame)
 
         # --- clone/: control preservation at resample ---
         if 'kl' in g:
