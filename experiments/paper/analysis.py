@@ -116,7 +116,7 @@ def show_table(df, caption=None):
 # right is the collapse check that catches a metric-1 win bought by locking onto one easy body.
 
 # %%
-def fig_return_and_spec(r, *, title="", seed_paths=False):
+def fig_return_and_spec(r, *, title=""):
     fig = make_subplots(rows=1, cols=2, shared_yaxes=True, column_widths=[0.74, 0.26],
                         horizontal_spacing=0.035,
                         subplot_titles=("return curve — window average, generator's own bodies",
@@ -130,8 +130,9 @@ def fig_return_and_spec(r, *, title="", seed_paths=False):
                   annotation_position="bottom right",
                   annotation=dict(font=dict(size=10, color=F.INK_MUTED)), row=1, col=1)
 
-    # Right: one x position per checkpoint, seeds jittered behind the arm mean. The tick labels are
-    # the checkpoints' OWN gen_window numbers; `ckpt_metric` is what aligns them to the left panel.
+    # Right: one x position per checkpoint, arm means only. The tick labels are the checkpoints' OWN
+    # gen_window numbers; `ckpt_metric` is what aligns them to the left panel. Arms are nudged apart
+    # on x so their whiskers do not overlap at a shared checkpoint.
     n_ck = len(r.ckpt_gen)
     xs = np.arange(n_ck, dtype=float)
     Sm, Slo, Shi = load.mean_ci(r.spec)
@@ -139,18 +140,6 @@ def fig_return_and_spec(r, *, title="", seed_paths=False):
         a = r.arm(arm)
         c = F.colour(arm)
         off = (j - (len(r.arms) - 1) / 2) * 0.16
-        spec = r.spec[a]                                          # (seed, ckpt)
-        jit = off + np.linspace(-0.045, 0.045, len(r.seeds))[:, None]
-        fig.add_trace(go.Scatter(
-            x=(xs[None, :] + jit).ravel(), y=spec.ravel(), mode="markers",
-            marker=dict(color=F.rgba(c, 0.5), size=7, line=dict(width=1, color=F.SURFACE)),
-            showlegend=False, legendgroup=arm, hoverinfo="skip"), row=1, col=2)
-        if seed_paths:
-            for s in range(len(r.seeds)):
-                fig.add_trace(go.Scatter(x=xs + off, y=spec[s], mode="lines",
-                                         line=dict(color=F.rgba(c, 0.25), width=1),
-                                         showlegend=False, legendgroup=arm, hoverinfo="skip"),
-                              row=1, col=2)
         m = Sm[a]
         fig.add_trace(go.Scatter(
             x=xs + off, y=m,
