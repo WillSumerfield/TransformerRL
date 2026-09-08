@@ -455,70 +455,65 @@ show(fig_ladder(R["clone"], title="Experiment 3 — control generalization and G
 
 
 # %% [markdown]
-# ## Metric 4 — exploration, as a joint rather than two marginals
+# ## Metric 4 — exploration: breadth and mode travel, over the run
 #
-# Breadth and travel are both required and neither is sufficient, and they come apart in two named,
-# opposite ways: a generator holding one design that marches across design space explores while
+# Breadth and mode travel are both required and neither is sufficient, and they come apart in
+# two named, opposite ways: a generator holding one design that marches across design space explores while
 # reading as fully collapsed, and one holding the same three designs forever reads as healthy while
-# exploring nothing. Both are *corners of the joint*, so the panel is the plane rather than its two
-# marginals. Colour is the window index here — the trajectory is the whole point — so arm identity
-# moves to the panel title and the final-window marker.
+# exploring nothing. Neither panel is therefore a result on its own — they are read at the *same
+# window*, one directly above the other, and it is the pair that says whether a generator explored.
 #
-# Travel is read against its **measured split-half null**, never against zero: at the null the
+# Both go on the window axis with the arms overlaid, so the comparison the experiment actually asks
+# for — arm against arm, with the across-seed CI visible — is the one the panel makes, and the
+# trajectory through the run is the x-axis rather than a colour ramp.
+#
+# Mode travel is read against its **measured split-half null**, never against zero: at the null the
 # energy distance is as often slightly negative as slightly positive, and a small negative value is
 # the estimator working. The panel starts at the pretrain→RL boundary because `build/n_modes` is not
 # logged during pretrain.
 
 # %%
 def fig_exploration(r, *, title=""):
-    n = len(r.arms)
-    fig = make_subplots(rows=2, cols=n, vertical_spacing=0.17, horizontal_spacing=0.05,
-                        row_heights=[0.62, 0.38],
-                        specs=[[{} for _ in range(n)],
-                               [{"colspan": n}] + [None] * (n - 1)],
-                        subplot_titles=[f"{a}" for a in r.arms] + ["mode coverage — cumulative"])
-    breadth = np.nanmean(r.n_modes, axis=1)
-    excess = np.nanmean(r.energy - r.energy_null, axis=1)
-    for i, arm in enumerate(r.arms):
-        ok = np.isfinite(breadth[i]) & np.isfinite(excess[i])
-        w = r.windows[ok]
-        fig.add_trace(go.Scatter(
-            x=breadth[i][ok], y=excess[i][ok], mode="lines+markers",
-            line=dict(color=F.rgba(F.INK_MUTED, 0.45), width=1),
-            marker=dict(size=7, color=w, colorscale=F.SEQ, showscale=(i == n - 1),
-                        colorbar=dict(title="window", len=0.5, y=0.76, thickness=10)),
-            showlegend=False, name=arm,
-            hovertemplate="w=%{marker.color}<br>breadth %{x:.2f}<br>travel %{y:.3f}<extra></extra>"),
-            row=1, col=i + 1)
-        if ok.any():                                  # the arm's own colour, on its endpoint only
-            fig.add_trace(go.Scatter(
-                x=[breadth[i][ok][-1]], y=[excess[i][ok][-1]], mode="markers",
-                marker=dict(size=15, color=F.colour(arm), symbol="circle-open",
-                            line=dict(width=3, color=F.colour(arm))),
-                showlegend=False, hoverinfo="skip"), row=1, col=i + 1)
-        fig.add_hline(y=0, line=dict(color=F.INK_MUTED, width=1, dash="dot"), row=1, col=i + 1)
-        fig.update_xaxes(title_text="breadth (n_modes)", row=1, col=i + 1)
-        fig.layout.annotations[i].font.color = F.colour(arm)
-    fig.update_yaxes(title_text="travel above split-half null", row=1, col=1)
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.075,
+                        row_heights=[0.34, 0.33, 0.33],
+                        subplot_titles=("breadth — design diveristy per window",
+                                        "mode travel — design change per window",
+                                        "mode coverage — total distinct designs found"))
+    Bm, Blo, Bhi = load.mean_ci(r.n_modes)
+    Blo = np.clip(Blo, 1.0, None)
+    b_rng = (1.0, float(np.nanmax(Bm)) * 1.25)
+    F.arm_lines(fig, r.windows, Bm, Blo, Bhi, r.arms, row=1, col=1, log=True, rng=b_rng, label=False)
+    Tm, Tlo, Thi = load.mean_ci(r.energy - r.energy_null)
+    tlo, thi = min(float(np.nanmin(Tm)), 0.0), float(np.nanmax(Tm))
+    pad = 0.15 * max(thi - tlo, 1e-9)
+    t_rng = (tlo - pad, thi + pad)
+    F.arm_lines(fig, r.windows, Tm, Tlo, Thi, r.arms, row=2, col=1, showlegend=False, rng=t_rng, label=False)
+    # No annotation at all on the null line: an `annotation=` dict carrying only a font makes plotly
+    # label the line "new text", and `label=""` is rejected outright (it wants a Label, not a str).
+    fig.add_hline(y=0, line=dict(color=F.INK_MUTED, width=1, dash="dot"), row=2, col=1)
     Cm, Clo, Chi = load.mean_ci(r.coverage)
-    F.arm_lines(fig, r.windows, Cm, Clo, Chi, r.arms, row=2, col=1)
-    fig.update_xaxes(title_text="resample window", row=2, col=1)
-    fig.update_yaxes(title_text="distinct designs found", row=2, col=1)
-    F.style(fig, height=740, title=title)
+    F.arm_lines(fig, r.windows, Cm, Clo, Chi, r.arms, row=3, col=1, showlegend=False, label=False)
+    for row in (1, 2, 3):
+        fig.add_vline(x=r.rl_start - 0.5, line=dict(color=F.INK_MUTED, width=1, dash="dot"),
+                      row=row, col=1)
+    fig.update_xaxes(title_text="resample window", row=3, col=1)
+    fig.update_yaxes(type="log", title_text="effective modes (log)",
+                     range=[float(np.log10(b_rng[0])), float(np.log10(b_rng[1]))], row=1, col=1)
+    fig.update_yaxes(title_text="mode travel", range=list(t_rng), row=2, col=1)
+    fig.update_yaxes(title_text="mode coverage", row=3, col=1)
+    F.style(fig, height=820, title=title)
     F.caption(fig,
-              "Top: one point per window, colour = window index; the ring is the final window in the "
-              "arm's colour. Upper-left = ES-like hill-climbing (travelling while collapsed); "
-              "lower-right = breadth without exploration. Travel is read against the MEASURED "
-              "split-half null (the zero line here), never against 0 in absolute terms.<br>"
-              "Bottom: cumulative greedy cover at τ=1 — monotone by construction, so its SLOPE is "
-              "the discovery rate and a plateau means finding stopped, not that motion stopped. "
-              "Both panels start at the pretrain→RL boundary; build/* is not logged before it.")
+              "Read the top two together at the same window: breadth without travel is a "
+              "generator sitting still on several designs, travel without breadth is ES-like "
+              "hill-climbing on one. Mode travel is read against its measured split-half null "
+              "(the zero line), never against 0 — at the null the estimator is as often "
+              "slightly negative as positive.")
     F.synthetic_badge(fig, r.synthetic & {"n_modes", "energy", "energy_null", "coverage"}, r)
     return fig
 
 
 # %%
-show(fig_exploration(R["aux"], title="Experiment 2 — exploration: breadth and travel together"))
+show(fig_exploration(R["aux"], title="Experiment 2 — exploration: breadth and mode travel together"))
 
 
 # %% [markdown]
