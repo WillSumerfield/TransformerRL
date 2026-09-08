@@ -62,6 +62,11 @@ R = _rollups()
 def show(fig):
     """Display a figure in an interactive kernel; do nothing under plain `python analysis.py`.
 
+    Returns NOTHING, on purpose. A kernel auto-displays a cell's last expression, so returning the
+    figure renders it a SECOND time whenever a `show(...)` ends a cell -- which is every
+    single-figure cell here, and the last figure of every multi-figure one. The explicit `fig.show()`
+    is what stays, because auto-display alone would drop all but the last figure in a cell.
+
     The display calls below live at MODULE level, which is what makes this a notebook -- a `# %%`
     cell is just top-level code. That also means they run when the file is executed as a script, and
     an unguarded `fig.show()` there opens a browser tab per figure. The script path renders to PNG at
@@ -74,7 +79,6 @@ def show(fig):
     """
     if INTERACTIVE:
         fig.show()
-    return fig
 
 
 def show_table(df, caption=None):
@@ -83,9 +87,12 @@ def show_table(df, caption=None):
     `display` is injected into the interactive NAMESPACE by the kernel, not into builtins that an
     imported module can see -- so relying on the bare name works when a cell is pasted and breaks the
     moment the file is imported. Imported explicitly here for that reason.
+
+    Returns nothing, for the same reason `show` does not: a returned frame is auto-displayed a
+    second time by the cell that called this.
     """
     if not INTERACTIVE:
-        return df
+        return
     try:
         from IPython.display import display
     except ImportError:
@@ -94,7 +101,6 @@ def show_table(df, caption=None):
         display(df)
     if caption:
         print(caption + "\n")
-    return df
 
 
 # %% [markdown]
