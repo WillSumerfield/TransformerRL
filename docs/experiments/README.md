@@ -93,7 +93,7 @@ the one that needs nothing but a committed body.
    outside its own distribution control stays valid.
 4. **GenCrit excess bias** — predicted vs actual return over the same ladder. Whether the
    generator's judgement generalizes with control's competence.
-5. **Exploration** — breadth (`build/n_modes`) *and* travel (energy distance) *and* mode coverage.
+5. **Exploration** — breadth (`build/n_modes`) *and* mode travel (energy distance) *and* mode coverage.
 
 Numbering here is presentation order; ADR-0021 numbers them by the order they were designed
 (1 return, 2 control-gen, 3 gencrit, 4 exploration, 5 specialized).

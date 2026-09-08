@@ -506,7 +506,7 @@ bias by construction, and bias is the whole mechanism. (The pooled `gencrit_cali
 [above](#gencrit-calibration) remains valid — pooling gives the return spread that a single level
 lacks.)
 
-### Travel: energy distance
+### Mode travel: energy distance
 
 How far the generator's distribution **moves** between windows.
 
@@ -537,7 +537,7 @@ null with high `div_nmodes` is a generator holding the same designs forever — 
 exploration. Sustained $E$ well above the null with `div_nmodes ≈ 1` is sequential, ES-like
 hill-climbing — exploration that the diversity headline alone would call total collapse.
 
-_Avoid_: plain mean cross-window distance $\mathbb{E}[d_{\text{struct}}(A,B)]$ as travel. For two
+_Avoid_: plain mean cross-window distance $\mathbb{E}[d_{\text{struct}}(A,B)]$ as mode travel. For two
 *identical* distributions it equals the within-window mean pairwise distance, so a wide static
 generator scores as fast-moving; breadth and travel are inseparable in it. The two subtracted terms
 are exactly what fixes this.
@@ -564,7 +564,7 @@ finished, whether by converging or by getting stuck.
 
 _Avoid_: reading a plateau as "the generator stopped moving" — the curve is monotone by
 construction and reports finding, not motion. A generator cycling among already-seen designs
-plateaus while travelling. Pair it with [energy distance](#travel-energy-distance).
+plateaus while travelling. Pair it with [energy distance](#mode-travel-energy-distance).
 
 _Avoid_: counting single-linkage clusters of the *pooled* populations, the obvious cumulative
 reading of [$N_{\text{modes}}$](#effective-number-of-modes). It is **not monotone**: single-linkage

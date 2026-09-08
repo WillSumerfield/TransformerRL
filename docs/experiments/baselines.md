@@ -99,7 +99,7 @@ Most of ADR-0021 does not survive contact with a method that has no generator. W
 | 1 — return curve | **no** | "return on its own bodies" means different things for a learned generator, a GA population and a fixed body; the curves are not on comparable axes |
 | 2 — control-generalization | **no** | needs a generator distribution to perturb along |
 | 3 — GenCrit excess bias | **no** | needs GenCrit; only `ours` has one |
-| 4 — exploration | **partly** | breadth and travel need only a population, and `Progress.morphologies` reports one for **every** algorithm through the interface. Undefined for `fixed_body` and `robogrammar`'s deterministic search. `fixed_body` therefore records with `population=0`: its generator head exists and is never trained, and left on it would report design modes it has no mechanism to discover |
+| 4 — exploration | **partly** | breadth and mode travel need only a population, and `Progress.morphologies` reports one for **every** algorithm through the interface. Undefined for `fixed_body` and `robogrammar`'s deterministic search. `fixed_body` therefore records with `population=0`: its generator head exists and is never trained, and left on it would report design modes it has no mechanism to discover |
 | 5 — specialized return | **yes** | it needs nothing but a committed body: strip the scaffolding, warm-start control, fine-tune 250 epochs on that body, measure |
 
 **Decision metric: specialized return, per (algorithm × task)** — the series default, and the only

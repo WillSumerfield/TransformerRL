@@ -76,7 +76,7 @@ to bias by construction, and bias is the whole mechanism.
 **Exploration curves**:
 How much searching the generator actually does, over a run. Two independent components, both
 required — [breadth](#effective-number-of-modes) (how many designs at once) and
-[travel](#travel) (how far the distribution moves between windows). They come apart: a generator
+[mode travel](#mode-travel) (how far the distribution moves between windows). They come apart: a generator
 holding one design that marches across design space explores while reading as fully collapsed, and
 one holding the same three designs forever reads as healthy while exploring nothing.
 _Avoid_: reporting breadth alone as "exploration".
@@ -203,7 +203,7 @@ _Avoid_: root-aligned / positional limb comparison (misranks unequal-length limb
 Prevalence-weighted count of *distinct designs* a converged generator produces: Hill number (order q=1, perplexity) over `d_struct`-clusters (τ = 1 module) of the sampled bodies. `1.0` = single design (ES-like); `>1` = branching (EA-like). The Phase-8 diversity target. Between-seed variant adds **mode-overlap** (fraction of seed-pairs sharing a mode).
 _Avoid_: generator-entropy as the diversity headline (inflates independent-component flipping without breaking the common core — see Phase 8).
 
-## Travel
+## Mode travel
 
 The complement to [Diversity](#diversity), which is a snapshot: how far the generator's body
 distribution **moves** from one [resample window](#) to the next. Measured on the same
@@ -211,12 +211,12 @@ subtype-collapsed skeleton, and reported alongside the typed version — "skelet
 subtype churn continues" is a finding, not a nuisance.
 
 **Energy distance**:
-The travel headline. A window-to-window divergence built from
+The mode-travel headline. A window-to-window divergence built from
 [`d_struct`](#tip-aligned-structural-distance): the mean cross-window distance with **each window's
 own breadth subtracted off**, so it is zero exactly when the two windows' distributions match and
 positive in proportion to real movement, still in module units. Its same-distribution null is
 measured rather than assumed — one window's sample split in half and compared against itself.
-_Avoid_: plain mean cross-window distance as travel. For two *identical* distributions it equals
+_Avoid_: plain mean cross-window distance as mode travel. For two *identical* distributions it equals
 the within-window mean pairwise distance, so a wide static generator scores as fast-moving; breadth
 and travel are inseparable in it.
 
