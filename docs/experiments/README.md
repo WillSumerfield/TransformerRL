@@ -28,6 +28,11 @@ no windows at all, and experiment 5 is budgeted in environment frames per
 | 4 | [Control attention](attention.md) | Is cross-token information actually used by a per-token control policy? | **specified** — off-protocol |
 | 5 | [Outside baselines](baselines.md) | Does the method beat other codesign algorithms, on tasks it was not built for? | **specified** — [ADR-0022](../adr/0022-cross-method-comparison-protocol.md), blocked on rival ports |
 
+The exploratory credit-assignment and response-probe work is archived in
+[its retrospective](credit_assignment_response_probe_retrospective.md). It is a
+diagnostic checkpoint, not a new paper experiment or a change to the default
+codesign objective.
+
 Two experiments sit outside ADR-0021, for opposite reasons. **Experiment 4** deliberately has no
 generator — one fixed body, no resampling — so metrics 3–5 are undefined and metric 1's
 `quality/R_mean` is never written; it defines its own five measurements in its doc. **Experiment 5**'s
