@@ -241,16 +241,21 @@ show(fig_clone_interaction(R["clone"], title="Experiment 3 — the 2×2"))
 
 
 # %% [markdown]
-# ## Experiment 3 — the boundary-recovery trace
+# ## Experiments 2 and 3 — the boundary-recovery trace
 #
 # `control/r_step` folded on the RL resample boundaries. Offset 0 is the last epoch of the closing
 # window, so the resample fires between 0 and +1 and the dip belongs to the new bodies. Normalised
 # to each arm's own pre-boundary level: the arms sit at different absolute competence, which is the
-# left panel of Fig 3.1's job, and mixing it in here would conflate *worse overall* with *dips
-# deeper*. What is under test is the transient alone.
+# return curve's job, and mixing it in here would conflate *worse overall* with *dips deeper*. What
+# is under test is the transient alone.
 #
-# The dip mixes two causes — the bodies are new, and the trunk moved under control — and only the
-# clone scalars in the next figure isolate the second. Read them together.
+# Drawn for both resampling studies, because the transient is the per-epoch face of the same claim
+# each of them makes about transfer between bodies: for `aux`, whether a trunk trained on dense
+# body-conditioned targets re-adapts faster to bodies it has not seen; for `clone`, whether the
+# correction terms preserve control across the boundary at all.
+#
+# The dip mixes two causes — the bodies are new, and the trunk moved under control — and only
+# experiment 3's clone scalars, two figures down, isolate the second. Read them together.
 
 # %%
 def fig_boundary_fold(r, *, title=""):
@@ -272,16 +277,15 @@ def fig_boundary_fold(r, *, title=""):
     fig.update_yaxes(title_text="r_step ÷ pre-boundary level")
     F.style(fig, height=430, title=title)
     F.caption(fig,
-              f"Mean over the {r.n_windows - r.rl_start} RL boundaries, then across seeds; band is "
-              f"the 95% CI across seeds. Normalised per arm, so absolute competence is NOT shown "
-              f"here — see Fig 3.1.<br>A window is {r.epochs_per_window} epochs, so an arm still "
-              f"below 1.0 at the right-hand edge has not recovered before the next resample "
-              f"arrives.")
+              f"Normalised per arm, so absolute competence is NOT shown here. A window is "
+              f"{r.epochs_per_window} epochs, so an arm still below 1.0 at the right-hand edge "
+              f"has not recovered before the next resample arrives.")
     F.synthetic_badge(fig, r.synthetic & {"rew_fold", "r_step"}, r)
     return fig
 
 
 # %%
+show(fig_boundary_fold(R["aux"], title="Experiment 2 — boundary recovery"))
 show(fig_boundary_fold(R["clone"], title="Experiment 3 — boundary recovery"))
 
 
@@ -987,8 +991,9 @@ if __name__ == "__main__":
     jobs = [
         ("exp2-aux_1_return-and-specialized",        fig_return_and_spec(aux, title="Experiment 2 — aux: return and what the design was worth"), 1180, 520),
         ("exp2-aux_2_control-generalization-gencrit", fig_ladder(aux, title="Experiment 2 — control generalization and GenCrit's judgement"), 1400, 860),
-        ("exp2-aux_3_exploration-breadth-travel",    fig_exploration(aux, title="Experiment 2 — exploration: breadth and travel together"), 1200, 760),
+        ("exp2-aux_3_exploration-breadth-travel",    fig_exploration(aux, title="Experiment 2 — exploration: breadth and mode travel together"), 1200, 840),
         ("exp2-aux_4_fk-hazard-loss-vs-diversity",   fig_aux_hazard(aux, title="Experiment 2 — the FK hazard"), 1180, 640),
+        ("exp2-aux_5_boundary-recovery",             fig_boundary_fold(aux, title="Experiment 2 — boundary recovery"), 1180, 500),
         ("exp3-clone_1_return-and-collapse-check",   fig_return_and_spec(clone, title="Experiment 3 — clone: return and the collapse check"), 1180, 520),
         ("exp3-clone_2_interaction-2x2",             fig_clone_interaction(clone, title="Experiment 3 — the 2×2"), 1100, 520),
         ("exp3-clone_3_boundary-recovery",           fig_boundary_fold(clone, title="Experiment 3 — boundary recovery"), 1180, 500),
