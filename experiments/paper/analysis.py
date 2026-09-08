@@ -157,10 +157,9 @@ def fig_return_and_spec(r, *, title=""):
     fig.update_yaxes(title_text="return (raw units)", row=1, col=1)
     F.style(fig, height=440, title=title)
     F.caption(fig,
-              "Bands / whiskers: 95% CI across seeds (Student's t). Left is a joint body×control "
-              "score on the generator's own bodies — not a control-quality curve.<br>"
-              "Right shares the y-axis but not the x: the 250-epoch fine-tune never resamples, so "
-              "it is the same unit and deliberately not the same series. Dots are individual seeds.")
+              "Left is a joint body×control score on the generator's own bodies, not a "
+              "control-quality curve. Right shares the y-axis but not the x: the fine-tune "
+              "never resamples, so it is the same unit and deliberately not the same series.")
     F.synthetic_badge(fig, r.synthetic & {"spec"}, r)
     return fig
 
@@ -229,10 +228,10 @@ def fig_clone_interaction(r, *, title=""):
     fig.update_yaxes(title_text="return at final window (raw units)")
     F.style(fig, height=440, title=title)
     F.caption(fig,
-              "Whiskers: 95% CI across seeds. Vertical gap between the lines is the CRITIC main "
-              "effect; slope along x is the ACTOR main effect; non-parallelism is the interaction.<br>"
-              "clone.md predicts the gap exceeds the slope — a poisoned critic biases advantages for "
-              "a whole window, while a displaced actor decays within a few epochs.")
+              "Vertical gap between the lines is the CRITIC main effect, slope along x the "
+              "ACTOR main effect, non-parallelism the interaction. clone.md predicts the gap "
+              "exceeds the slope: a poisoned critic biases advantages for a whole window, a "
+              "displaced actor decays within a few epochs.")
     return fig
 
 
@@ -334,11 +333,10 @@ def fig_clone_drift(r, *, title=""):
     fig.update_xaxes(title_text="resample window", row=2, col=1)
     F.style(fig, height=620, title=title)
     F.caption(fig,
-              "Bands: 95% CI across seeds. Both terms are computed BEFORE being scaled by beta/lam "
-              "and logged in every arm, so `none` measures the drift it is not correcting.<br>"
-              "Grey band is the run's own info/kl p10–p90 — the yardstick. Caveat: these are a mean "
-              "over all 16 generator epochs of the update, so they understate the end-of-window "
-              "displacement.")
+              "Both terms are computed BEFORE being scaled by beta/lam and logged in every "
+              "arm, so `none` measures the drift it is not correcting; the grey band is the "
+              "run's own info/kl p10–p90. Caveat: they are a mean over all 16 generator epochs "
+              "of the update, so they understate the end-of-window displacement.")
     return fig
 
 
@@ -433,18 +431,13 @@ def fig_ladder(r, *, title=""):
                            showarrow=False, font=dict(size=11, color=F.INK_MUTED))
     F.style(fig, height=800, title=title)
     F.caption(fig,
-              "Top: solid = actual return at μ; dotted = GenCrit's prediction for the same bodies. "
-              "Inner band 95% CI across seeds; outer band the pooled across-BODY sd. At distance 0 "
-              "every body is the identical committed body, so the outer band there is pure episode "
-              "noise — this metric's own floor.<br>"
-              "Middle: bias with level 0 subtracted. Anchoring removes the μ-vs-sampled and "
-              "staleness confounds, neither constant across arms; above 0 = over-optimism about "
-              "unfamiliar designs. Dashed rule = the generator's own spread (T=1).<br>"
-              "Bottom: skeleton share — a flat top curve with a near-zero share means the ladder "
-              "only ever swapped subtypes, never a body plan. x is the MEASURED mean d_struct per "
-              "level, not the integer it was bisected onto.<br>"
-              "The excess-bias row is scaled to its mean curve, so a far-ladder seed whose GenCrit "
-              "prediction diverges clips rather than flattening the panel.")
+              "Solid = actual return at μ, dotted = GenCrit's prediction for the same bodies; "
+              "the outer band is the across-BODY sd, which at distance 0 is pure episode noise "
+              "— this metric's own floor.<br>"
+              "Middle anchors the bias at level 0, removing the μ-vs-sampled and staleness "
+              "confounds (above 0 = over-optimism), and is scaled to its mean curve so a "
+              "diverging seed clips; a near-zero skeleton share means the ladder only ever "
+              "swapped subtypes, never a body plan.")
     F.synthetic_badge(fig, r.synthetic & {"G", "G_sd", "pred", "skel_share", "T", "dist"}, r)
     return fig
 
@@ -558,12 +551,11 @@ def fig_aux_hazard(r, arm=None, *, title=""):
     fig.update_xaxes(title_text="epoch", row=2, col=1)
     F.style(fig, height=620, title=f"{title} — arm `{arm}`" if title else "")
     F.caption(fig,
-              "Mean across seeds of one arm; the ablated arm's aux losses are NaN by construction "
-              "(the heads exist but are never armed), so this panel has no comparison and is not "
-              "meant to.<br>Read jointly: FK pinned at its floor WHILE div_struct rises means the "
-              "target was already determined by the morphology tokens — the hazard — which is a "
-              "different finding from 'kinematic grounding does not help'. The tag is `losses/fk`; "
-              "there is no `gen/fk`.")
+              "One arm only: the ablated arm's aux losses are NaN by construction, so this "
+              "panel has no comparison and is not meant to. FK pinned at its floor WHILE "
+              "div_struct rises means the target was already determined by the morphology "
+              "tokens — the hazard — a different finding from 'kinematic grounding does not "
+              "help'.")
     F.synthetic_badge(fig, r.synthetic & {"div_struct"}, r)
     return fig
 
@@ -653,12 +645,9 @@ def fig_attention_return(r, *, title=""):
     fig.update_yaxes(title_text="control/r_step  (mean raw reward per env-step)", rangemode="tozero")
     F.style(fig, height=470, title=title)
     F.caption(fig,
-              f"Curves smoothed over {SMOOTH} epochs for display; B and C come from "
-              f"`harness.stats` on the raw series (C uses a TRAILING mean, so a crossing never "
-              f"depends on the future). Band is the 95% CI across seeds. Shaded strip = "
-              f"measurement B. Rule = C's threshold, {THRESHOLD_FRAC:.0%} of `{ref_arm}`'s "
-              f"asymptote, fixed before the other arms were read; drop-lines are the across-seed "
-              f"mean crossing.<br>"
+              f"Curves are smoothed over {SMOOTH} epochs for display only; B and C come from "
+              f"`harness.stats` on the raw series, against a threshold fixed from `{ref_arm}` "
+              f"before the other arms were read.<br>"
               f"These runs never resample, so LR warmup never applies — their returns are NOT "
               f"comparable to experiments 1–3 and must never share an axis with them.")
     F.synthetic_badge(fig, r.synthetic & {"r_step"}, r)
@@ -685,10 +674,9 @@ def fig_attention_gait(r, *, title=""):
     fig.update_xaxes(title_text="epoch", row=len(rows), col=1)
     F.style(fig, height=240 * len(rows) + 160, title=title)
     F.caption(fig,
-              f"Mean across seeds, smoothed over {SMOOTH} epochs; bands are the 95% CI across seeds. "
-              f"`attention.md` predicts the gap shows here too, as shorter episodes (falling) in the "
-              f"masked arms.<br>Same no-resample caveat as the return panel: not comparable to "
-              f"experiments 1–3.")
+              f"Smoothed over {SMOOTH} epochs. `attention.md` predicts the gap shows here too, "
+              f"as shorter episodes (falling) in the masked arms; same no-resample caveat as "
+              f"the return panel.")
     return fig
 
 
@@ -749,14 +737,12 @@ def fig_attention_structure(r, arm=None, *, title=""):
     fig.update_xaxes(title_text="key", row=1, col=2)
     F.style(fig, height=580, title=title)
     F.caption(fig,
-              "Left: the decisive number — share of a present module token's attention landing on "
-              "the OTHER present module tokens, averaged over heads, query tokens and seeds. Run on "
-              "the ablated arms too, where it is also the check that the mask does what it claims: "
-              "a self/self_cls mask cannot exceed 0.<br>"
-              f"Right: mean over seeds and all {r.attn_map.shape[3]} heads at the final checkpoint. "
-              f"Rules mark the [CLS] / [start × {r.n_slots}] / [module × {r.n_slots * r.max_depth}] "
-              f"blocks. Cross-limb MASS survives state-averaging (mass is linear in the weights); "
-              f"the map's PATTERN does not, so the fraction is the reading and the map the evidence.")
+              "Left is the decisive number: share of a present module token's attention "
+              "landing on the OTHER present module tokens. A self/self_cls mask structurally "
+              "cannot exceed 0, so it doubles as the check that the mask does what it "
+              "claims.<br>"
+              "Cross-limb MASS survives state-averaging but the map's PATTERN does not, so "
+              "the fraction is the reading and the map only the evidence.")
     F.synthetic_badge(fig, r.synthetic & {"attn_map", "attn_offdiag"}, r)
     return fig
 
@@ -811,12 +797,10 @@ def fig_design_vs_generalization(r, *, f=RETENTION_F, ckpt=-1, title=""):
     fig.update_yaxes(title_text="specialized return (raw units)")
     F.style(fig, height=520, title=title)
     F.caption(fig,
-              f"Checkpoint w={r.ckpt_gen[ckpt]}. Large marker = arm mean with 95% CI on both axes; "
-              f"small markers are individual seeds. Quadrant lines are the across-arm means, so the "
-              f"regions are relative to this study, not absolute.<br>"
-              f"Width = perturbation distance at which return first falls below {f:.0%} of its "
-              f"level-0 value — the definition backbone.md and aux.md pre-register a falsifier "
-              f"against but never give. Sensitivity over f ∈ {RETENTION_SENS} is in the table.")
+              f"Quadrant lines are the across-arm means, so the regions are relative to this "
+              f"study, not absolute. Width = the perturbation distance at which return first "
+              f"falls below {f:.0%} of its level-0 value; sensitivity over f ∈ {RETENTION_SENS} "
+              f"is in the table.")
     F.synthetic_badge(fig, r.synthetic & {"G", "dist", "spec"}, r)
     return fig
 
