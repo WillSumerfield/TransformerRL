@@ -557,7 +557,7 @@ def fig_aux_hazard(r, arm=None, *, title=""):
                                  line=dict(color=c, width=2),
                                  hovertemplate=f"{nm}: %{{y:.3g}}<extra></extra>"), row=1, col=1)
         if ok.any():
-            F.direct_label(fig, ep[ok][-1], m[ok][-1], nm, c, row=1, column=1)
+            F.direct_label(fig, ep[ok][-1], m[ok][-1], nm, c, row=1, column=1, log=True)
     fig.update_yaxes(type="log", title_text="loss (log)", row=1, col=1)
     # Window-cadence diversity onto the same EPOCH axis: window w closes at epoch (w+1)*per_window.
     dv = np.nanmean(r.div_struct[a], axis=0)

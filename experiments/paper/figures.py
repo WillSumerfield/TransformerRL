@@ -156,14 +156,34 @@ def synthetic_badge(fig: go.Figure, keys, rollup=None) -> go.Figure:
     return fig
 
 
-def direct_label(fig, x, y, text, col, *, row=None, column=None, dx=8):
+def _log_y(y):
+    """Data-space y -> the log10 an annotation on a `type="log"` axis is positioned in.
+
+    Plotly positions annotations in AXIS coordinates, which on a log axis are the exponent -- so a
+    label handed y=0.15 lands at 10^0.15 and one handed y=1867 lands at 10^1867, dragging the axis
+    with it. Both happened: the FK panel's `losses/fk` label sat two decades above its curve, and the
+    breadth panel's put the axis at 1e52. Non-positive y has no place on a log axis; NaN drops the
+    label rather than crashing the figure.
+    """
+    y = np.asarray(y, float)
+    return np.where(y > 0, np.log10(np.where(y > 0, y, 1.0)), np.nan)
+
+
+def direct_label(fig, x, y, text, col, *, row=None, column=None, dx=8, log=False):
     """End-of-series label in INK, beside the coloured line that carries identity.
 
     Mandatory, not decorative: the palette validates only with secondary encoding (the red/aqua CVD
     pair) and only under the relief rule (gold and aqua below 3:1 on this surface). Text wears a
     text token rather than the series colour, per the data-viz rule.
+
+    `y` is always in DATA units; pass `log=True` when the target axis is `type="log"` and the
+    conversion happens here, so no caller has to know plotly's annotation convention.
     """
     kw = {} if row is None else dict(row=row, col=column)
+    if log:
+        y = float(_log_y(y))
+        if not np.isfinite(y):
+            return fig
     fig.add_annotation(x=x, y=y, text=text, xanchor="left", yanchor="middle", xshift=dx,
                        showarrow=False, font=dict(size=11, color=INK), **kw)
     return fig
@@ -224,15 +244,24 @@ def hline(fig, y, text=None, *, row=None, col=None, colr=INK_MUTED, dash="dot"):
     return fig
 
 
-def label_series(fig, x, ys, arms, *, span, row=None, col=None, min_frac=0.062, rng=None):
+def label_series(fig, x, ys, arms, *, span, row=None, col=None, min_frac=0.062, rng=None, log=False):
     """End labels for several series at one x, pushed apart so near-equal arms stay readable.
 
     Direct labels are not optional here -- the palette validates only WITH secondary encoding -- so
     when four arms finish within a hair of each other the answer has to be to space the labels, not
     to drop them. `span` is the panel's own data range, because the natural alternative (the spread
     of these four values) collapses to zero in exactly the case that needs the gap most.
+
+    On a `log=True` axis the whole push-apart is done in log space and `span` is ignored: a gap of
+    6.2% of a range spanning three decades is most of the panel down at the floor and invisible at
+    the top. Everything in and out of here is still data units.
     """
     ys = np.asarray(ys, float)
+    if log:
+        ys = _log_y(ys)
+        rng = None if rng is None else tuple(float(_log_y(v)) for v in rng)
+        span = (rng[1] - rng[0]) if rng is not None and np.isfinite(rng).all() \
+            else np.nanmax(ys) - np.nanmin(ys)
     ok = np.flatnonzero(np.isfinite(ys))
     gap = min_frac * (span if np.isfinite(span) and span > 0 else 1.0)
     prev, placed = None, {}
@@ -252,12 +281,14 @@ def label_series(fig, x, ys, arms, *, span, row=None, col=None, min_frac=0.062, 
         if high > hi:
             placed = {i: y - (high - hi) for i, y in placed.items()}
     for i, y in placed.items():
-        direct_label(fig, x, y, arms[i], colour(arms[i]), row=row, column=col)
+        # Back to data units for the one place that owns the axis convention.
+        direct_label(fig, x, 10.0 ** y if log else y, arms[i], colour(arms[i]),
+                     row=row, column=col, log=log)
     return fig
 
 
 def arm_lines(fig, x, m, lo, hi, arms, *, row=None, col=None, showlegend=True, rng=None,
-              label=True, dash=None, alpha=0.16):
+              label=True, dash=None, alpha=0.16, log=False):
     """The default multi-arm panel: one CI ribbon per arm, then ONE spaced label pass.
 
     `add_ci`'s own label is per-series and therefore blind to the others, which stacks four labels on
@@ -283,4 +314,5 @@ def arm_lines(fig, x, m, lo, hi, arms, *, row=None, col=None, showlegend=True, r
             xend = np.nanmax([xend, np.asarray(x, float)[ok[-1]]])
     r0, r1 = (rng if rng is not None
               else (np.nanmin(m if lo is None else lo), np.nanmax(m if hi is None else hi)))
-    return label_series(fig, xend, ends, list(arms), span=r1 - r0, rng=(r0, r1), row=row, col=col)
+    return label_series(fig, xend, ends, list(arms), span=r1 - r0, rng=(r0, r1), row=row, col=col,
+                        log=log)
