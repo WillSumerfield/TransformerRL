@@ -37,7 +37,7 @@ from codesigner import optimize
 from codesigner.control import optimize_control
 from codesigner.metrics.record import MetricRecord
 
-from experiments.harness.baselines import ARMS, algorithm_for, overrides_from_sets
+from experiments.harness.baselines import LOCAL_ARMS, algorithm_for, overrides_from_sets
 from transformer_rl.morphology import reference_body
 
 
@@ -50,7 +50,7 @@ def build(args):
 
 def main():
     ap = ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("arm", choices=ARMS)
+    ap.add_argument("arm", choices=LOCAL_ARMS)
     ap.add_argument("--config", required=True,
                     help="run config (names the task); path or a name under configs/")
     ap.add_argument("--name", required=True,

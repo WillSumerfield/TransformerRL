@@ -28,8 +28,9 @@ The algorithm axis. Each is a `codesigner` `Algorithm` — `run()`, `is_finished
 |---|---|---|
 | `ours` | shared-trunk transformer codesign; one `run()` = one generator window | `transformer_rl/algorithm.py:45` |
 | `evolutionary` | GA over the body population, fitness from the shared controller; one `run()` = one generation | `components/algorithms/evolutionary.py` |
-| `bodygen` | learned generative morphology policy trained by policy gradient — the closest rival | pending |
-| `nge` | Neural Graph Evolution: graph mutation with a learned controller | pending |
+| `bodygen` | learned generative morphology policy trained by policy gradient — the closest rival | SoftwarePackage native runner |
+| `nge` | Neural Graph Evolution: graph mutation with a learned controller | SoftwarePackage native runner |
+| `stackelberg` | bilevel morphology-policy / universal-controller optimisation | SoftwarePackage native runner |
 | `robogrammar` | graph grammar plus heuristic search; **no learned generator** | pending |
 | `fixed_body` | the task's reference morphology, our transformer controller, no morphology search | `scripts/optimize_baselines.py fixed_body` |
 | `random_generator` | bodies redrawn every window from the uniform-size draw; nothing about the body is learned | `transformer_rl/random_body.py` |
@@ -53,6 +54,31 @@ ablation, since it carries no generator head, no return predictor and no clone.
 `robogrammar` has no learned generator and no learned controller in the same sense as the others; it
 is included precisely because it is the most different, and it is the condition most likely to expose
 whether learning the design distribution buys anything over searching it.
+
+### Native SoftwarePackage arms
+
+The `baselines` study launches NGE, BodyGen, and Stackelberg as individual native processes, rather
+than through SoftwarePackage's serial suite wrapper. This keeps the harness's seed-major scheduling
+and lets a crashed method resume from its own checkpoint format.
+
+```bash
+# One validated native seed. SOFTWARE_PACKAGE_ROOT is only needed when the
+# native source checkout is not at the workstation's sibling-repository path.
+SOFTWARE_PACKAGE_ROOT=/path/to/SoftwarePackage \
+  .venv/bin/python experiments/harness/launch.py baselines \
+  --arms nge,bodygen,stackelberg --seeds 42 --slots 3
+```
+
+All three currently use SoftwarePackage's `ant` / `basic` profile. `basic` is selected deliberately:
+Stackelberg's `benchmark` profile resolves a control-cost setting rejected by its own validator.
+The native configs retain their own units and budgets (NGE generations, BodyGen updates, Stackelberg
+environment steps), so `--epochs` does not apply to them. Before reporting a sample-efficiency
+comparison, set the three native configs to analytically matched environment-frame budgets.
+
+Native metrics remain in each run directory under
+`runs/ant_codesign/codesign_baselines/baselines_<method>_s<seed>`. They are explicitly marked
+`native` by `harness/scrape.py`: the existing scraper's TransformerRL epoch/window grid is not a
+valid common x-axis for these algorithms.
 
 ## Tasks
 

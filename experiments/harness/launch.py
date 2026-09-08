@@ -62,7 +62,13 @@ from experiments.harness.slots import (          # noqa: E402
 from transformer_rl.train_utils import _load_config, _resolve_task   # noqa: E402  ONE extends: resolver
 # The experiment dir experiment 5 writes to, taken from the module that CONSTRUCTS those
 # algorithms rather than restated here -- see EXPERIMENT there for why a second copy is a bug.
-from experiments.harness.baselines import EXPERIMENT as _BASELINES_EXPERIMENT  # noqa: E402
+from experiments.harness.baselines import (  # noqa: E402
+    EXPERIMENT as _BASELINES_EXPERIMENT,
+    native_checkpoint as _native_checkpoint,
+    native_config as _native_config,
+    native_finished as _native_finished,
+    native_runner as _native_runner,
+)
 
 SEEDS = tuple(range(42, 50))            # 42-49, series-wide (ADR-0021)
 WINDOWS = 48                            # 8 pretrain + 40 RL (ADR-0021); epochs are DERIVED from it
@@ -83,6 +89,9 @@ class Arm:
     experiment: str | None = None      # run dir leaf: runs/<task>_<family>/<experiment>/<run>
     args: tuple[str, ...] = ()         # positional args, before the flags -- the arm's own name,
                                        # where one script serves several arms
+    driver: str | None = None           # override the Study driver for a native package runner
+    task: str | None = None             # task forwarded to a native SoftwarePackage runner
+    preset: str | None = None           # native task profile, e.g. benchmark
 
 
 @dataclass(frozen=True)
@@ -180,6 +189,19 @@ STUDIES: dict[str, Study] = {
                        experiment=_BASELINES_EXPERIMENT, driver="codesigner", arms={
         "fixed_body":       Arm(args=("fixed_body",)),
         "random_generator": Arm(args=("random_generator",)),
+        # Keep each native method as an independent process instead of calling
+        # SoftwarePackage's serial suite launcher.  The shared scheduler can
+        # then mix all arms seed-major and resume its method-specific state.
+        # `basic` is the supported common Ant profile: Stackelberg's
+        # `benchmark` profile resolves a control-cost incompatible with its
+        # validator, while all three native methods accept `basic`.
+        "nge": Arm(script=str(_native_runner("nge")), config=str(_native_config("nge")),
+                   driver="software_package", task="ant", preset="basic"),
+        "bodygen": Arm(script=str(_native_runner("bodygen")), config=str(_native_config("bodygen")),
+                       driver="software_package", task="ant", preset="basic"),
+        "stackelberg": Arm(script=str(_native_runner("stackelberg")),
+                            config=str(_native_config("stackelberg")),
+                            driver="software_package", task="ant", preset="basic"),
     }),
 }
 
@@ -198,6 +220,8 @@ class Run:
     sets: tuple[str, ...] = ()
     args: tuple[str, ...] = ()          # positional args, ahead of the flags
     driver: str = "rlgames"             # see Study.driver
+    task: str | None = None              # SoftwarePackage task; unused by local drivers
+    preset: str | None = None            # SoftwarePackage task profile; unused by local drivers
     checkpoint: str | None = None
     target_epoch: int = 0               # for done-detection; 0 disables it
     # Whether a run dir with no checkpoint may be relaunched. False for training runs, where the only
@@ -217,6 +241,19 @@ class Run:
 
     def cmd(self, checkpoint: str | None) -> list[str]:
         cmd = [sys.executable, str(_ROOT / self.script), *self.args]
+        if self.driver == "software_package":
+            if not self.task:
+                raise ValueError(f"native run {self.name} is missing its task")
+            # The slot exposes exactly one GPU through CUDA_VISIBLE_DEVICES, so
+            # all three native runners address that selected GPU as cuda:0.
+            cmd += ["train", "--config", str(_ROOT / self.config), "--task", self.task,
+                    "--name", self.name, "--runs-dir", str(self.run_dir.parent),
+                    "--seed", str(self.meta["seed"]), "--device", "cuda:0"]
+            if self.preset:
+                cmd += ["--preset", self.preset]
+            if checkpoint:
+                cmd += ["--resume", str(checkpoint)]
+            return cmd
         if self.driver == "codesigner":
             # No checkpoint on the command line, ever: `resume=True` continues the run in the run
             # directory from the inside, so re-issuing this exact command IS the resume. A path
@@ -238,11 +275,15 @@ class Run:
         return cmd
 
 
-def _train_dir(study: Study, arm: Arm, config: Path, sets: tuple[str, ...]) -> str:
+def _train_dir(study: Study, arm: Arm, config: Path, sets: tuple[str, ...], driver: str) -> str:
     """Where the entry point will put this run: runs/<task>_<family>/<experiment>. Composed the same
     way `_compose_identity` composes it, with the task read from the config rather than assumed, so a
     grasp config -- or a `--set env.task=grasp` -- lands under runs/grasp_codesign/ with no registry
     edit."""
+    if driver == "software_package":
+        if not arm.task:
+            raise SystemExit("[launch] SoftwarePackage arm is missing its task")
+        return f"runs/{arm.task}_{study.family}/{arm.experiment or study.experiment}"
     task, _, _ = _effective(config, sets)
     return f"runs/{task}_{study.family}/{arm.experiment or study.experiment}"
 
@@ -306,16 +347,21 @@ def study_runs(name: str, arms: list[str] | None = None, seeds: tuple[int, ...] 
                 if not p.exists():
                     raise SystemExit(f"[launch] {name}/{arm_name}: missing {what} {p}")
             sets = (*study.common, *arm.sets)
-            budget = _budget(study, config, sets, epochs)
+            driver = arm.driver or study.driver
+            # Native methods use incompatible units (generations, updates, and
+            # environment steps).  Their maintained YAMLs own those budgets.
+            budget = () if driver == "software_package" else _budget(study, config, sets, epochs)
             runs.append(Run(
                 name=f"{name}_{arm_name}_s{seed}",
                 script=arm.script or study.script,
                 config=arm.config or study.config,
-                train_dir=_train_dir(study, arm, config, sets),
+                train_dir=_train_dir(study, arm, config, sets, driver),
                 sets=(*sets, *budget, f"params.seed={seed}"),
                 args=arm.args,
-                driver=study.driver,
-                target_epoch=int(budget[0].split("=")[1]),
+                driver=driver,
+                task=arm.task,
+                preset=arm.preset,
+                target_epoch=int(budget[0].split("=")[1]) if budget else 0,
                 meta={"study": name, "arm": arm_name, "seed": seed},
             ))
     return runs
@@ -409,12 +455,29 @@ def _classify_codesigner(run: Run) -> tuple[str, Path | None, str]:
     return "resume", None, f"continuing the run in {run.run_dir.name}"
 
 
+def _classify_software_package(run: Run) -> tuple[str, Path | None, str]:
+    """Native-runner state using its own completion and checkpoint contracts."""
+    if not run.run_dir.exists() or not any(run.run_dir.iterdir()):
+        return "fresh", None, ""
+    arm = run.meta["arm"]
+    if _native_finished(arm, run.run_dir):
+        return "done", None, "native completion artifact present"
+    checkpoint = _native_checkpoint(arm, run.run_dir)
+    if checkpoint is None:
+        return "blocked", None, (
+            f"native run dir exists with no resumable checkpoint: {run.run_dir}"
+        )
+    return "resume", checkpoint, f"continuing from {checkpoint.name}"
+
+
 def _classify_pending(run: Run) -> tuple[str, Path | None, str]:
     """(state, checkpoint, note) for a run before it is scheduled. `blocked` is deliberate: a run dir
     with no checkpoint cannot be resumed AND must not be relaunched into, because rl_games would open
     a second event file in the same summaries dir and the two partial runs would scrape as one."""
     if run.driver == "codesigner":
         return _classify_codesigner(run)
+    if run.driver == "software_package":
+        return _classify_software_package(run)
     if not run.run_dir.exists():
         return "fresh", None, ""
     ckpt = _newest_ckpt(run.nn_dir)
@@ -530,11 +593,15 @@ def run_pool(runs: list[Run], slots: list[_Slot], log_dir: Path, *, poll: float 
                 if job.attempt + 1 >= max_attempts:
                     _retire(job, "failed", f"exit {ret} ({cause}), {max_attempts} attempts spent")
                     continue
-                # rl_games' nn/ exists under a codesigner run too (its save_frequency is still
-                # set), so the checkpoint has to be suppressed by DRIVER rather than by absence --
-                # handing that path back would turn an internal resume into a warm start the entry
-                # point does not even take an argument for.
-                ckpt = None if job.run.driver == "codesigner" else _newest_ckpt(job.run.nn_dir)
+                # Codesigner resumes internally, while SoftwarePackage runners
+                # take their own method-specific checkpoints.  Do not mistake
+                # an incidental rl_games nn/ directory for either contract.
+                if job.run.driver == "codesigner":
+                    ckpt = None
+                elif job.run.driver == "software_package":
+                    ckpt = _native_checkpoint(job.run.meta["arm"], job.run.run_dir)
+                else:
+                    ckpt = _newest_ckpt(job.run.nn_dir)
                 _release(job, f"exit {ret} ({cause}) -> "
                               + (f"resume from {ckpt.name}" if ckpt else
                                  "relaunching" if job.run.driver == "codesigner" else

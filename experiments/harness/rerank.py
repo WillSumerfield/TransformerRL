@@ -183,7 +183,10 @@ def main():
 
     arms = args.arms.split(",") if args.arms else None
     seeds = tuple(int(s) for s in args.seeds.split(",")) if args.seeds else None
-    runs = [r for r in study_runs(args.study, arms, seeds) if holds_run(r.run_dir)]
+    # Reranking is a CodesignAlgorithm shortlist pass.  The native methods in
+    # the shared baseline study deliberately have no compatible shortlist.
+    runs = [r for r in study_runs(args.study, arms, seeds)
+            if r.driver == "codesigner" and holds_run(r.run_dir)]
     if not runs:
         raise SystemExit(f"[rerank] {args.study}: no run directories to read")
 

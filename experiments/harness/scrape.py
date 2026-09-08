@@ -289,6 +289,15 @@ def scrape(study: str, arms: list[str] | None = None,
 
     for run in runs:
         i = (arm_ix[run.meta["arm"]], seed_ix[run.meta["seed"]])
+        if run.driver == "software_package":
+            # Native methods have their own TensorBoard schema and incompatible
+            # budgets (generations / updates / environment steps), so they
+            # cannot be placed honestly on this Transformer's epoch/window
+            # grid.  Preserve their labelled cells as an explicit status
+            # rather than attempting to parse their config as rl_games YAML.
+            status[i] = "native"
+            print(f"[scrape] NATIVE {run.name}: use SoftwarePackage metrics", flush=True)
+            continue
         if not (run.run_dir / "config.yaml").exists():
             print(f"[scrape] MISSING {run.name}", flush=True)
             continue
